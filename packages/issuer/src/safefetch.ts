@@ -1,4 +1,4 @@
-// Section 2.2 fetch protections: no special-use addresses (RFC 6890), re-checked at every hop, size and
+// Section 2.2 fetch protections for every request to a URL learned through discovery (shared with the issuer).
 // time limits, no credentials. Used for Client ID Metadata Documents (Section 4.2) and, by the client
 // library, for discovery. Implemented over node:https so that the resolved address can be filtered
 // before the connection is made.
@@ -14,8 +14,14 @@ export interface SafeFetchOptions {
   /** Development only: permit loopback and private addresses, and plain http. */
   allowPrivate?: boolean;
   accept?: string;
-  /** Maximum redirects to follow (each hop re-checked); 0 treats a 3xx as the final response. */
+  /** Maximum redirects to follow (each hop re-checked); 0 treats a 3xx as the final response. Only GET requests follow redirects. */
   maxRedirects?: number;
+  /** Request method, default GET. */
+  method?: string;
+  /** Extra request headers (for example Authorization for the Token or UserInfo Endpoint, Sections 3.3 and 5.6). */
+  headers?: Record<string, string>;
+  /** Request body for non-GET requests. */
+  body?: string;
 }
 export interface SafeFetchResult {
   url: string;
@@ -51,17 +57,14 @@ function expandV6(addr: string): bigint {
   const groups = [...hs, ...new Array(8 - hs.length - ts.length).fill('0'), ...ts];
   return groups.reduce((acc, g) => (acc << 16n) | BigInt(parseInt(g || '0', 16)), 0n);
 }
+/** IPv6 is default-deny: only global unicast (2000::/3) outside the special-purpose blocks, or an embedded IPv4 address that passes the IPv4 check. */
 function v6Blocked(addr: string): boolean {
   const n = expandV6(addr);
   const inRange = (prefix: string, bits: number) => (n >> BigInt(128 - bits)) === (expandV6(prefix) >> BigInt(128 - bits));
-  if (inRange('::ffff:0:0', 96)) return v4Blocked(intToV4(Number(n & 0xffffffffn)));
-  if (inRange('64:ff9b::', 96)) return v4Blocked(intToV4(Number(n & 0xffffffffn)));
-  if (inRange('64:ff9b:1::', 48)) return true;
+  if (inRange('::ffff:0:0', 96) || inRange('64:ff9b::', 96)) return v4Blocked(intToV4(Number(n & 0xffffffffn)));
   if (inRange('2002::', 16)) return v4Blocked(intToV4(Number((n >> 80n) & 0xffffffffn)));
-  return (
-    n === 0n || n === 1n || inRange('100::', 64) || inRange('2001::', 23) || inRange('2001:db8::', 32) || inRange('fc00::', 7) ||
-    inRange('fe80::', 10) || inRange('ff00::', 8)
-  );
+  if (!inRange('2000::', 3)) return true;
+  return inRange('2001::', 23) || inRange('2001:db8::', 32) || inRange('3fff::', 20);
 }
 function intToV4(n: number): string {
   return [n >>> 24, (n >>> 16) & 255, (n >>> 8) & 255, n & 255].join('.');
@@ -96,7 +99,18 @@ function one(url: URL, o: SafeFetchOptions): Promise<SafeFetchResult> {
     const mod = url.protocol === 'https:' ? https : http;
     const req = mod.request(
       url,
-      { method: 'GET', headers: { accept: o.accept ?? 'application/json', 'user-agent': 'agentlogin-issuer/0.1' }, lookup: filteredLookup(allowPrivate), timeout: o.timeoutMs },
+      {
+        method: o.method ?? 'GET',
+        headers: {
+          accept: o.accept ?? 'application/json',
+          'user-agent': 'agentlogin-issuer/0.1',
+          ...(o.body !== undefined ? { 'content-length': String(Buffer.byteLength(o.body)) } : {}),
+          ...o.headers,
+        },
+        lookup: filteredLookup(allowPrivate),
+        timeout: o.timeoutMs,
+        agent: false, // never reuse a socket another caller opened without the address check
+      },
       (res) => {
         const chunks: Buffer[] = [];
         let size = 0;
@@ -112,9 +126,12 @@ function one(url: URL, o: SafeFetchOptions): Promise<SafeFetchResult> {
         res.on('error', reject);
       },
     );
+    // `timeout` above is an idle timeout; this bounds the whole exchange (N_FETCH).
+    const hard = setTimeout(() => req.destroy(new Error('fetch timed out')), o.timeoutMs);
+    req.on('close', () => clearTimeout(hard));
     req.on('timeout', () => req.destroy(new Error('fetch timed out')));
     req.on('error', reject);
-    req.end();
+    req.end(o.body);
   });
 }
 
@@ -126,7 +143,8 @@ export async function safeFetch(input: string | URL, o: SafeFetchOptions): Promi
     const remaining = deadline - Date.now();
     if (remaining <= 0) throw new Error('fetch timed out');
     const res = await one(url, { ...o, timeoutMs: remaining });
-    if (res.status >= 300 && res.status < 400 && (o.maxRedirects ?? 0) > hops && res.headers.location) {
+    const isGet = (o.method ?? 'GET').toUpperCase() === 'GET';
+    if (isGet && res.status >= 300 && res.status < 400 && (o.maxRedirects ?? 0) > hops && res.headers.location) {
       hops += 1;
       url = new URL(res.headers.location, url);
       continue;

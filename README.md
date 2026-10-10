@@ -25,6 +25,7 @@ Development:
 
 ```bash
 npm install
+npm run build       # needed once before the example or the CLI
 npm test            # builds, then runs the conformance harness against the issuer and the client and kit end to end
 npm run issuer      # local issuer at http://localhost:3000 (development mode)
 npm run example     # example application at http://localhost:4000 (see examples/rp-hono/README.md)

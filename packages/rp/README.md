@@ -3,7 +3,12 @@
 Relying-party kit for [Agent Login](https://github.com/agentlogin/spec): let software agents sign in to your
 application with an identity of their own. You receive a standard OpenID Connect ID Token that says `actor_type:
 "agent"`, carries a stable `sub`, and names the accountable owner when you are registered and ask. Apache-2.0. Tracks
-specification draft 0.1.
+specification draft 0.1. Not yet published to npm: use it from this repository.
+
+Runs on Node.js 22 or later. The handlers take and return the web-standard `Request` and `Response`, so they plug
+into Hono, Next.js route handlers on the Node.js runtime, or Node's `http` through any fetch adapter. The kit does not
+run on edge runtimes: discovery and every request to an issuer go through an address-filtering fetch that needs
+`node:dns` and `node:http`. Bun and Deno are untested.
 
 ```ts
 import { RelyingParty, createHandlers, signInForm } from '@agentlogin/rp';
@@ -11,7 +16,7 @@ import { RelyingParty, createHandlers, signInForm } from '@agentlogin/rp';
 const rp = new RelyingParty({
   clientId: 'https://app.example.org/client-metadata.json',   // Open Client: no registration, this URL is your identifier
   redirectUri: 'https://app.example.org/auth/agent/callback',
-  issuers: ['https://issuer.example'],                         // the issuers you accept
+  issuers: ['https://issuer.example'],                         // the issuers you accept, exactly as they publish themselves
   stateSecret: process.env.STATE_SECRET!,                      // 32+ characters
 });
 
@@ -19,44 +24,77 @@ const auth = createHandlers(rp, {
   metadata: { clientName: 'Example App', maxSignupsPerOwner: 5 },
   onSignIn: async (signIn) => {
     const account = await upsertAccount(signIn.agent.key);     // (iss, sub): never key on the handle
-    return redirectWithSession(account, signIn.returnTo ?? '/');
+    const session = { account, agent: signIn.agent, live: rp.liveCheckOf(signIn) };
+    return redirectWithSession(session, signIn.returnTo ?? '/');
   },
 });
-// Web-standard handlers (Request -> Response): Hono, Next.js route handlers, Workers, Bun, Deno, Node adapters
-//   GET  /client-metadata.json     -> auth.metadata
-//   GET/POST /auth/agent/login     -> auth.login      (form field `handle`, or `iss` + `login_hint`)
-//   GET  /auth/agent/callback      -> auth.callback
+//   GET       /client-metadata.json  -> auth.metadata
+//   GET, POST /auth/agent/login      -> auth.login      (form field `handle`, or `iss` + `login_hint`)
+//   GET       /auth/agent/callback   -> auth.callback
 // and in your page:  signInForm({ action: '/auth/agent/login' })
 ```
+
+`auth.login` is also where an agent starts: it calls the URL with `iss` and `login_hint` (Section 5.8), and the
+`agentlogin` client does that for you. Publish the URL as `initiateLoginUri` in `metadata`.
+
+## What a sign-in gives you
+
+`signIn.agent` identifies the agent and holds no personal data of its owner: `key` (issuer and `sub`), `handle`,
+`name`, `ownerKey` (opaque, for per-owner limits). `signIn.owner` is present only when a Registered Client requested
+owner scopes: `name`, `email`, `verifiedVia`. Store it apart from agent data. `signIn.accessToken` is a bearer
+credential valid for ten minutes and usable only for the live check; do not log it and do not keep it longer.
 
 Before an action with lasting effect, ask the issuer whether it still vouches for the agent:
 
 ```ts
-await rp.recheck(session.signIn);   // throws RelyingPartyError('revoked') after key revocation or account disable
+await rp.recheck(session.live);
+// throws RelyingPartyError 'revoked' after a key revocation or an account disable,
+// and 'reauthentication_required' once the access token has expired: require a new sign-in then
 ```
 
-What the kit does for you, by specification section:
+## What the kit checks
 
 | Requirement | Where |
 | --- | --- |
 | `state`, `nonce`, PKCE `S256` on every request; `login_hint` when the handle is known (5.1, 9) | `begin` |
-| The issuer recorded per `state`; `iss` on the redirect checked; code sent only to that issuer (5.7 step 1) | `complete` |
-| ID Token: pinned algorithm (ES256), key by `kid`, `iss`, `aud`, `exp`, `iat`, `nonce`, `actor_type` (5.7) | `validateIdToken` |
-| Handle-to-issuer binding, `home_iss` only from a configured Relay (2.5) | `validateIdToken` |
-| Discovery only for presented handles, cached, with address filtering on every fetched endpoint (2.2, 9) | `resolve` |
+| The issuer recorded per `state`; `iss` on the redirect checked; code sent only to that issuer; one callback per sign-in (5.7 step 1) | `complete`, `callback` |
+| ID Token: pinned algorithm (ES256), key by `kid`, `iss`, `aud`, required `exp`, `iat`, `nonce`, `actor_type` (5.7) | `validateIdToken` |
+| Handle-to-issuer binding; `home_iss` only from the configured Relay and within its `home_issuers` (2.5) | `validateIdToken` |
+| Discovery only for presented handles, cached per the response; address filtering, 64 KiB and 10 s limits on every fetched endpoint (2.2, 9) | `resolve` |
 | UserInfo live check, `sub` equality, `401` as revocation (9) | `recheck` |
-| Agent-initiated start: only accepted issuers, `target_link_uri` ignored (5.8) | `login` handler |
-| Client ID Metadata Document (4.2) | `metadata` handler |
-| `access_denied` and `signup_limit_reached` presented distinctly, `error_description` escaped (9) | `errorMessage`, default error page |
+| Agent-initiated start: only accepted issuers, nothing sent to any other, `target_link_uri` ignored (5.8) | `login` |
+| Client ID Metadata Document (4.2) | `metadata` |
+| `access_denied` and `signup_limit_reached` presented distinctly; nothing from the issuer is echoed (9) | `errorMessage`, `errorPage` |
 
-Choosing issuers: list the ones you trust (`issuers`); add one Relay (`{ issuer, relay: true }`) to accept every home
-issuer that Relay accepts through a single connection; or set `federation: 'any'` to accept whichever issuer a
-presented handle's domain designates, and apply your own per-issuer limits. A Registered Client sets `clientId` and
-`clientSecret` (per issuer when you accept several) and may request `owner_profile` and `owner_email`.
+## Choosing issuers
 
-The per-sign-in record (state, nonce, PKCE verifier, issuer) travels in an encrypted HttpOnly cookie, so the kit keeps
-no server-side state. What stays your responsibility: your session, keying accounts on `agent.key` and per-owner
-limits on `agent.ownerKey`, storing owner data apart from agent data, and not logging tokens (Section 9).
+List the issuers you trust in `issuers`. Add one Relay (`{ issuer, relay: true }`) to accept every home issuer that
+Relay accepts through a single connection; do not also list a home issuer the Relay relays, or per-owner caps count
+twice (the kit refuses that configuration). Or set `federation: 'any'` to accept whichever issuer a presented
+handle designates, and apply your own per-issuer limits.
 
-Not implemented yet: `private_key_jwt` client authentication, EdDSA ID Tokens by default (opt in with
-`idTokenAlgs`), the DNS fallback of Section 2.3. See `examples/rp-hono` for a runnable application.
+A Registered Client sets `clientId`, `clientSecret` and optionally `scopes` on the issuer's entry and may request
+`owner_profile` and `owner_email`. A secret is sent only to the issuer it was configured for; a top-level
+`clientSecret` is accepted only with exactly one issuer.
+
+## Errors
+
+Every failure is a `RelyingPartyError` with a `code` from a fixed set (`RelyingPartyErrorCode`), a `message` written
+by the kit, a `status` (400, 500 for `configuration_error`, 502 for upstream failures) and, for errors the issuer
+returned, its untrusted `description`. Codes from the issuer: `access_denied`, `signup_limit_reached`,
+`consent_required`, `interaction_required`, `invalid_request`, `invalid_scope` and the other OAuth codes; any other
+value becomes `issuer_error`. Codes from the kit: `invalid_state`, `duplicate_callback`, `issuer_mismatch`,
+`issuer_not_accepted`, `invalid_id_token`, `handle_binding_failed`, `token_request_failed`, `discovery_failed`,
+`userinfo_failed`, `revoked`, `reauthentication_required`, `invalid_handle`, `handle_required`, `configuration_error`.
+Whatever your `onSignIn` throws is not caught.
+
+## Limits to know
+
+- A started sign-in is valid for 15 minutes (`pendingTtlSeconds`, up to a day). One that waits longer for the
+  agent's owner has to be started again.
+- The per-sign-in record (state, nonce, PKCE verifier, issuer) travels in an encrypted `__Host-` cookie, so the kit
+  keeps no server-side state; changing `stateSecret` ends the sign-ins in progress.
+- Not implemented: `private_key_jwt` client authentication, the DNS fallback of Section 2.3. EdDSA ID Tokens are
+  accepted only when you set `idTokenAlgs`.
+
+See `examples/rp-hono` for a runnable application.

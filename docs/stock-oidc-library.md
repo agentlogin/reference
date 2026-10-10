@@ -1,14 +1,18 @@
 # Accepting agents with a stock OpenID Connect library
 
 For the application, Agent Login is OpenID Connect: Authorization Code Flow, PKCE `S256`, an ES256 ID Token. A
-standard library therefore works unmodified. This is exercised in CI with `openid-client` 6
+standard library therefore works unmodified. The test suite exercises this with `openid-client` 6
 (`packages/rp/test/stock-oidc.test.ts`): discovery, the authorization URL, the code exchange, ID Token validation and
 UserInfo all pass against the reference issuer.
 
 ```ts
 import * as oidc from 'openid-client';
 
+// Open Client: CLIENT_ID is the HTTPS URL of a Client ID Metadata Document you serve; no secret.
 const config = await oidc.discovery(new URL('https://issuer.example'), CLIENT_ID, undefined, oidc.None());
+// Registered Client: CLIENT_ID is the identifier the issuer assigned.
+// const config = await oidc.discovery(new URL('https://issuer.example'), CLIENT_ID, undefined, oidc.ClientSecretBasic(CLIENT_SECRET));
+
 const verifier = oidc.randomPKCECodeVerifier();
 const state = oidc.randomState();
 const nonce = oidc.randomNonce();
@@ -21,19 +25,22 @@ const tokens = await oidc.authorizationCodeGrant(config, callbackUrl, { pkceCode
 const claims = tokens.claims();
 ```
 
-`CLIENT_ID` is either the HTTPS URL of a Client ID Metadata Document you serve (an Open Client, no registration) or
-the identifier a registration gave you.
+Only the Open Client form is covered by the test.
 
-A stock library does not know the two Relying Party additions of the specification. Add them yourself, or use
-`@agentlogin/rp`, which does both:
+A stock library does not know the Relying Party additions of the specification. Add them yourself, or use
+`@agentlogin/rp`, which does all three:
 
 1. **`actor_type`** (Section 5.7 step 6): reject the token unless `claims.actor_type === 'agent'`.
-2. **Handle binding** (Section 2.5): when the token carries `email`, confirm that discovery for the handle's domain
-   yields the token's `iss`. Without it, a token is only as trustworthy as the issuer you configured: that issuer
-   could name a handle in a domain it does not serve.
+2. **`home_iss`** (Section 2.5): reject a token that carries `home_iss` unless its issuer is one you configured as a
+   Relay and `home_iss` is among that Relay's `home_issuers`.
+3. **Handle binding** (Section 2.5): when the token carries `email`, confirm that discovery for that handle yields
+   the token's `iss` (or `home_iss` for a Relay token). Without it, a token is only as trustworthy as the issuer you
+   configured: that issuer could name a handle in a domain it does not serve. The lookup goes to a host chosen by
+   whoever presented the handle, so it needs the fetch protections of Section 2.2 (no private addresses, size and
+   time limits); `discoverIssuer` from the `agentlogin` package applies them.
 
-And follow Section 9: key accounts on (`iss`, `sub`), never on the handle; use the access token only at UserInfo and
-treat a `401` there as revocation; expect `ES256` if your library defaults to `RS256`.
+And follow Section 9: key accounts on (`iss`, `sub`), never on the handle; use the access token only at UserInfo, for
+at most its lifetime, and treat a `401` there as revocation; expect `ES256` if your library defaults to `RS256`.
 
-Hosted identity products that accept a custom OpenID Connect provider should work the same way, with the same two
+Hosted identity products that accept a custom OpenID Connect provider should work the same way, with the same
 additions. None has been tested yet; guides will be added only for configurations that were run.

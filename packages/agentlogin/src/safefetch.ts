@@ -57,17 +57,14 @@ function expandV6(addr: string): bigint {
   const groups = [...hs, ...new Array(8 - hs.length - ts.length).fill('0'), ...ts];
   return groups.reduce((acc, g) => (acc << 16n) | BigInt(parseInt(g || '0', 16)), 0n);
 }
+/** IPv6 is default-deny: only global unicast (2000::/3) outside the special-purpose blocks, or an embedded IPv4 address that passes the IPv4 check. */
 function v6Blocked(addr: string): boolean {
   const n = expandV6(addr);
   const inRange = (prefix: string, bits: number) => (n >> BigInt(128 - bits)) === (expandV6(prefix) >> BigInt(128 - bits));
-  if (inRange('::ffff:0:0', 96)) return v4Blocked(intToV4(Number(n & 0xffffffffn)));
-  if (inRange('64:ff9b::', 96)) return v4Blocked(intToV4(Number(n & 0xffffffffn)));
-  if (inRange('64:ff9b:1::', 48)) return true;
+  if (inRange('::ffff:0:0', 96) || inRange('64:ff9b::', 96)) return v4Blocked(intToV4(Number(n & 0xffffffffn)));
   if (inRange('2002::', 16)) return v4Blocked(intToV4(Number((n >> 80n) & 0xffffffffn)));
-  return (
-    n === 0n || n === 1n || inRange('100::', 64) || inRange('2001::', 23) || inRange('2001:db8::', 32) || inRange('fc00::', 7) ||
-    inRange('fe80::', 10) || inRange('ff00::', 8)
-  );
+  if (!inRange('2000::', 3)) return true;
+  return inRange('2001::', 23) || inRange('2001:db8::', 32) || inRange('3fff::', 20);
 }
 function intToV4(n: number): string {
   return [n >>> 24, (n >>> 16) & 255, (n >>> 8) & 255, n & 255].join('.');
@@ -112,6 +109,7 @@ function one(url: URL, o: SafeFetchOptions): Promise<SafeFetchResult> {
         },
         lookup: filteredLookup(allowPrivate),
         timeout: o.timeoutMs,
+        agent: false, // never reuse a socket another caller opened without the address check
       },
       (res) => {
         const chunks: Buffer[] = [];
@@ -128,6 +126,9 @@ function one(url: URL, o: SafeFetchOptions): Promise<SafeFetchResult> {
         res.on('error', reject);
       },
     );
+    // `timeout` above is an idle timeout; this bounds the whole exchange (N_FETCH).
+    const hard = setTimeout(() => req.destroy(new Error('fetch timed out')), o.timeoutMs);
+    req.on('close', () => clearTimeout(hard));
     req.on('timeout', () => req.destroy(new Error('fetch timed out')));
     req.on('error', reject);
     req.end(o.body);

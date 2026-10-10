@@ -1,7 +1,8 @@
 export { RelyingParty } from './rp.js';
-export type { RelyingPartyOptions, IssuerConfig, BeginOptions, Begun, AgentIdentity, SignIn, ClientMetadataInput } from './rp.js';
-export { RelyingPartyError } from './errors.js';
-export { createHandlers, errorMessage } from './handlers.js';
+export type { RelyingPartyOptions, IssuerConfig, BeginOptions, Begun, AgentIdentity, OwnerIdentity, SignIn, LiveCheck, ClientMetadataInput } from './rp.js';
+export { RelyingPartyError, ISSUER_ERROR_CODES, LOCAL_ERROR_CODES } from './errors.js';
+export type { RelyingPartyErrorCode } from './errors.js';
+export { createHandlers, errorMessage, errorPage, safeReturnTo } from './handlers.js';
 export type { HandlerOptions, Handlers } from './handlers.js';
 export { signInForm, signInFormCss } from './button.js';
 export type { SignInFormOptions } from './button.js';

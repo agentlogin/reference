@@ -31,8 +31,13 @@ const ENDPOINTS = ['authorization_endpoint', 'token_endpoint', 'userinfo_endpoin
 
 const cache = new Map<string, { value: IssuerMetadata; until: number }>();
 
-/** Section 2.2: resolves a handle's domain to its Issuer Identifier. */
+/** Section 2.2: resolves a handle to its Issuer Identifier. */
 export async function discoverIssuer(handle: string, o: DiscoveryOptions = {}): Promise<string> {
+  return (await lookupIssuer(handle, o)).issuer;
+}
+
+/** As discoverIssuer, with the freshness lifetime the WebFinger response allows (seconds; undefined when it states none). */
+export async function lookupIssuer(handle: string, o: DiscoveryOptions = {}): Promise<{ issuer: string; maxAge?: number }> {
   const h = parseHandle(handle);
   if (!h) throw new Error(`not a handle: ${handle}`);
   const scheme = o.allowInsecure ? 'http' : 'https';
@@ -49,7 +54,10 @@ export async function discoverIssuer(handle: string, o: DiscoveryOptions = {}): 
   }
   const link = (jrd.links ?? []).find((l) => l.rel === REL);
   if (!link?.href) throw new Error(`no issuer link for ${h.handle}`);
-  return checkIssuerIdentifier(link.href, o);
+  const cc = String(res.headers['cache-control'] ?? '');
+  const m = /(?:^|,)\s*max-age=(\d+)/i.exec(cc);
+  const maxAge = /no-store|no-cache/i.test(cc) ? 0 : m ? Number(m[1]) : undefined;
+  return { issuer: checkIssuerIdentifier(link.href, o), maxAge };
 }
 
 /** An Issuer Identifier is an https URL without query or fragment; it is compared as a string, never normalised. */
@@ -78,9 +86,10 @@ export async function fetchMetadata(issuer: string, o: DiscoveryOptions = {}): P
   if (m.issuer !== issuer) throw new Error(`metadata issuer ${m.issuer} does not equal ${issuer}`);
   for (const k of ENDPOINTS) {
     const v = m[k];
-    if (typeof v !== 'string' || !(v.startsWith('https://') || (o.allowInsecure && v.startsWith('http://')))) throw new Error(`metadata ${k} is not an https URL`);
+    if (typeof v !== 'string' || !URL.canParse(v) || !(v.startsWith('https://') || (o.allowInsecure && v.startsWith('http://')))) throw new Error(`metadata ${k} is not an https URL`);
   }
   if (!Array.isArray(m.handle_domains) || !Array.isArray(m.agent_key_algs_supported)) throw new Error('metadata lacks Agent Login members');
+  if (cache.size >= 200) cache.delete(cache.keys().next().value!); // bounded: identifiers can be chosen by whoever presents a handle
   cache.set(issuer, { value: m, until: Date.now() + 300_000 });
   return m;
 }

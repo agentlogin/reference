@@ -9,7 +9,7 @@ import { serve } from '@hono/node-server';
 import { SignJWT, calculateJwkThumbprint, exportJWK, generateKeyPair, type CryptoKey, type JWK } from 'jose';
 import { AgentLogin, AgentLoginError, MemoryCookieJar, MemoryKeystore } from 'agentlogin';
 import { createIssuer } from '../../issuer/src/index.js';
-import { RelyingParty, RelyingPartyError, createHandlers, signInForm, type SignIn } from '../src/index.js';
+import { RelyingParty, RelyingPartyError, createHandlers, safeReturnTo, signInForm, type SignIn } from '../src/index.js';
 
 const rnd = (n = 16) => randomBytes(n).toString('base64url');
 async function freePort(): Promise<number> {
@@ -69,6 +69,7 @@ before(async () => {
     metadata: { clientName: 'Kit Test App', maxSignupsPerOwner: 5 },
     onSignIn: (signIn) => {
       const sid = rnd();
+      assert.equal(signIn.owner, undefined, 'an Open Client receives no Owner data');
       sessions.set(sid, signIn);
       return new Response(null, { status: 302, headers: { location: signIn.returnTo ?? '/me', 'set-cookie': `sid=${sid}; Path=/; HttpOnly` } });
     },
@@ -141,6 +142,10 @@ test('login refuses an Issuer that is not accepted and an invalid handle', async
   assert.match(await a.text(), /does not accept/);
   const b = await fetch(`${rpUrl}/auth/agent/login?handle=not-a-handle`, { redirect: 'manual' });
   assert.equal(b.status, 400);
+  for (const hint of ['not-a-handle', 'a%40nonexistent.invalid', 'scout%40example.com']) {
+    const r = await fetch(`${rpUrl}/auth/agent/login?iss=${encodeURIComponent('https://unaccepted.example')}&login_hint=${hint}`, { redirect: 'manual' });
+    assert.equal(r.status, 400, hint);
+  }
   const c = await fetch(`${rpUrl}/auth/agent/login`, { method: 'POST', redirect: 'manual', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: 'handle=scout%40example.com' });
   assert.equal(c.status, 302);
   const u = new URL(c.headers.get('location')!);
@@ -162,19 +167,28 @@ test('the callback validates state and iss before anything else and presents err
     return { status: r.status, text: await r.text() };
   };
   const iss = encodeURIComponent(issuerUrl);
+  // Each started sign-in gets one callback: a fresh start per case that carries a valid cookie.
+  const withFresh = async (query: (state: string) => string) => { const s = await start(); return cb(query(s.state), s.cookie); };
   const s1 = await start();
   assert.match((await cb(`code=x&state=${s1.state}&iss=${iss}`)).text, /invalid_state/, 'no cookie');
   assert.match((await cb(`code=x&state=${rnd()}&iss=${iss}`, s1.cookie)).text, /invalid_state/, 'state of another sign-in');
-  assert.match((await cb(`code=x&state=${s1.state}&iss=${encodeURIComponent('https://evil.example')}`, s1.cookie)).text, /issuer_mismatch/);
-  assert.match((await cb(`code=x&state=${s1.state}`, s1.cookie)).text, /issuer_mismatch/, 'missing iss');
   assert.match((await cb(`code=x&state=${s1.state}&iss=${iss}`, `${s1.cookie.split('=')[0]}=garbage`)).text, /invalid_state/, 'tampered cookie');
-  const denied = await cb(`error=access_denied&state=${s1.state}&iss=${iss}`, s1.cookie);
-  const limit = await cb(`error=signup_limit_reached&error_description=%3Cscript%3Ealert(1)%3C%2Fscript%3E&state=${s1.state}&iss=${iss}`, s1.cookie);
+  assert.match((await withFresh((st) => `code=x&state=${st}&iss=${encodeURIComponent('https://evil.example')}`)).text, /issuer_mismatch/);
+  assert.match((await withFresh((st) => `code=x&state=${st}`)).text, /issuer_mismatch/, 'missing iss');
+  const denied = await withFresh((st) => `error=access_denied&state=${st}&iss=${iss}`);
+  const limit = await withFresh((st) => `error=signup_limit_reached&error_description=%3Cscript%3Ealert(1)%3C%2Fscript%3E&state=${st}&iss=${iss}`);
   assert.equal(denied.status, 400);
   assert.match(denied.text, /cancelled or is not permitted/);
   assert.match(limit.text, /number of agents it accepts/);
   assert.equal(limit.text.includes('<script>'), false);
-  assert.match((await cb(`code=not-a-code&state=${s1.state}&iss=${iss}`, s1.cookie)).text, /token_request_failed/);
+  const odd = await withFresh((st) => `error=%3Cb%3Eboom&state=${st}&iss=${iss}`);
+  assert.match(odd.text, /issuer_error/);
+  assert.equal(odd.text.includes('boom'), false, 'an unknown error code from the Issuer is not echoed');
+  const s2 = await start();
+  const first = await cb(`code=not-a-code&state=${s2.state}&iss=${iss}`, s2.cookie);
+  assert.equal(first.status, 502);
+  assert.match(first.text, /token_request_failed/);
+  assert.match((await cb(`code=not-a-code&state=${s2.state}&iss=${iss}`, s2.cookie)).text, /duplicate_callback/, 'state is consumed');
 });
 
 test('ID Token validation (Section 5.7) and the handle binding (Section 2.5)', async () => {
@@ -214,6 +228,8 @@ test('ID Token validation (Section 5.7) and the handle binding (Section 2.5)', a
   await rejects(check(plain, await mint({}, { exp: Math.floor(Date.now() / 1000) - 1, iat: Math.floor(Date.now() / 1000) - 700 })), 'invalid_id_token');
   await rejects(check(plain, await mint({}, { iat: Math.floor(Date.now() / 1000) + 600, exp: Math.floor(Date.now() / 1000) + 1200 })), 'invalid_id_token');
   await rejects(check(plain, await mint({}, { iss: issuerUrl })), 'invalid_id_token');
+  const noExp = await new SignJWT({ nonce, actor_type: 'agent' }).setProtectedHeader({ alg: 'ES256', kid: rogueKey.kid }).setIssuer(rogueUrl).setSubject('b1Ykm9wQ2tN0cJ6vR8dLxA').setAudience(clientId).setIssuedAt().sign(rogueKey.privateKey);
+  await rejects(check(plain, noExp), 'invalid_id_token');
   // Another key, same kid: the signature does not verify.
   const other = await generateKeyPair('ES256');
   const forged = await new SignJWT({ nonce, actor_type: 'agent' }).setProtectedHeader({ alg: 'ES256', kid: rogueKey.kid }).setIssuer(rogueUrl).setSubject('x').setAudience(clientId).setIssuedAt().setExpirationTime('5m').sign(other.privateKey);
@@ -242,6 +258,26 @@ test('issuer choice: allow-list, relay and open federation', async () => {
   assert.ok(b.url.startsWith(`${rogueUrl}/authorize?`) && new URL(b.url).searchParams.get('login_hint') === 'scout@example.com');
   const two = new RelyingParty({ ...cfg, issuers: [issuerUrl, rogueUrl], staticIssuers: elsewhere });
   await assert.rejects(two.begin(), (e: unknown) => e instanceof RelyingPartyError && e.code === 'handle_required');
+});
+
+test('configuration rules: secrets stay with their Issuer, one Relay, no Relay beside a Home Issuer it relays', async () => {
+  const cfg = { clientId: 's6BhdRkqt3', redirectUri: `${rpUrl}/auth/agent/callback`, stateSecret: 'test-secret-test-secret-test-secret-1234', allowInsecure: true, staticIssuers: { 'example.com': issuerUrl } };
+  assert.throws(() => new RelyingParty({ ...cfg, clientSecret: 'x', issuers: [issuerUrl, rogueUrl] }), /clientSecret/);
+  assert.throws(() => new RelyingParty({ ...cfg, clientSecret: 'x', issuers: [issuerUrl], federation: 'any' }), /clientSecret/);
+  assert.throws(() => new RelyingParty({ ...cfg, issuers: [{ issuer: rogueUrl, relay: true }, { issuer: issuerUrl, relay: true }] }), /one Relay/);
+  assert.throws(() => new RelyingParty({ ...cfg, issuers: [{ issuer: rogueUrl, relay: true }], federation: 'any' }), /Relay/);
+  assert.throws(() => new RelyingParty({ ...cfg, issuers: ['not a url'] }), /Issuer Identifier/);
+  assert.throws(() => new RelyingParty({ ...cfg, issuers: [issuerUrl], stateSecret: undefined as unknown as string }), /stateSecret/);
+  // the test Relay accepts every Home Issuer ("*"), so listing one beside it is a configuration error
+  const both = new RelyingParty({ ...cfg, issuers: [issuerUrl, { issuer: rogueUrl, relay: true }] });
+  await assert.rejects(both.begin({ handle: 'scout@example.com' }), (e: unknown) => e instanceof RelyingPartyError && e.code === 'configuration_error' && e.status === 500);
+});
+
+test('return_to accepts same-origin paths only', () => {
+  for (const ok of ['/', '/dashboard', '/a/b?c=d&e=f#g']) assert.equal(safeReturnTo(ok), ok);
+  for (const bad of ['//evil.example', '/\\evil.example', '/\t/evil.example', '/\n/evil.example', 'https://evil.example', 'javascript:alert(1)', '/ space', '', `/${'a'.repeat(600)}`]) {
+    assert.equal(safeReturnTo(bad), undefined, JSON.stringify(bad));
+  }
 });
 
 test('the sign-in form escapes its inputs', () => {
