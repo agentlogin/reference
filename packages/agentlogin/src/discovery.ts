@@ -1,7 +1,7 @@
 // Section 2: WebFinger discovery of the Home Issuer and its metadata. HTTPS only, no HTTP retry, at most five
 // redirect hops, fetch protections of Section 2.2. The DNS fallback (Section 2.3) requires DNSSEC validation that
 // Node.js does not expose; this client does not implement it and reports the WebFinger failure instead.
-import { parseHandle } from './handle.js';
+import { acctUri, parseHandle } from './handle.js';
 import { safeFetch } from './safefetch.js';
 
 export interface IssuerMetadata {
@@ -29,7 +29,26 @@ const REL = 'http://openid.net/specs/connect/1.0/issuer';
 const MAX_BYTES = 64 * 1024;
 const ENDPOINTS = ['authorization_endpoint', 'token_endpoint', 'userinfo_endpoint', 'jwks_uri', 'transaction_endpoint', 'agents_endpoint'] as const;
 
+const T_CACHE = 86_400; // seconds, Section 1.5
 const cache = new Map<string, { value: IssuerMetadata; until: number }>();
+
+/** Freshness lifetime in seconds that a response allows: 0 for no-store or no-cache, max-age capped at T_CACHE, `fallback` when it states none. */
+export function freshness(cacheControl: string | string[] | undefined, fallback: number): number {
+  const cc = String(cacheControl ?? '');
+  if (/(?:^|,)\s*(?:no-store|no-cache)\b/i.test(cc)) return 0;
+  const m = /(?:^|,)\s*max-age=(\d+)/i.exec(cc);
+  return Math.min(m ? Number(m[1]) : fallback, T_CACHE);
+}
+
+/** The WebFinger request for a handle (Section 2.2): the acct URI, itself percent-encoded, as the `resource` value. */
+export function webfingerUrl(handle: string, o: DiscoveryOptions = {}): URL {
+  const h = parseHandle(handle);
+  if (!h) throw new Error(`not a handle: ${handle}`);
+  const url = new URL(`${o.allowInsecure ? 'http' : 'https'}://${h.domain}/.well-known/webfinger`);
+  url.searchParams.set('resource', acctUri(h.handle));
+  url.searchParams.set('rel', REL);
+  return url;
+}
 
 /** Section 2.2: resolves a handle to its Issuer Identifier. */
 export async function discoverIssuer(handle: string, o: DiscoveryOptions = {}): Promise<string> {
@@ -40,10 +59,7 @@ export async function discoverIssuer(handle: string, o: DiscoveryOptions = {}): 
 export async function lookupIssuer(handle: string, o: DiscoveryOptions = {}): Promise<{ issuer: string; maxAge?: number }> {
   const h = parseHandle(handle);
   if (!h) throw new Error(`not a handle: ${handle}`);
-  const scheme = o.allowInsecure ? 'http' : 'https';
-  const url = new URL(`${scheme}://${h.domain}/.well-known/webfinger`);
-  url.searchParams.set('resource', `acct:${h.handle}`);
-  url.searchParams.set('rel', REL);
+  const url = webfingerUrl(h.handle, o);
   const res = await safeFetch(url, { maxBytes: MAX_BYTES, timeoutMs: o.timeoutMs ?? 10_000, allowPrivate: o.allowInsecure, maxRedirects: 5, accept: 'application/jrd+json, application/json' });
   if (res.status !== 200) throw new Error(`WebFinger lookup for ${h.domain} failed with status ${res.status}`);
   let jrd: { links?: Array<{ rel?: string; href?: string }> };
@@ -54,10 +70,8 @@ export async function lookupIssuer(handle: string, o: DiscoveryOptions = {}): Pr
   }
   const link = (jrd.links ?? []).find((l) => l.rel === REL);
   if (!link?.href) throw new Error(`no issuer link for ${h.handle}`);
-  const cc = String(res.headers['cache-control'] ?? '');
-  const m = /(?:^|,)\s*max-age=(\d+)/i.exec(cc);
-  const maxAge = /no-store|no-cache/i.test(cc) ? 0 : m ? Number(m[1]) : undefined;
-  return { issuer: checkIssuerIdentifier(link.href, o), maxAge };
+  const cc = res.headers['cache-control'];
+  return { issuer: checkIssuerIdentifier(link.href, o), maxAge: cc === undefined ? undefined : freshness(cc, 300) };
 }
 
 /** An Issuer Identifier is an https URL without query or fragment; it is compared as a string, never normalised. */
@@ -74,23 +88,31 @@ export function checkIssuerIdentifier(issuer: string, o: DiscoveryOptions = {}):
   return issuer;
 }
 
-/** Section 2.4: fetches and validates Issuer metadata; `issuer` must equal the identifier. */
+/**
+ * Section 2.4: fetches and validates Issuer metadata; `issuer` must equal the identifier. Cached for as long as the
+ * response allows (five minutes when it states nothing, never for no-store), separately per security mode.
+ */
 export async function fetchMetadata(issuer: string, o: DiscoveryOptions = {}): Promise<IssuerMetadata> {
-  const hit = cache.get(issuer);
-  if (hit && hit.until > Date.now()) return hit.value;
   checkIssuerIdentifier(issuer, o);
+  const key = `${o.allowInsecure ? 'insecure' : 'secure'}|${issuer}`; // what development mode accepted is never served to a strict caller
+  const hit = cache.get(key);
+  if (hit && hit.until > Date.now()) return hit.value;
   // Section 4 of OpenID Connect Discovery: a terminating "/" is removed before the well-known path is appended.
   const res = await safeFetch(`${issuer.replace(/\/$/, '')}/.well-known/openid-configuration`, { maxBytes: MAX_BYTES, timeoutMs: o.timeoutMs ?? 10_000, allowPrivate: o.allowInsecure, maxRedirects: 0 });
   if (res.status !== 200) throw new Error(`metadata for ${issuer} failed with status ${res.status}`);
   const m = JSON.parse(res.body.toString('utf8')) as IssuerMetadata;
-  if (m.issuer !== issuer) throw new Error(`metadata issuer ${m.issuer} does not equal ${issuer}`);
+  if (typeof m !== 'object' || m === null || m.issuer !== issuer) throw new Error(`metadata issuer ${String(m?.issuer)} does not equal ${issuer}`);
   for (const k of ENDPOINTS) {
     const v = m[k];
     if (typeof v !== 'string' || !URL.canParse(v) || !(v.startsWith('https://') || (o.allowInsecure && v.startsWith('http://')))) throw new Error(`metadata ${k} is not an https URL`);
   }
   if (!Array.isArray(m.handle_domains) || !Array.isArray(m.agent_key_algs_supported)) throw new Error('metadata lacks Agent Login members');
-  if (cache.size >= 200) cache.delete(cache.keys().next().value!); // bounded: identifiers can be chosen by whoever presents a handle
-  cache.set(issuer, { value: m, until: Date.now() + 300_000 });
+  cache.delete(key);
+  const ttl = freshness(res.headers['cache-control'], 300);
+  if (ttl > 0) {
+    if (cache.size >= 200) cache.delete(cache.keys().next().value!); // bounded: identifiers can be chosen by whoever presents a handle
+    cache.set(key, { value: m, until: Date.now() + ttl * 1000 });
+  }
   return m;
 }
 

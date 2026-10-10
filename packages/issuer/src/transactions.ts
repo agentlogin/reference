@@ -4,6 +4,7 @@ import { AGENT_KEY_ALGS, ASSERTION_TYP, DISCLOSURE, OWNER_SCOPES, SCOPES, type S
 import type { IssuerContext } from './context.js';
 import { OAuthError } from './errors.js';
 import { getLiveKey } from './agents.js';
+import { ownerClaimsAvailable } from './tokens.js';
 import { TERMINAL, type Client, type Consent, type ConsentReason, type DenyReason, type Transaction, type TxStatus } from './store.js';
 import { domainServed, handlesEqual, isPlainObject, nowSeconds, parseHandle, randomId, randomSecret, sha256, typMatches } from './util.js';
 
@@ -151,20 +152,26 @@ export function identifyViewer(tx: Transaction, bearer: string | null, cookieSec
 }
 
 /** Section 6.4: whether a review is required, and why. */
-export function reviewReason(ctx: IssuerContext, tx: Transaction, client: Client, consent: Consent | undefined): ConsentReason | null {
-  if (!consent) return 'first_visit';
-  const redirectHost = new URL(tx.redirectUri).host;
-  const changed =
-    !tx.scopes.every((s) => consent.scopes.includes(s)) ||
-    consent.redirectHost !== redirectHost ||
-    consent.clientName !== client.clientName ||
-    consent.tosUri !== client.tosUri ||
-    consent.policyUri !== client.policyUri;
-  if (changed) return 'material_change';
-  if (ctx.now() - consent.lastUsedAt > ctx.constants.T_CONSENT) return 'expired';
-  if (tx.prompt === 'consent') return 'prompt_consent';
-  if (client.requireReview) return 'policy';
-  return null;
+/**
+ * Section 6.4: why a review is required. `record` is a reason that the Agent's acceptance of the disclosure
+ * satisfies (the Consent Record is missing, outdated or expired); `forced` is one that it does not (the request or
+ * the client demands a review).
+ */
+export function reviewReasons(ctx: IssuerContext, tx: Transaction, client: Client, consent: Consent | undefined): { record: ConsentReason | null; forced: ConsentReason | null } {
+  let record: ConsentReason | null = null;
+  if (!consent) record = 'first_visit';
+  else {
+    const changed =
+      !tx.scopes.every((s) => consent.scopes.includes(s)) ||
+      consent.redirectHost !== new URL(tx.redirectUri).host ||
+      consent.clientName !== client.clientName ||
+      consent.tosUri !== client.tosUri ||
+      consent.policyUri !== client.policyUri;
+    if (changed) record = 'material_change';
+    else if (ctx.now() - consent.lastUsedAt > ctx.constants.T_CONSENT) record = 'expired';
+  }
+  const forced: ConsentReason | null = tx.prompt === 'consent' ? 'prompt_consent' : client.requireReview ? 'policy' : null;
+  return { record, forced };
 }
 
 async function writeConsent(ctx: IssuerContext, tx: Transaction, client: Client): Promise<void> {
@@ -289,24 +296,52 @@ export async function assert(ctx: IssuerContext, tx: Transaction, client: Client
   }
   // Step 9: per-owner cap (Section 7.6).
   if (!account && client.maxSignupsPerOwner !== undefined) {
-    const ever = await ctx.store.signupsEver(agent.ownerId, tx.clientId);
-    const inflight = (await ctx.store.listOpenTransactions({ ownerId: agent.ownerId, clientId: tx.clientId })).filter((t) => t.passedCap && t.id !== tx.id).length;
-    if (ever + inflight >= client.maxSignupsPerOwner) {
+    const max = client.maxSignupsPerOwner;
+    // Checked and reserved under one lock per (Owner, client), so that concurrent first sign-ins cannot both take the
+    // last place. A place is held by an Agent, not by a transaction: several transactions of one Agent hold one, and
+    // a transaction that has expired holds none, whether or not anyone has read it since.
+    const admitted = await ctx.locks.run(`cap:${agent.ownerId}\u0000${tx.clientId}`, async () => {
+      const ever = await ctx.store.signupsEver(agent.ownerId, tx.clientId);
+      const now = ctx.now();
+      const others = new Set(
+        (await ctx.store.listOpenTransactions({ ownerId: agent.ownerId, clientId: tx.clientId }))
+          .filter((t) => t.passedCap && t.id !== tx.id && now < t.expiresAt && t.handle !== agent.handle)
+          .map((t) => t.handle),
+      );
+      if (ever + others.size >= max) return false;
+      tx.passedCap = true;
+      await ctx.store.putTransaction(tx); // the reservation is stored before the lock is released
+      return true;
+    });
+    if (!admitted) {
       setTerminal(ctx, tx, 'denied', 'signup_limit_reached');
       await ctx.store.putTransaction(tx);
       return token;
     }
-    tx.passedCap = true;
   }
   // Step 10: gates.
   const wantsOwner = tx.scopes.some((s) => OWNER_SCOPES.includes(s));
+  if (wantsOwner) {
+    // Section 6.6: a requested Owner Claim that cannot be issued for this Owner ends the sign-in; it is never omitted.
+    const owner = await ctx.store.getOwner(agent.ownerId);
+    if (!owner || !ownerClaimsAvailable(owner, tx.scopes)) {
+      setTerminal(ctx, tx, 'denied', 'access_denied');
+      await ctx.store.putTransaction(tx);
+      return token;
+    }
+  }
   tx.ownerApprovalOutstanding = wantsOwner && !key.permissions.share_owner;
   const consent = await ctx.store.getConsent(agent.handle, tx.clientId);
-  const reason = reviewReason(ctx, tx, client, consent);
-  if (reason === 'expired') await ctx.store.deleteConsent(agent.handle, tx.clientId); // Section 6.4: unused for T_CONSENT
-  const satisfiable = reason === 'first_visit' || reason === 'material_change' || reason === 'expired';
-  tx.reviewOutstanding = reason !== null && !(tx.acceptDisclosure && satisfiable);
-  tx.consentReason = reason ?? undefined;
+  const { record, forced } = reviewReasons(ctx, tx, client, consent);
+  if (record === 'expired') await ctx.store.deleteConsent(agent.handle, tx.clientId); // Section 6.4: unused for T_CONSENT
+  // accept_disclosure answers for the Consent Record only; a review that the request or the client demands stays due.
+  const recordOutstanding = record !== null && !tx.acceptDisclosure;
+  tx.reviewOutstanding = recordOutstanding || forced !== null;
+  tx.consentReason = (recordOutstanding ? record : forced) ?? undefined;
+  if (consent && record === null) {
+    consent.lastUsedAt = ctx.now(); // the record is used by this sign-in: T_CONSENT runs from the last use (Section 1.5)
+    await ctx.store.putConsent(consent);
+  }
   if (tx.prompt === 'none' && tx.reviewOutstanding) {
     setTerminal(ctx, tx, 'denied', 'consent_required');
   } else if (tx.prompt === 'none' && tx.ownerApprovalOutstanding) {
@@ -385,16 +420,8 @@ export async function cont(ctx: IssuerContext, tx: Transaction, secret: string, 
     tx.codeIssued = true;
     setTerminal(ctx, tx, 'completed');
     // Section 7.4: the Account is created or updated at the first completed transaction.
-    const existing = await ctx.store.getAccount(tx.handle!, tx.clientId);
-    const now = ctx.now();
-    if (existing) {
-      existing.lastSignedInAt = now;
-      existing.signInCount += 1;
-      await ctx.store.putAccount(existing);
-    } else {
-      await ctx.store.putAccount({ handle: tx.handle!, clientId: tx.clientId, status: 'enabled', firstSignedInAt: now, lastSignedInAt: now, signInCount: 1 });
-      await ctx.store.countSignup(tx.ownerId!, tx.clientId);
-    }
+    // One atomic store operation: concurrent first completions create one Account and count one sign-up (Section 7.6).
+    await ctx.store.recordSignIn({ handle: tx.handle!, clientId: tx.clientId, ownerId: tx.ownerId!, now: ctx.now() });
     await ctx.store.putTransaction(tx);
     u.searchParams.set('code', code);
     return { redirect: u.href };

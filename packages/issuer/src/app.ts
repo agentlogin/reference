@@ -12,7 +12,7 @@ import type { Client, OwnerVerifiedVia, SessionAuth, Transaction } from './store
 import * as tx from './transactions.js';
 import { authenticateClient, exchangeCode, userinfo } from './tokens.js';
 import * as agents from './agents.js';
-import { domainServed, isPlainObject, parseBearer, parseHandle, prefersJson, randomId, randomSecret, safeEqual, sha256 } from './util.js';
+import { domainServed, isPlainObject, parseBearer, parseHandle, prefersJson, randomId, randomSecret, safeEqual, sha256, acctUri, parseAcctUri } from './util.js';
 
 const WAIT_JS = readFileSync(fileURLToPath(new URL('../static/wait.js', import.meta.url)), 'utf8');
 const NO_STORE = { 'Cache-Control': 'no-store', Pragma: 'no-cache' };
@@ -96,12 +96,13 @@ export function createIssuerApp(ctx: IssuerContext): Hono {
   );
   // Section 2.2: WebFinger for handles in the served domains (per-handle lookups only).
   app.get('/.well-known/webfinger', async (c) => {
-    const resource = c.req.query('resource') ?? '';
-    const h = resource.startsWith('acct:') ? parseHandle(resource.slice(5)) : null;
+    // The query value is decoded once by the framework; the `acct:` URI inside it carries its own percent-encoding
+    // of the userpart (RFC 7565 Section 7), decoded by parseAcctUri.
+    const h = parseAcctUri(c.req.query('resource') ?? '');
     if (!h || !domainServed(h.domain, ctx.handleDomains) || !(await ctx.store.getAgent(h.handle))) return c.body(null, 404);
     const rel = c.req.queries('rel') ?? [];
     const links = [{ rel: 'http://openid.net/specs/connect/1.0/issuer', href: base }].filter((l) => rel.length === 0 || rel.includes(l.rel));
-    return c.json({ subject: `acct:${h.handle}`, links }, 200, { 'Content-Type': 'application/jrd+json', 'Access-Control-Allow-Origin': '*', 'Cache-Control': 'public, max-age=3600' });
+    return c.json({ subject: acctUri(h.handle), links }, 200, { 'Content-Type': 'application/jrd+json', 'Access-Control-Allow-Origin': '*', 'Cache-Control': 'public, max-age=3600' });
   });
 
   // ---- Section 5: Authentication Request ---------------------------------------------------------
@@ -280,7 +281,11 @@ export function createIssuerApp(ctx: IssuerContext): Hono {
       const decoded = Buffer.from(auth.replace(/^Basic\s+/i, ''), 'base64').toString('utf8');
       const i = decoded.indexOf(':');
       if (i < 0) throw new OAuthError(401, 'invalid_client');
-      basic = { id: decodeURIComponent(decoded.slice(0, i)), secret: decodeURIComponent(decoded.slice(i + 1)) };
+      try {
+        basic = { id: decodeURIComponent(decoded.slice(0, i)), secret: decodeURIComponent(decoded.slice(i + 1)) };
+      } catch {
+        throw new OAuthError(401, 'invalid_client', undefined, { 'WWW-Authenticate': 'Basic realm="token"' });
+      }
     }
     const req = { grantType: str('grant_type'), code: str('code'), redirectUri: str('redirect_uri'), codeVerifier: str('code_verifier'), clientIdParam: str('client_id'), clientSecretParam: str('client_secret'), basic };
     if (basic && req.clientIdParam && basic.id !== req.clientIdParam) throw new OAuthError(400, 'invalid_request', 'client_id mismatch');
@@ -298,7 +303,7 @@ export function createIssuerApp(ctx: IssuerContext): Hono {
 
   // ---- Section 7.2, 7.8: agent management ----------------------------------------------------------
   const handleOf = (c: Context) => {
-    const h = parseHandle(decodeURIComponent(c.req.param('handle') ?? ''));
+    const h = parseHandle(c.req.param('handle') ?? ''); // already percent-decoded by the router
     if (!h) throw new OAuthError(404, 'not_found');
     return h.handle;
   };
@@ -308,7 +313,7 @@ export function createIssuerApp(ctx: IssuerContext): Hono {
     const r = await agents.enrollKey(ctx, handle, await jsonBody(c));
     return c.json({ ...r.record, challenge: r.challenge, proof_url: r.proof_url }, 201, NO_STORE);
   });
-  app.post('/agents/:handle/keys/:kid/proof', async (c) => c.json(await agents.proveKey(ctx, handleOf(c), decodeURIComponent(c.req.param('kid') ?? ''), await jsonBody(c)), 200, NO_STORE));
+  app.post('/agents/:handle/keys/:kid/proof', async (c) => c.json(await agents.proveKey(ctx, handleOf(c), (c.req.param('kid') ?? ''), await jsonBody(c)), 200, NO_STORE));
   app.get('/agents/:handle/keys', async (c) => {
     const handle = handleOf(c);
     await agents.authorizeManagement(ctx, c.req.header('authorization'), handle, true);
@@ -317,7 +322,7 @@ export function createIssuerApp(ctx: IssuerContext): Hono {
   app.get('/agents/:handle/keys/:kid', async (c) => {
     const handle = handleOf(c);
     await agents.authorizeManagement(ctx, c.req.header('authorization'), handle, true);
-    const k = await agents.getLiveKey(ctx, decodeURIComponent(c.req.param('kid') ?? ''));
+    const k = await agents.getLiveKey(ctx, (c.req.param('kid') ?? ''));
     if (!k || k.handle !== handle) throw new OAuthError(404, 'not_found');
     return c.json(agents.keyRecord(ctx, k), 200, NO_STORE);
   });
@@ -326,7 +331,7 @@ export function createIssuerApp(ctx: IssuerContext): Hono {
     const body = await jsonBody(c);
     const wantsPermissions = isPlainObject(body) && body.permissions !== undefined;
     const cred = await agents.authorizeManagement(ctx, c.req.header('authorization'), handle, !wantsPermissions);
-    const k = await agents.getLiveKey(ctx, decodeURIComponent(c.req.param('kid') ?? ''));
+    const k = await agents.getLiveKey(ctx, (c.req.param('kid') ?? ''));
     if (!k || k.handle !== handle) throw new OAuthError(404, 'not_found');
     if (!isPlainObject(body)) throw new OAuthError(400, 'invalid_request');
     if (wantsPermissions) {
@@ -342,7 +347,7 @@ export function createIssuerApp(ctx: IssuerContext): Hono {
   app.delete('/agents/:handle/keys/:kid', async (c) => {
     const handle = handleOf(c);
     await agents.authorizeManagement(ctx, c.req.header('authorization'), handle, true);
-    const k = await agents.getLiveKey(ctx, decodeURIComponent(c.req.param('kid') ?? ''));
+    const k = await agents.getLiveKey(ctx, (c.req.param('kid') ?? ''));
     if (!k || k.handle !== handle) throw new OAuthError(404, 'not_found');
     if (k.status !== 'revoked') await agents.revokeKeyEffects(ctx, k);
     return c.body(null, 204, NO_STORE);
@@ -365,12 +370,12 @@ export function createIssuerApp(ctx: IssuerContext): Hono {
     if (!isPlainObject(body) || (body.status !== 'enabled' && body.status !== 'disabled')) throw new OAuthError(400, 'invalid_request', 'status must be enabled or disabled');
     const cred = await agents.authorizeManagement(ctx, c.req.header('authorization'), handle, true);
     if (cred.kind === 'delegated' && body.status === 'enabled') throw new OAuthError(403, 'insufficient_permission', 'a Delegated Credential may only disable', { 'WWW-Authenticate': 'Bearer error="insufficient_scope"' });
-    return c.json(await agents.setAccountStatus(ctx, handle, decodeURIComponent(c.req.param('client_id') ?? ''), body.status), 200, NO_STORE);
+    return c.json(await agents.setAccountStatus(ctx, handle, (c.req.param('client_id') ?? ''), body.status), 200, NO_STORE);
   });
   app.delete('/agents/:handle/consents/:client_id', async (c) => {
     const handle = handleOf(c);
     await agents.authorizeManagement(ctx, c.req.header('authorization'), handle, true);
-    await ctx.store.deleteConsent(handle, decodeURIComponent(c.req.param('client_id') ?? ''));
+    await ctx.store.deleteConsent(handle, (c.req.param('client_id') ?? ''));
     return c.body(null, 204, NO_STORE);
   });
 

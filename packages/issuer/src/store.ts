@@ -200,6 +200,8 @@ export interface Store {
   listOpenTransactions(filter: { kid?: string; handle?: string; clientId?: string; ownerId?: string }): Promise<Transaction[]>;
   putCode(c: Code): Promise<void>;
   getCode(hash: string): Promise<Code | undefined>;
+  /** Atomically marks a code used. Resolves false when it was used already: a store shared by several processes must make this a single conditional write. */
+  markCodeUsed(hash: string): Promise<boolean>;
   listCodes(filter: { txnId?: string; kid?: string; handle?: string; clientId?: string }): Promise<Code[]>;
   putAccessToken(t: AccessToken): Promise<void>;
   getAccessToken(hash: string): Promise<AccessToken | undefined>;
@@ -215,7 +217,11 @@ export interface Store {
   deleteAccount(handle: string, clientId: string): Promise<void>;
   /** Number of Accounts ever created for (Owner, client), including disabled and deleted ones. */
   signupsEver(ownerId: string, clientId: string): Promise<number>;
-  countSignup(ownerId: string, clientId: string): Promise<void>;
+  /**
+   * Atomically records a completed sign-in: creates the Account and counts one sign-up for the Owner when the Account
+   * does not exist, otherwise updates its counters. A shared store must do this in one transaction.
+   */
+  recordSignIn(p: { handle: string; clientId: string; ownerId: string; now: number }): Promise<{ created: boolean }>;
 }
 
 export class MemoryStore implements Store {
@@ -280,6 +286,12 @@ export class MemoryStore implements Store {
   }
   async putCode(c: Code) { this.codes.set(c.hash, c); }
   async getCode(hash: string) { return this.codes.get(hash); }
+  async markCodeUsed(hash: string) {
+    const c = this.codes.get(hash);
+    if (!c || c.used) return false;
+    c.used = true;
+    return true;
+  }
   async listCodes(f: { txnId?: string; kid?: string; handle?: string; clientId?: string }) {
     return [...this.codes.values()].filter(
       (c) =>
@@ -308,8 +320,18 @@ export class MemoryStore implements Store {
   async listAccounts(handle: string) { return [...this.accounts.values()].filter((a) => a.handle === handle); }
   async deleteAccount(handle: string, clientId: string) { this.accounts.delete(`${handle}\u0000${clientId}`); }
   async signupsEver(ownerId: string, clientId: string) { return this.signups.get(`${ownerId}\u0000${clientId}`) ?? 0; }
-  async countSignup(ownerId: string, clientId: string) {
-    const k = `${ownerId}\u0000${clientId}`;
+  async recordSignIn(p: { handle: string; clientId: string; ownerId: string; now: number }) {
+    // No await between the read and the writes: atomic within this process.
+    const key = `${p.handle}\u0000${p.clientId}`;
+    const existing = this.accounts.get(key);
+    if (existing) {
+      existing.lastSignedInAt = p.now;
+      existing.signInCount += 1;
+      return { created: false };
+    }
+    this.accounts.set(key, { handle: p.handle, clientId: p.clientId, status: 'enabled', firstSignedInAt: p.now, lastSignedInAt: p.now, signInCount: 1 });
+    const k = `${p.ownerId}\u0000${p.clientId}`;
     this.signups.set(k, (this.signups.get(k) ?? 0) + 1);
+    return { created: true };
   }
 }

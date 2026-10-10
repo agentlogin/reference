@@ -16,3 +16,9 @@ export function parseHandle(input: string): Handle | null {
 export function domainServed(domain: string, handleDomains: string[]): boolean {
   return handleDomains.some((d) => (d.startsWith('*.') ? domain.endsWith(d.slice(1)) && domain.length > d.length - 1 : d === domain));
 }
+/** Section 2.1 and RFC 7565 Section 7: the `acct:` URI of a handle, with octets of `local` outside `userpart` percent-encoded. */
+export function acctUri(handle: string): string {
+  const at = handle.lastIndexOf('@');
+  const userpart = [...Buffer.from(handle.slice(0, at), 'utf8')].map((b) => (/[A-Za-z0-9\-._~!$&'()*+,;=]/.test(String.fromCharCode(b)) ? String.fromCharCode(b) : `%${b.toString(16).toUpperCase().padStart(2, '0')}`)).join('');
+  return `acct:${userpart}@${handle.slice(at + 1)}`;
+}

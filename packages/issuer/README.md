@@ -41,3 +41,7 @@ Status: passes every check of `@agentlogin/conformance` (`npm test`). Not yet im
 are issued by the bootstrap API on the operator's word) and the HTML pages for Owner sign-in and approval,
 Relay profile (8), a database-backed `Store`, the `pairwise` subject type. Development mode (`INSECURE_DEV=1`, or an
 `http` issuer) permits loopback clients and private addresses in metadata fetches; never run it that way in production.
+
+Concurrency: the issuer serialises work per transaction, per authorization code and per (Owner, client) cap in
+process, and the `Store` interface has two operations that a shared store must make atomic (`markCodeUsed`,
+`recordSignIn`). Running several issuer processes on one database needs those two to be single conditional writes.

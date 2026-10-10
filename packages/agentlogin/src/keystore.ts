@@ -1,7 +1,7 @@
 // Agent Key storage (Section 7.1). The private key never leaves the keystore except to sign; it is never logged.
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { readPrivateJson, writePrivateJson } from './files.js';
+import { readPrivateJson, withFileLock, writePrivateJson } from './files.js';
 import type { JWK } from 'jose';
 
 export interface StoredKey {
@@ -33,13 +33,15 @@ export class MemoryKeystore implements Keystore {
   async remove(kid: string) { this.keys.delete(kid); }
 }
 
-/** JSON file with mode 0600 in a 0700 directory. */
+/** JSON file with mode 0600 in a 0700 directory. Changes are locked across processes, so concurrent commands lose nothing. */
 export class FileKeystore implements Keystore {
   constructor(public readonly path: string = join(agentloginHome(), 'keys.json')) {}
   private read(): StoredKey[] { return readPrivateJson<StoredKey[]>(this.path, []); }
-  private write(keys: StoredKey[]) { writePrivateJson(this.path, keys); }
+  private change(fn: (keys: StoredKey[]) => StoredKey[]): Promise<void> {
+    return withFileLock(this.path, () => writePrivateJson(this.path, fn(this.read())));
+  }
   async list(handle?: string) { return this.read().filter((k) => !handle || k.handle === handle); }
   async get(kid: string) { return this.read().find((k) => k.kid === kid); }
-  async put(key: StoredKey) { this.write([...this.read().filter((k) => k.kid !== key.kid), key]); }
-  async remove(kid: string) { this.write(this.read().filter((k) => k.kid !== kid)); }
+  async put(key: StoredKey) { await this.change((keys) => [...keys.filter((k) => k.kid !== key.kid), key]); }
+  async remove(kid: string) { await this.change((keys) => keys.filter((k) => k.kid !== kid)); }
 }

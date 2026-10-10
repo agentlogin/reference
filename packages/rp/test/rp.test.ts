@@ -28,6 +28,7 @@ let rogueUrl = '';
 let rp: RelyingParty;
 let owner: Record<string, any>;
 let rogueKey: { privateKey: CryptoKey; jwk: JWK; kid: string };
+const rogueJwks = { cacheControl: undefined as string | undefined, published: true, hits: 0 };
 const sessions = new Map<string, SignIn>();
 const closers: Array<() => Promise<void>> = [];
 
@@ -46,10 +47,13 @@ before(async () => {
   const jwk: JWK = { kty: pub.kty, crv: pub.crv, x: pub.x, y: pub.y };
   rogueKey = { privateKey: kp.privateKey, jwk, kid: await calculateJwkThumbprint(jwk, 'sha256') };
   const rogue = http.createServer((req, res) => {
-    const send = (v: unknown) => { res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify(v)); };
+    const send = (v: unknown, headers: Record<string, string> = {}) => { res.writeHead(200, { 'content-type': 'application/json', ...headers }); res.end(JSON.stringify(v)); };
     if (req.url === '/.well-known/openid-configuration') {
       send({ issuer: rogueUrl, authorization_endpoint: `${rogueUrl}/authorize`, token_endpoint: `${rogueUrl}/token`, userinfo_endpoint: `${rogueUrl}/userinfo`, jwks_uri: `${rogueUrl}/jwks`, transaction_endpoint: `${rogueUrl}/transactions`, agents_endpoint: `${rogueUrl}/agents`, handle_domains: [], home_issuers: ['*'], agent_key_algs_supported: ['ES256'], agent_login_versions_supported: ['1.0'] });
-    } else if (req.url === '/jwks') send({ keys: [{ ...jwk, kid: rogueKey.kid, use: 'sig', alg: 'ES256' }] });
+    } else if (req.url === '/jwks') {
+      rogueJwks.hits += 1;
+      send({ keys: rogueJwks.published ? [{ ...jwk, kid: rogueKey.kid, use: 'sig', alg: 'ES256' }] : [] }, rogueJwks.cacheControl ? { 'cache-control': rogueJwks.cacheControl } : {});
+    }
     else { res.writeHead(404); res.end(); }
   });
   await new Promise<void>((r) => rogue.listen(roguePort, '127.0.0.1', r));
@@ -239,6 +243,48 @@ test('ID Token validation (Section 5.7) and the handle binding (Section 2.5)', a
   await rejects(check(plain, none), 'invalid_id_token');
   const hs = await new SignJWT({ nonce, actor_type: 'agent' }).setProtectedHeader({ alg: 'HS256', kid: rogueKey.kid }).setIssuer(rogueUrl).setSubject('x').setAudience(clientId).setExpirationTime('5m').sign(new TextEncoder().encode(JSON.stringify(rogueKey.jwk)));
   await rejects(check(plain, hs), 'invalid_id_token');
+});
+
+test('#5 the JWK Set is cached only as long as the Issuer allows; a removed key stops verifying', async () => {
+  const nonce = rnd();
+  const clientId = `${rpUrl}/client-metadata.json`;
+  const mint = () => {
+    const now = Math.floor(Date.now() / 1000);
+    return new SignJWT({ nonce, actor_type: 'agent' }).setProtectedHeader({ alg: 'ES256', kid: rogueKey.kid }).setIssuer(rogueUrl).setSubject('b1Ykm9wQ2tN0cJ6vR8dLxA').setAudience(clientId).setIssuedAt(now).setExpirationTime(now + 600).sign(rogueKey.privateKey);
+  };
+  const fresh = () => new RelyingParty({ clientId, redirectUri: `${rpUrl}/auth/agent/callback`, issuers: [rogueUrl], stateSecret: 'test-secret-test-secret-test-secret-1234', allowInsecure: true });
+  const check = async (r: RelyingParty) => r.validateIdToken(await mint(), { issuer: rogueUrl, nonce, clientId });
+  try {
+    for (const cc of ['no-store', 'no-cache', 'max-age=0', 'private, max-age=0']) {
+      rogueJwks.cacheControl = cc;
+      rogueJwks.published = true;
+      const r = fresh();
+      const before = rogueJwks.hits;
+      await check(r);
+      await check(r);
+      assert.equal(rogueJwks.hits - before, 2, `${cc}: fetched for every validation`);
+      rogueJwks.published = false; // the Issuer removes the key, for example after a compromise
+      await assert.rejects(check(r), (e: unknown) => e instanceof RelyingPartyError && e.code === 'invalid_id_token', `${cc}: removed key`);
+    }
+    // Within a lifetime the Issuer itself allows, the cached set is used (Section 7.7 builds on this).
+    rogueJwks.cacheControl = 'max-age=120';
+    rogueJwks.published = true;
+    const r = fresh();
+    const before = rogueJwks.hits;
+    await check(r);
+    await check(r);
+    assert.equal(rogueJwks.hits - before, 1, 'max-age=120: one fetch');
+    // An unknown kid triggers one refetch, then is throttled without touching the cache lifetime.
+    const other = await generateKeyPair('ES256');
+    const unknown = () => new SignJWT({ nonce, actor_type: 'agent' }).setProtectedHeader({ alg: 'ES256', kid: 'unknown-kid' }).setIssuer(rogueUrl).setSubject('x').setAudience(clientId).setIssuedAt().setExpirationTime('5m').sign(other.privateKey);
+    const h0 = rogueJwks.hits;
+    for (let i = 0; i < 5; i += 1) await assert.rejects(r.validateIdToken(await unknown(), { issuer: rogueUrl, nonce, clientId }));
+    assert.equal(rogueJwks.hits - h0, 1, 'unknown kid: one refetch, then throttled');
+    await check(r); // the known key still verifies from the cache
+  } finally {
+    rogueJwks.cacheControl = undefined;
+    rogueJwks.published = true;
+  }
 });
 
 test('issuer choice: allow-list, relay and open federation', async () => {

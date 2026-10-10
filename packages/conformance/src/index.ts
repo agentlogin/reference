@@ -1,6 +1,6 @@
 // Black-box conformance harness for Agent Login issuers (checklist items I-*, Section numbers of the core spec).
 import { calculateJwkThumbprint, createRemoteJWKSet, decodeProtectedHeader, jwtVerify } from 'jose';
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { AgentClient, rnd } from './agent.js';
 import { call, callContext, obj, type CallContext, type Exchange, type Res } from './http.js';
 
@@ -22,7 +22,9 @@ export interface HarnessOptions {
    * reading the code from wherever the issuer delivered it, and returns the Owner Credential that sign-in issued.
    */
   ownerEmailSignIn?: (email: string) => Promise<string>;
-  /** Optional Open Client to exercise Section 4.2: a reachable metadata URL and one of its redirect URIs. */
+  /** With `handle` and `ownerCredential` and no `adminToken`: a Registered Client that already exists at the issuer. */
+  client?: { clientId: string; clientSecret: string; redirectUri: string };
+  /** Optional Open Client to exercise Section 4.2: a reachable metadata URL and one of its redirect URIs. Also the client of existing-agent mode when no Registered Client is given. */
   openClient?: { clientId: string; redirectUri: string };
   /**
    * I-39: reachable Client ID Metadata Documents the issuer must refuse (Sections 3.2, 4.2), for example one stating
@@ -109,6 +111,8 @@ class Harness {
   }
   /** Starts a transaction on the JSON path. */
   async start(client: RegisteredClient = this.client, over: Record<string, string | undefined> = {}) {
+    // Owner scopes exist for Registered Clients only (Section 4.1): with an Open Client as the harness's client the check cannot run.
+    if (!client.client_secret && /\bowner_/.test(over.scope ?? '')) throw new Skip('owner scopes need a Registered Client');
     const a = this.authUrl(client, over);
     const r = await call(a.url);
     expect(r.status === 200, `authorize JSON path status ${r.status}: ${r.text.slice(0, 200)}`);
@@ -138,14 +142,21 @@ class Harness {
     return { ...s, tx, redirect, code, token: obj(token.json), tokenRes: token };
   }
   async exchange(client: RegisteredClient, code: string, verifier: string, over: Record<string, string> = {}) {
+    const form = { grant_type: 'authorization_code', code, redirect_uri: client.redirect_uri, code_verifier: verifier, ...over };
+    if (!client.client_secret) return call(this.meta.token_endpoint, { method: 'POST', form: { client_id: client.client_id, ...form } }); // an Open Client does not authenticate
     const basic = Buffer.from(`${encodeURIComponent(client.client_id)}:${encodeURIComponent(client.client_secret)}`).toString('base64');
-    return call(this.meta.token_endpoint, { method: 'POST', headers: { authorization: `Basic ${basic}` }, form: { grant_type: 'authorization_code', code, redirect_uri: client.redirect_uri, code_verifier: verifier, ...over } });
+    return call(this.meta.token_endpoint, { method: 'POST', headers: { authorization: `Basic ${basic}` }, form });
   }
   async admin(path: string, json: unknown, method = 'POST') {
     if (!this.o.adminToken) throw new Skip('needs adminToken');
     const r = await call(`${this.o.issuer}${path}`, { method, headers: { authorization: `Bearer ${this.o.adminToken}` }, json });
     expect(r.status < 300, `${method} ${path} → ${r.status} ${r.text.slice(0, 200)}`);
     return obj(r.json);
+  }
+  /** The client with `max_signups_per_owner` 1; checks that need it are skipped when the harness cannot register one. */
+  capped(): RegisteredClient {
+    if (!this.cappedClient) throw new Skip('needs adminToken for registration');
+    return this.cappedClient;
   }
   async register(meta: Record<string, unknown>): Promise<RegisteredClient> {
     if (!this.o.adminToken) throw new Skip('needs adminToken for registration');
@@ -223,6 +234,7 @@ class Harness {
 
   // ---- bootstrap ---------------------------------------------------------------------------------
   async bootstrap() {
+    if (!this.o.adminToken && !(this.o.handle && this.o.ownerCredential)) throw new Error('the harness needs an admin token, or an existing handle with its Owner Credential');
     const m = await call(`${this.o.issuer}/.well-known/openid-configuration`);
     expect(m.status === 200, `metadata → ${m.status}`);
     this.meta = obj(m.json);
@@ -236,10 +248,18 @@ class Harness {
       this.ownerId = owner.owner_id;
       this.ownerEmail = owner.email;
       this.credential = owner.credential;
-      this.agent = await this.newAgent(this.ownerId!, 'scout');
+      this.agent = await this.newAgent(this.ownerId!, `scout-${slug()}`); // a fresh handle per run: the issuer may keep state between runs
     }
-    this.client = await this.register({});
-    this.cappedClient = await this.register({ max_signups_per_owner: 1 });
+    if (this.o.adminToken) {
+      this.client = await this.register({});
+      this.cappedClient = await this.register({ max_signups_per_owner: 1 });
+    } else if (this.o.client) {
+      this.client = { client_id: this.o.client.clientId, client_secret: this.o.client.clientSecret, redirect_uri: this.o.client.redirectUri };
+    } else if (this.o.openClient) {
+      this.client = { client_id: this.o.openClient.clientId, client_secret: '', redirect_uri: this.o.openClient.redirectUri };
+    } else {
+      throw new Error('without an admin token the harness needs a client: a Registered Client (client) or an Open Client (openClient)');
+    }
   }
 
   // ---- checks ------------------------------------------------------------------------------------
@@ -426,6 +446,23 @@ class Harness {
       const again = await call(a.next.url, { method: 'POST', headers: { authorization: `Bearer ${a.transaction_token}` }, json: { decision: 'allow' } });
       expect(again.status === 400, `decision while ready → ${again.status}`);
     });
+    await this.check('I-15', 'prompt=consent and require_review force the review even on a first visit with accept_disclosure', async () => {
+      const first = await this.newAgent(this.ownerId ?? (() => { throw new Skip('needs adminToken'); })());
+      const forced = obj((await this.assert((await this.start(this.client, { prompt: 'consent' })).tx, first, { accept_disclosure: true })).json);
+      expect(forced.status === 'awaiting_consent' && forced.next?.action === 'review', `first visit, prompt=consent, accept_disclosure → ${forced.status}`);
+      expect(forced.consent_reason === 'prompt_consent' || forced.consent_reason === 'first_visit', `consent_reason ${forced.consent_reason}`);
+      const strict = await this.register({ require_review: true });
+      const second = await this.newAgent(this.ownerId!);
+      const policy = obj((await this.assert((await this.start(strict)).tx, second, { accept_disclosure: true })).json);
+      expect(policy.status === 'awaiting_consent', `first visit, require_review, accept_disclosure → ${policy.status}`);
+      const none = obj((await this.assert((await this.start(strict, { prompt: 'none' })).tx, second, { accept_disclosure: true })).json);
+      expect(none.status === 'denied' && none.reason === 'consent_required', `require_review with prompt=none → ${none.status} ${none.reason}`);
+      // once a Consent Record exists, the forced review is still due on every sign-in
+      const allow = await call(policy.next.url, { method: 'POST', headers: { authorization: `Bearer ${policy.transaction_token}` }, json: { decision: 'allow' } });
+      expect(allow.status === 200 && obj(allow.json).status === 'ready', `allow → ${allow.status}`);
+      const again = obj((await this.assert((await this.start(strict)).tx, second, { accept_disclosure: true })).json);
+      expect(again.status === 'awaiting_consent' && again.consent_reason === 'policy', `repeat sign-in at a require_review client → ${again.status} ${again.consent_reason}`);
+    });
     await this.check('I-15', 'A valid Consent Record skips the review; prompt=consent and material change force it', async () => {
       const fresh = await this.newAgent(this.ownerId ?? (() => { throw new Skip('needs adminToken'); })());
       const first = await this.signIn(this.client, fresh, 'openid email');
@@ -476,6 +513,16 @@ class Harness {
       const d2 = await this.cont(a3.next.url, a3.transaction_token);
       expect(d1.status === 200 && d2.status === 200, 'denied continue repeatable');
     });
+    await this.check('I-19', 'A code is redeemed once under concurrent Token Requests', async () => {
+      const s = await this.start();
+      const a = obj((await this.assert(s.tx, this.agent, { accept_disclosure: true })).json);
+      expect(a.status === 'ready', `assertion → ${a.status}`);
+      const code = new URL(obj((await this.cont(a.next.url, a.transaction_token)).json).redirect).searchParams.get('code')!;
+      const results = await Promise.all(Array.from({ length: 4 }, () => this.exchange(this.client, code, s.verifier)));
+      const ok = results.filter((r) => r.status === 200);
+      expect(ok.length === 1, `concurrent redemptions: statuses ${results.map((r) => r.status).join(', ')}`);
+      expect(results.filter((r) => r.status !== 200).every((r) => r.status === 400 && obj(r.json).error === 'invalid_grant'), 'the other redemptions answer invalid_grant');
+    });
     await this.check('I-19', 'Code single use; wrong verifier, redirect_uri or client → invalid_grant', async () => {
       const r = await this.signIn();
       expect(r.tokenRes.status === 200, `exchange → ${r.tokenRes.status} ${r.tokenRes.text.slice(0, 160)}`);
@@ -491,7 +538,7 @@ class Harness {
       const s3 = await this.start();
       const a3 = obj((await this.assert(s3.tx, this.agent)).json);
       const c3 = new URL(obj((await this.cont(a3.next.url, a3.transaction_token)).json).redirect);
-      const wrongClient = await this.exchange(this.cappedClient!, c3.searchParams.get('code')!, s3.verifier);
+      const wrongClient = await this.exchange(this.capped(), c3.searchParams.get('code')!, s3.verifier);
       expect(wrongClient.status === 400 && obj(wrongClient.json).error === 'invalid_grant', `wrong client → ${wrongClient.status}`);
       const noVerifier = await call(m.token_endpoint, { method: 'POST', headers: { authorization: `Basic ${Buffer.from(`${this.client.client_id}:${this.client.client_secret}`).toString('base64')}` }, form: { grant_type: 'authorization_code', code: c3.searchParams.get('code')!, redirect_uri: this.client.redirect_uri } });
       expect(noVerifier.status === 400 && obj(noVerifier.json).error === 'invalid_grant', `no verifier → ${noVerifier.status}`);
@@ -530,6 +577,28 @@ class Harness {
       const r = await this.signIn(this.client, fresh, 'openid email owner_email owner_profile');
       const { payload } = await jwtVerify(r.token.id_token, createRemoteJWKSet(new URL(m.jwks_uri)), { issuer: iss });
       expect(payload.owner_email !== undefined && payload.owner_email_verified === true && ['email', 'oidc', 'domain', 'passkey'].includes(payload.owner_verified_via as string), `owner claims ${JSON.stringify(payload).slice(0, 200)}`);
+      expect(typeof payload.owner_name === 'string' && payload.owner_name.length > 0, 'owner_profile was granted but owner_name is missing');
+    });
+    await this.check('I-22', 'A requested Owner Claim the issuer cannot supply ends the sign-in; the token never omits it', async () => {
+      // An Owner without a display name: `owner_profile` cannot be satisfied (Section 6.6).
+      const nameless = await this.admin('/admin/owners', { email: `nameless-${slug()}@example.com`, verified_via: 'passkey', session_auth: 'passkey' });
+      const saved = this.credential;
+      this.credential = nameless.credential;
+      try {
+        const agent = await this.newAgent(nameless.owner_id);
+        const grant = await call(`${m.agents_endpoint}/${encodeURIComponent(agent.handle)}/keys/${encodeURIComponent(agent.kid)}`, { method: 'PATCH', headers: { authorization: `Bearer ${this.credential}` }, json: { permissions: { share_owner: true } } });
+        expect(grant.status === 200, `share_owner grant → ${grant.status}`);
+        const s = await this.start(this.client, { scope: 'openid email owner_profile' });
+        const a = obj((await this.assert(s.tx, agent, { accept_disclosure: true })).json);
+        if (a.status === 'denied') {
+          expect(a.reason === 'access_denied', `denied with ${a.reason}`);
+          return;
+        }
+        // An issuer may instead collect the name before completing; what it must not do is issue the token without it.
+        expect(a.status !== 'ready', 'the transaction went ready although owner_name cannot be supplied');
+      } finally {
+        this.credential = saved;
+      }
     });
     await this.check('I-23', 'UserInfo returns 401 invalid_token after key revocation; sub matches; accepted nowhere else', async () => {
       if (!this.ownerId) throw new Skip('needs adminToken');
@@ -615,12 +684,36 @@ class Harness {
       expect(later.status === 'denied' && later.reason === 'access_denied', `later → ${later.status}`);
       const ui = await call(m.userinfo_endpoint, { headers: { authorization: `Bearer ${r.token.access_token}` } });
       expect(ui.status === 401, `userinfo → ${ui.status}`);
-      const other = obj((await this.assert((await this.start(this.cappedClient!)).tx, fresh, { accept_disclosure: true })).json);
+      const other = obj((await this.assert((await this.start(this.capped())).tx, fresh, { accept_disclosure: true })).json);
       expect(other.status === 'ready', 'other client unaffected');
       const en = await call(acct, { method: 'PATCH', headers: { authorization: `Bearer ${this.credential}` }, json: { status: 'enabled' } });
       expect(en.status === 200 && obj(en.json).sign_in_count === 1 && obj(en.json).status === 'enabled', `re-enable → ${en.text.slice(0, 160)}`);
       const list = await call(`${m.agents_endpoint}/${encodeURIComponent(fresh.handle)}/accounts`, { headers: { authorization: `Bearer ${this.credential}` } });
       expect(list.status === 200 && Array.isArray(obj(list.json).accounts), 'list accounts');
+    });
+    await this.check('I-28', 'Concurrent first completions of one Agent count once toward the cap', async () => {
+      if (!this.o.adminToken) throw new Skip('needs adminToken');
+      const owner = await this.newOwner('twice');
+      const saved = this.credential;
+      this.credential = owner.credential;
+      try {
+        const two = await this.register({ max_signups_per_owner: 2 });
+        const a1 = await this.newAgent(owner.owner_id);
+        const a2 = await this.newAgent(owner.owner_id);
+        const a3 = await this.newAgent(owner.owner_id);
+        const txs = [];
+        for (let i = 0; i < 3; i += 1) txs.push(obj((await this.assert((await this.start(two)).tx, a1, { accept_disclosure: true })).json));
+        expect(txs.every((t) => t.status === 'ready'), `one Agent, three transactions → ${txs.map((t) => `${t.status} ${t.reason ?? ''}`).join(', ')}`);
+        const done = await Promise.all(txs.map((t) => this.cont(t.next.url, t.transaction_token)));
+        expect(done.every((d) => d.status === 200), 'all three complete');
+        const second = obj((await this.assert((await this.start(two)).tx, a2, { accept_disclosure: true })).json);
+        expect(second.status === 'ready', `the Owner's second Agent under a cap of two → ${second.status} ${second.reason ?? ''}`);
+        expect((await this.cont(second.next.url, second.transaction_token)).status === 200, 'second Agent completes');
+        const third = obj((await this.assert((await this.start(two)).tx, a3, { accept_disclosure: true })).json);
+        expect(third.status === 'denied' && third.reason === 'signup_limit_reached', `the third Agent → ${third.status} ${third.reason ?? ''}`);
+      } finally {
+        this.credential = saved;
+      }
     });
     await this.check('I-28', 'Per-owner cap counts Accounts ever created plus in-flight transactions; signup_limit_reached', async () => {
       if (!this.ownerId) throw new Skip('needs adminToken');
@@ -630,19 +723,19 @@ class Harness {
       try {
         const a1 = await this.newAgent(owner.owner_id);
         const a2 = await this.newAgent(owner.owner_id);
-        const inflight = await this.start(this.cappedClient!);
+        const inflight = await this.start(this.capped());
         const i = obj((await this.assert(inflight.tx, a1, { accept_disclosure: true })).json);
         expect(i.status === 'ready', 'first agent passes the cap');
-        const second = obj((await this.assert((await this.start(this.cappedClient!)).tx, a2, { accept_disclosure: true })).json);
+        const second = obj((await this.assert((await this.start(this.capped())).tx, a2, { accept_disclosure: true })).json);
         expect(second.status === 'denied' && second.reason === 'signup_limit_reached', `second agent while first in flight → ${second.status} ${second.reason}`);
         const c = await this.cont(i.next.url, i.transaction_token);
         expect(new URL(obj((await this.cont(second.next.url, second.transaction_token)).json).redirect).searchParams.get('error') === 'signup_limit_reached', 'redirect error');
         expect(c.status === 200, 'first completes');
-        const again = obj((await this.assert((await this.start(this.cappedClient!)).tx, a1)).json);
+        const again = obj((await this.assert((await this.start(this.capped())).tx, a1)).json);
         expect(again.status === 'ready', `existing account signs in regardless of the cap: ${again.status}`);
-        const dis = await call(`${m.agents_endpoint}/${encodeURIComponent(a1.handle)}/accounts/${encodeURIComponent(this.cappedClient!.client_id)}`, { method: 'PATCH', headers: { authorization: `Bearer ${this.credential}` }, json: { status: 'disabled' } });
+        const dis = await call(`${m.agents_endpoint}/${encodeURIComponent(a1.handle)}/accounts/${encodeURIComponent(this.capped().client_id)}`, { method: 'PATCH', headers: { authorization: `Bearer ${this.credential}` }, json: { status: 'disabled' } });
         expect(dis.status === 200, 'disable');
-        const still = obj((await this.assert((await this.start(this.cappedClient!)).tx, a2, { accept_disclosure: true })).json);
+        const still = obj((await this.assert((await this.start(this.capped())).tx, a2, { accept_disclosure: true })).json);
         expect(still.status === 'denied' && still.reason === 'signup_limit_reached', 'disabled account still counts');
       } finally {
         this.credential = saved;
@@ -1438,10 +1531,14 @@ function modPow(base: bigint, exp: bigint, mod: bigint): bigint {
 }
 /** 32-octet big-endian base64url encoding of a coordinate. */
 const b64u32 = (n: bigint) => Buffer.from(n.toString(16).padStart(64, '0'), 'hex').toString('base64url');
-/** A P-256 point with a small x coordinate, so that x + p still fits in 32 octets and encodes the same point non-canonically. */
+/**
+ * A P-256 point with a small x coordinate, so that x + p still fits in 32 octets and encodes the same point
+ * non-canonically. The search starts at a random x: every run uses a key the issuer has not seen, so the harness
+ * can be run again against an issuer that keeps its state.
+ */
 function smallXPoint(): { x: bigint; y: bigint } {
   const { p, b } = P256;
-  for (let x = 1n; ; x += 1n) {
+  for (let x = BigInt(`0x${randomBytes(20).toString('hex')}`) + 1n; ; x += 1n) {
     const rhs = (((x * x * x - 3n * x + b) % p) + p) % p;
     const y = modPow(rhs, (p + 1n) / 4n, p); // p ≡ 3 (mod 4)
     if ((y * y) % p === rhs) return { x, y };

@@ -32,6 +32,26 @@ export function parseHandle(input: string): Handle | null {
   if (labels.length < 2 || !labels.every((l) => LABEL.test(l))) return null;
   return { handle: `${local}@${domain}`, local, domain };
 }
+/** Section 2.1 and RFC 7565 Section 7: the `acct:` URI of a handle, with octets of `local` outside `userpart` percent-encoded. */
+export function acctUri(handle: string): string {
+  const at = handle.lastIndexOf('@');
+  const userpart = [...Buffer.from(handle.slice(0, at), 'utf8')].map((b) => (/[A-Za-z0-9\-._~!$&'()*+,;=]/.test(String.fromCharCode(b)) ? String.fromCharCode(b) : `%${b.toString(16).toUpperCase().padStart(2, '0')}`)).join('');
+  return `acct:${userpart}@${handle.slice(at + 1)}`;
+}
+/** The handle named by an `acct:` URI, or null. The userpart is percent-decoded once; the host is not. */
+export function parseAcctUri(uri: string): Handle | null {
+  if (!uri.startsWith('acct:')) return null;
+  const rest = uri.slice(5);
+  const at = rest.lastIndexOf('@');
+  if (at <= 0) return null;
+  let local: string;
+  try {
+    local = decodeURIComponent(rest.slice(0, at));
+  } catch {
+    return null;
+  }
+  return parseHandle(`${local}@${rest.slice(at + 1)}`);
+}
 /** Equality per Section 2.1: local octet-equal, domains equal after lower-casing. */
 export function handlesEqual(a: string, b: string): boolean {
   const pa = parseHandle(a);

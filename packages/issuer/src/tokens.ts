@@ -38,7 +38,12 @@ export async function authenticateClient(ctx: IssuerContext, r: TokenRequest): P
 export async function exchangeCode(ctx: IssuerContext, client: Client, r: TokenRequest): Promise<Record<string, unknown>> {
   if (r.grantType !== 'authorization_code') throw new OAuthError(400, 'unsupported_grant_type');
   if (!r.code || !r.redirectUri || !r.codeVerifier) throw new OAuthError(400, 'invalid_grant', 'code, redirect_uri and code_verifier are required');
-  const code = await ctx.store.getCode(sha256(r.code));
+  // One exchange at a time per code, so that a replay is seen after the first redemption has finished (Section 5.4).
+  return ctx.locks.run(`code:${sha256(r.code)}`, () => exchangeLocked(ctx, client, r));
+}
+
+async function exchangeLocked(ctx: IssuerContext, client: Client, r: TokenRequest): Promise<Record<string, unknown>> {
+  const code = await ctx.store.getCode(sha256(r.code!));
   const fail = () => new OAuthError(400, 'invalid_grant');
   if (!code) throw fail();
   if (code.used) {
@@ -52,7 +57,7 @@ export async function exchangeCode(ctx: IssuerContext, client: Client, r: TokenR
     throw fail();
   }
   if (code.voided || ctx.now() >= code.expiresAt || code.clientId !== client.clientId || code.redirectUri !== r.redirectUri) throw fail();
-  const challenge = createHash('sha256').update(r.codeVerifier, 'ascii').digest('base64url');
+  const challenge = createHash('sha256').update(r.codeVerifier!, 'ascii').digest('base64url');
   if (!safeEqual(challenge, code.codeChallenge)) throw fail();
   const key = await ctx.store.getKey(code.kid);
   if (!key || key.status !== 'active' || ctx.now() >= key.expiresAt) throw fail();
@@ -61,8 +66,9 @@ export async function exchangeCode(ctx: IssuerContext, client: Client, r: TokenR
   const agent = await ctx.store.getAgent(code.handle);
   const owner = agent && (await ctx.store.getOwner(agent.ownerId));
   if (!agent || !agent.enabled || !owner) throw fail();
-  code.used = true;
-  await ctx.store.putCode(code);
+  if (!ownerClaimsAvailable(owner, code.scopes)) throw fail(); // Section 6.6: never a token that omits a requested Owner Claim
+  // The single conditional write that consumes the code: a second redemption, in this process or another, gets false.
+  if (!(await ctx.store.markCodeUsed(code.hash))) throw fail();
 
   const accessToken = randomSecret();
   const now = ctx.now();
@@ -86,6 +92,13 @@ export async function exchangeCode(ctx: IssuerContext, client: Client, r: TokenR
   };
 }
 
+/** Section 6.6: whether every Owner Claim that the scopes request can be issued for this Owner. */
+export function ownerClaimsAvailable(owner: Owner, scopes: Scope[]): boolean {
+  if (scopes.includes('owner_profile') && !owner.name) return false;
+  if (scopes.includes('owner_email') && !(owner.email && owner.emailVerified)) return false;
+  return true;
+}
+
 /** Section 3.1 Claims for the granted scopes. */
 export function claimsFor(agent: Agent, owner: Owner, scopes: Scope[]): Record<string, unknown> {
   const c: Record<string, unknown> = { sub: agent.sub, actor_type: 'agent' };
@@ -99,7 +112,7 @@ export function claimsFor(agent: Agent, owner: Owner, scopes: Scope[]): Record<s
     c.owner_sub = owner.ownerSub;
   }
   if (scopes.includes('owner_profile')) {
-    if (owner.name) c.owner_name = owner.name;
+    c.owner_name = owner.name;
     c.owner_verified_via = owner.verifiedVia;
   }
   if (scopes.includes('owner_email')) {

@@ -2,7 +2,7 @@
 // Conformance items A-1 to A-9 are referenced inline.
 import { SignJWT, calculateJwkThumbprint, exportJWK, generateKeyPair, importJWK, type JWK } from 'jose';
 import { randomBytes } from 'node:crypto';
-import { discover, fetchMetadata, type DiscoveryOptions, type IssuerMetadata } from './discovery.js';
+import { fetchMetadata, lookupIssuer, type DiscoveryOptions, type IssuerMetadata } from './discovery.js';
 import { safeFetch } from './safefetch.js';
 import { parseHandle, domainServed } from './handle.js';
 import { MemoryCookieJar, type CookieJar } from './cookies.js';
@@ -141,7 +141,7 @@ export class AgentLogin {
   private readonly keystore: Keystore;
   readonly cookies: CookieJar;
   private readonly disc: DiscoveryOptions;
-  private resolved?: { issuer: string; metadata: IssuerMetadata; at: number };
+  private located?: { issuer: string; until: number };
 
   constructor(private readonly opts: AgentLoginOptions) {
     const h = parseHandle(opts.handle);
@@ -156,24 +156,30 @@ export class AgentLogin {
   }
   private log(m: string) { this.opts.log?.(m); }
 
-  /** Section 2: the Home Issuer for this Agent (A-1). Refreshed after five minutes. */
+  /**
+   * Section 2: the Home Issuer for this Agent (A-1). The WebFinger result and the metadata are each reused only for
+   * as long as their responses allow (five minutes at most for the former within one process).
+   */
   async discover(): Promise<{ issuer: string; metadata: IssuerMetadata }> {
-    if (this.resolved && Date.now() - this.resolved.at < 300_000) return this.resolved;
     try {
+      let issuer: string;
+      if (this.opts.issuer) issuer = this.opts.issuer;
+      else if (this.located && Date.now() < this.located.until) issuer = this.located.issuer;
+      else {
+        const found = await lookupIssuer(this.handle, this.disc);
+        issuer = found.issuer;
+        this.located = { issuer, until: Date.now() + Math.min(found.maxAge ?? 300, 300) * 1000 };
+      }
+      const metadata = await fetchMetadata(issuer, this.disc);
       if (this.opts.issuer) {
-        const issuer = this.opts.issuer;
-        const metadata = await fetchMetadata(issuer, this.disc);
         const h = parseHandle(this.handle)!;
         if (!domainServed(h.domain, metadata.handle_domains)) throw new AgentLoginError(`${issuer} does not serve ${h.domain}`, 'issuer_mismatch');
-        this.resolved = { issuer, metadata, at: Date.now() };
-      } else {
-        this.resolved = { ...(await discover(this.handle, this.disc)), at: Date.now() };
       }
+      return { issuer, metadata };
     } catch (e) {
       if (e instanceof AgentLoginError) throw e;
       throw new AgentLoginError(`could not find the Issuer for ${this.handle}: ${(e as Error).message}`, 'discovery_failed');
     }
-    return this.resolved;
   }
 
   // ---- keys (Section 7) ------------------------------------------------------------------------------

@@ -3,7 +3,7 @@
 // through the address-filtering fetch of Section 2.2, which needs node:dns and node:http.
 import { createLocalJWKSet, decodeProtectedHeader, jwtVerify, type JSONWebKeySet, type JWTPayload } from 'jose';
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
-import { checkIssuerIdentifier, fetchMetadata, lookupIssuer, parseHandle, safeFetch, type IssuerMetadata } from 'agentlogin';
+import { checkIssuerIdentifier, fetchMetadata, freshness, lookupIssuer, parseHandle, safeFetch, type IssuerMetadata } from 'agentlogin';
 import { ISSUER_ERROR_CODES, RelyingPartyError, type RelyingPartyErrorCode } from './errors.js';
 import type { PendingSignIn } from './seal.js';
 
@@ -115,7 +115,7 @@ export interface ClientMetadataInput {
   maxSignupsPerOwner?: number;
   requireReview?: boolean;
 }
-interface JwksEntry { jwks: JSONWebKeySet; until: number; lastMissRefetch: number }
+interface JwksEntry { jwks: JSONWebKeySet; until: number }
 
 export class RelyingParty {
   private readonly issuers = new Map<string, IssuerConfig>();
@@ -124,6 +124,8 @@ export class RelyingParty {
   private readonly timeoutMs: number;
   private readonly discoveryCache = new Map<string, { issuer: string; until: number }>();
   private readonly jwksCache = new Map<string, JwksEntry>();
+  /** When a JWK Set was last refetched because of an unknown `kid`: a throttle, kept apart from the cache lifetime. */
+  private readonly jwksMissAt = new Map<string, number>();
   private relayChecked = false;
 
   constructor(private readonly o: RelyingPartyOptions) {
@@ -369,31 +371,39 @@ export class RelyingParty {
   }
 
   /**
-   * JWK Set of an Issuer (Section 5.7 step 2). Cached per the response's freshness (five minutes when it states none,
-   * a day at most); refetched once when `kid` is unknown, at most once a minute (R-13).
+   * JWK Set of an Issuer (Section 5.7 step 2). Reused only for as long as the response allows: never for no-store,
+   * no-cache or max-age=0, five minutes when it states nothing, a day at most. A removed key therefore stops
+   * verifying as soon as the Issuer's own caching terms say so (Section 7.7). Separately, an unknown `kid` causes
+   * one refetch of a still-fresh set, at most once a minute (R-13).
    */
   private async jwks(issuer: string, kid: string): Promise<JSONWebKeySet> {
     const now = Date.now();
     const cached = this.jwksCache.get(issuer);
-    const has = (j: JSONWebKeySet) => j.keys.some((k) => k.kid === kid);
-    if (cached && now < cached.until && has(cached.jwks)) return cached.jwks;
-    if (cached && now < cached.until && now - cached.lastMissRefetch < 60_000) return cached.jwks; // unknown kid, refetched recently
+    const fresh = cached !== undefined && now < cached.until;
+    if (fresh) {
+      if (cached.jwks.keys.some((k) => k.kid === kid)) return cached.jwks;
+      if (now - (this.jwksMissAt.get(issuer) ?? 0) < 60_000) return cached.jwks; // unknown kid, refetched recently
+      if (this.jwksMissAt.size >= 200) this.jwksMissAt.delete(this.jwksMissAt.keys().next().value!);
+      this.jwksMissAt.set(issuer, now);
+    }
     const m = await this.metadata(issuer);
     let jwks: JSONWebKeySet;
-    let maxAge = 300;
+    let ttl: number;
     try {
       const r = await safeFetch(m.jwks_uri, { maxBytes: MAX_BYTES, timeoutMs: this.timeoutMs, allowPrivate: this.o.allowInsecure, maxRedirects: 0 });
       if (r.status !== 200) throw new Error(`status ${r.status}`);
       const parsed: unknown = JSON.parse(r.body.toString('utf8'));
       if (!isObject(parsed) || !Array.isArray(parsed.keys) || !parsed.keys.every(isObject)) throw new Error('not a JWK Set');
       jwks = parsed as unknown as JSONWebKeySet;
-      const cc = /(?:^|,)\s*max-age=(\d+)/i.exec(String(r.headers['cache-control'] ?? ''));
-      if (cc) maxAge = Math.min(Number(cc[1]), T_CACHE);
+      ttl = freshness(r.headers['cache-control'], 300);
     } catch (e) {
       throw new RelyingPartyError('discovery_failed', 'JWK Set unavailable', undefined, { cause: e });
     }
-    if (this.jwksCache.size >= 200 && !cached) this.jwksCache.delete(this.jwksCache.keys().next().value!);
-    this.jwksCache.set(issuer, { jwks, until: now + Math.max(maxAge, 60) * 1000, lastMissRefetch: cached && now < cached.until ? now : (cached?.lastMissRefetch ?? 0) });
+    this.jwksCache.delete(issuer);
+    if (ttl > 0) {
+      if (this.jwksCache.size >= 200) this.jwksCache.delete(this.jwksCache.keys().next().value!);
+      this.jwksCache.set(issuer, { jwks, until: now + ttl * 1000 });
+    }
     return jwks;
   }
 

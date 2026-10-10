@@ -1,8 +1,10 @@
 // A small cookie jar for the Relying Party session the agent obtains after sign-in. Cookies are scoped by host
 // and path; Secure cookies are sent over https only. Not sent to the Issuer: Agent Clients carry no cookies there.
+import { createHash } from 'node:crypto';
 import { join } from 'node:path';
+import { parseHandle } from './handle.js';
 import { agentloginHome } from './keystore.js';
-import { readPrivateJson, writePrivateJson } from './files.js';
+import { readPrivateJson, withFileLock, writePrivateJson } from './files.js';
 
 export interface Cookie { name: string; value: string; host: string; path: string; secure: boolean; expires?: number }
 export interface CookieJar {
@@ -32,34 +34,47 @@ function parseSetCookie(url: URL, line: string): Cookie | null {
 }
 
 export class MemoryCookieJar implements CookieJar {
-  protected cookies: Cookie[] = [];
-  protected load(): Cookie[] { return this.cookies; }
-  protected save(c: Cookie[]) { this.cookies = c; }
+  private cookies: Cookie[] = [];
+  protected async load(): Promise<Cookie[]> { return this.cookies; }
+  /** Applies one change to the stored cookies. Overridden where the store is shared between processes. */
+  protected async update(fn: (all: Cookie[]) => Cookie[]): Promise<void> { this.cookies = fn(this.cookies); }
+
   async store(url: URL, setCookie: string[]) {
-    let all = this.load();
-    for (const line of setCookie) {
-      const c = parseSetCookie(url, line);
-      if (!c) continue;
-      all = all.filter((x) => !(x.name === c.name && x.host === c.host && x.path === c.path));
-      if (c.expires === undefined || c.expires > Date.now()) all.push(c);
-    }
-    this.save(all);
+    const incoming = setCookie.map((line) => parseSetCookie(url, line)).filter((c): c is Cookie => c !== null);
+    if (incoming.length === 0) return;
+    await this.update((all) => {
+      const now = Date.now();
+      let next = all.filter((c) => c.expires === undefined || c.expires > now);
+      for (const c of incoming) {
+        next = next.filter((x) => !(x.name === c.name && x.host === c.host && x.path === c.path));
+        if (c.expires === undefined || c.expires > now) next.push(c);
+      }
+      return next;
+    });
   }
   async header(url: URL) {
     const now = Date.now();
-    const match = this.load().filter((c) => c.host === url.hostname && (c.expires === undefined || c.expires > now) && (!c.secure || url.protocol === 'https:') && (url.pathname === c.path || url.pathname.startsWith(c.path.endsWith('/') ? c.path : `${c.path}/`)));
+    const match = (await this.load()).filter((c) => c.host === url.hostname && (c.expires === undefined || c.expires > now) && (!c.secure || url.protocol === 'https:') && (url.pathname === c.path || url.pathname.startsWith(c.path.endsWith('/') ? c.path : `${c.path}/`)));
     return match.length ? match.map((c) => `${c.name}=${c.value}`).join('; ') : undefined;
   }
-  async list(host?: string) { const now = Date.now(); return this.load().filter((c) => (!host || c.host === host) && (c.expires === undefined || c.expires > now)); }
-  async clear(host?: string) { this.save(host ? this.load().filter((c) => c.host !== host) : []); }
+  async list(host?: string) { const now = Date.now(); return (await this.load()).filter((c) => (!host || c.host === host) && (c.expires === undefined || c.expires > now)); }
+  async clear(host?: string) { await this.update((all) => (host ? all.filter((c) => c.host !== host) : [])); }
 }
 
-/** One file per Agent: a session one Agent obtained is never sent on behalf of another. */
+/**
+ * A cookie jar in a private file, for one Agent. Sessions belong to the Agent that obtained them: use `forHandle`,
+ * which names the file by a hash of the handle (the local part is case-sensitive, the domain is not, and a file
+ * system may fold case). Changes are locked across processes.
+ */
 export class FileCookieJar extends MemoryCookieJar {
-  constructor(public readonly path: string = join(agentloginHome(), 'cookies.json')) { super(); }
+  constructor(public readonly path: string) { super(); }
   static forHandle(handle: string): FileCookieJar {
-    return new FileCookieJar(join(agentloginHome(), 'cookies', `${encodeURIComponent(handle.toLowerCase())}.json`));
+    const h = parseHandle(handle);
+    if (!h) throw new Error(`not a handle: ${handle}`);
+    return new FileCookieJar(join(agentloginHome(), 'cookies', `${createHash('sha256').update(h.handle, 'utf8').digest('hex')}.json`));
   }
-  protected override load(): Cookie[] { return readPrivateJson<Cookie[]>(this.path, []); }
-  protected override save(c: Cookie[]) { writePrivateJson(this.path, c); }
+  protected override async load(): Promise<Cookie[]> { return readPrivateJson<Cookie[]>(this.path, []); }
+  protected override async update(fn: (all: Cookie[]) => Cookie[]): Promise<void> {
+    await withFileLock(this.path, () => writePrivateJson(this.path, fn(readPrivateJson<Cookie[]>(this.path, []))));
+  }
 }

@@ -113,15 +113,18 @@ test('enroll, login, fetch, cookies and revoke', async () => {
   assert.equal(JSON.parse(me.stdout).handle, 'scout@example.com');
 
   // cookies are per Agent and their values are not printed
-  const jar = readdirSync(join(home, 'cookies'));
-  assert.deepEqual(jar, ['scout%40example.com.json']);
+  const jar = readdirSync(join(home, 'cookies')).filter((f) => f.endsWith('.json'));
+  assert.equal(jar.length, 1);
+  assert.match(jar[0]!, /^[0-9a-f]{64}\.json$/, 'the jar is named by a hash of the handle');
   const sid = (JSON.parse(readFileSync(join(home, 'cookies', jar[0]!), 'utf8')) as Array<{ name: string; value: string }>).find((c) => c.name === 'sid')!.value;
   const cookies = await cli(['cookies', '--site', appUrl]);
   assert.match(cookies.stdout, /sid/);
   assert.equal(cookies.stdout.includes(sid), false);
-  const other = await cli(['fetch', `${appUrl}/me`], { AGENTLOGIN_HANDLE: 'rover@example.com' });
-  assert.equal(other.code, 1, 'another Agent has no session at the application');
-  assert.match(other.stderr, /401/);
+  for (const handle of ['rover@example.com', 'Scout@example.com']) { // the local part is case-sensitive: Scout is another Agent
+    const other = await cli(['fetch', `${appUrl}/me`], { AGENTLOGIN_HANDLE: handle });
+    assert.equal(other.code, 1, `${handle} has no session at the application`);
+    assert.match(other.stderr, /401/);
+  }
 
   // the wrong application is refused before any assertion
   const wrong = await cli(['login', `${appUrl}/auth/agent/login`, '--site', 'other.example', '--json']);

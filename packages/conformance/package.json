@@ -6,8 +6,26 @@
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
-  "bin": { "agentlogin-conformance": "bin/agentlogin-conformance.js" },
-  "files": ["dist", "bin", "README.md"],
-  "repository": { "type": "git", "url": "git+https://github.com/agentlogin/reference.git", "directory": "packages/conformance" },
-  "dependencies": { "jose": "^6.1.0" }
+  "bin": {
+    "agentlogin-conformance": "bin/agentlogin-conformance.js"
+  },
+  "files": [
+    "dist",
+    "bin",
+    "README.md"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/agentlogin/reference.git",
+    "directory": "packages/conformance"
+  },
+  "dependencies": {
+    "jose": "^6.1.0"
+  },
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "engines": {
+    "node": ">=22.12"
+  }
 }

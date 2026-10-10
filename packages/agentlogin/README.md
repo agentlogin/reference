@@ -23,7 +23,8 @@ Library:
 ```ts
 import { AgentLogin, FileKeystore, FileCookieJar } from 'agentlogin';
 
-const al = new AgentLogin({ handle: 'scout@example.com', keystore: new FileKeystore(), cookies: new FileCookieJar() });
+const handle = 'scout@example.com';
+const al = new AgentLogin({ handle, keystore: new FileKeystore(), cookies: FileCookieJar.forHandle(handle) });   // one jar per agent
 await al.enroll({ credential: process.env.OWNER_CREDENTIAL!, name: 'server-1' });   // once
 const result = await al.signInAt('https://app.example.org/auth/agent/login');
 await al.follow(result);                       // completes the application's sign-in; cookies are stored
@@ -48,8 +49,10 @@ answers reviews and waits for Owner approval using `retry_after` (A-5); follows 
 `transaction_token` and fetches the redirect with a per-host cookie jar, never forwarding `Authorization` (A-6, A-9).
 The code-bearing redirect URL is returned from `signIn` for `follow` and is never printed by the CLI.
 
-Keys live in `~/.agentlogin/keys.json` and cookies in `~/.agentlogin/cookies/<handle>.json`, one jar per Agent, all
-readable by you only and written atomically; set `AGENTLOGIN_HOME` to move them. Nothing secret is printed: not
+Keys live in `~/.agentlogin/keys.json` and cookies in `~/.agentlogin/cookies/<hash of the handle>.json`, one jar per
+agent: a session one agent obtained is never sent for another, and `Scout@example.com` and `scout@example.com` are
+different agents. Files are readable by you only, written atomically, and every change is locked across processes, so
+commands running at the same time lose nothing. Set `AGENTLOGIN_HOME` to move them. Nothing secret is printed: not
 credentials, keys, cookie values, tokens or the callback URL. `--json` gives machine-readable results and errors
 (`{"error": {"code", "message"}}`); the exit status is 0 only on success and 2 for usage errors.
 

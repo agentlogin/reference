@@ -12,9 +12,9 @@
   "scripts": {
     "build": "tsc -b packages/issuer packages/conformance packages/agentlogin packages/rp",
     "typecheck": "npm run build",
-    "test": "npm run build && node --import tsx --test packages/issuer/test/*.test.ts packages/agentlogin/test/*.test.ts packages/rp/test/*.test.ts",
+    "test": "npm run build && node --import tsx --test --test-concurrency=1 packages/issuer/test/*.test.ts packages/agentlogin/test/*.test.ts packages/rp/test/*.test.ts packages/conformance/test/*.test.ts",
     "issuer": "node --import tsx packages/issuer/src/server.ts",
-    "conformance": "node --import tsx packages/conformance/bin/agentlogin-conformance.ts",
+    "conformance": "node packages/conformance/bin/agentlogin-conformance.js",
     "agentlogin": "node packages/agentlogin/bin/agentlogin.js",
     "example": "node --import tsx examples/rp-hono/server.ts"
   },

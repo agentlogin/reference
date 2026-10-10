@@ -6,12 +6,16 @@ with the observed response.
 
 ```bash
 npm run conformance -- --issuer http://localhost:3000 --admin-token TOKEN
-npm run conformance -- --issuer https://issuer.example --handle scout@example.com --owner-credential CRED [--json]
+npm run conformance -- --issuer https://issuer.example --handle scout@example.com --owner-credential CRED \
+    --client-id ID --client-secret SECRET --redirect-uri https://rp.example/cb [--json]
 ```
 
-With `--admin-token` the harness creates its own owners, agents and registered clients through the reference issuer's
-bootstrap API and runs every check. With `--handle` and `--owner-credential` it uses an existing agent and skips
-checks that need more than one agent or a registered client. Some checks need something only the operator can supply
+Two modes. With `--admin-token` the harness creates its own owners, agents and registered clients through the
+reference issuer's bootstrap API and runs every check; each run uses fresh handles and keys, so it can be repeated
+against an issuer that keeps its state. With `--handle` and `--owner-credential` it uses an existing agent and needs
+a client that already exists at the issuer: a Registered Client (`--client-id`, `--client-secret`, `--redirect-uri`)
+or an Open Client (`--open-client-id`, `--open-redirect-uri`). Checks that need more than that are reported as
+skipped, never as failed; without any client the run stops with a message before the first check. Some checks need something only the operator can supply
 and report skip, naming what is missing, without it:
 
 | Option | Supplies | Used by |
