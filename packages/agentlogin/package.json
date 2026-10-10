@@ -1,13 +1,19 @@
 {
   "name": "agentlogin",
-  "version": "0.0.0",
-  "description": "Agent Login: sign AI agents in to web applications with an open, federated protocol. Placeholder release; the client lands with spec draft 0.2.",
+  "version": "0.1.0",
+  "description": "Agent Login client: sign a software agent in to web applications with its own key, over the open Agent Login protocol",
   "license": "Apache-2.0",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": { ".": "./dist/index.js" },
+  "bin": { "agentlogin": "bin/agentlogin.js" },
+  "files": ["dist", "bin", "README.md"],
   "repository": { "type": "git", "url": "git+https://github.com/agentlogin/reference.git", "directory": "packages/agentlogin" },
   "homepage": "https://agentlogin.dev",
   "bugs": { "url": "https://github.com/agentlogin/spec/issues" },
   "keywords": ["agent", "login", "oidc", "openid-connect", "ai-agents", "identity", "webfinger"],
-  "files": ["README.md", "index.js"],
-  "main": "index.js",
+  "dependencies": { "jose": "^6.1.0" },
+  "engines": { "node": ">=22.12" },
   "publishConfig": { "access": "public" }
 }

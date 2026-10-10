@@ -7,11 +7,12 @@
   "workspaces": ["packages/*"],
   "type": "module",
   "scripts": {
-    "build": "tsc -b packages/issuer packages/conformance",
-    "typecheck": "tsc -b packages/issuer packages/conformance --noEmit",
-    "test": "node --import tsx --test packages/issuer/test/*.test.ts",
+    "build": "tsc -b packages/issuer packages/conformance packages/agentlogin",
+    "typecheck": "tsc -b packages/issuer packages/conformance packages/agentlogin --noEmit",
+    "test": "node --import tsx --test packages/issuer/test/*.test.ts packages/agentlogin/test/*.test.ts",
     "issuer": "node --import tsx packages/issuer/src/server.ts",
-    "conformance": "node --import tsx packages/conformance/bin/agentlogin-conformance.ts"
+    "conformance": "node --import tsx packages/conformance/bin/agentlogin-conformance.ts",
+    "agentlogin": "node --import tsx packages/agentlogin/src/cli.ts"
   },
   "devDependencies": {
     "@types/node": "^22.18.0",

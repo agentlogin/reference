@@ -10,12 +10,12 @@ JSON path and the wait-page path. The specification is at draft 0.1; code lands 
 1. Issuer core and conformance harness. Done except Ed25519 keys, `private_key_jwt`, rate limits and Owner
    authentication pages; see `packages/issuer/README.md`.
 2. Relying-party kit: Better Auth helper, Clerk/Supabase/Auth0 guides, example app.
-3. Agent CLI, SDKs and MCP server.
+3. Agent CLI, SDKs and MCP server. CLI + TypeScript library done (10 Oct 2026, end-to-end test against the issuer and a stub relying party); Python SDK and MCP server open.
 4. Federation: WebFinger discovery, relay, Docker image and one-click templates.
 
 | Package | Purpose |
 | --- | --- |
-| `packages/agentlogin` | Agent CLI and client library (npm `agentlogin`) |
+| `packages/agentlogin` | Agent CLI and client library (npm `agentlogin`): discovery, enrollment, sign-in, cookie jar |
 | `packages/issuer` | Reference issuer (Hono + jose, written to the spec section by section) |
 | `packages/rp` | Relying-party helpers and the sign-in button |
 | `packages/conformance` | Conformance harness |
