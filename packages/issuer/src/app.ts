@@ -8,7 +8,7 @@ import { AGENT_KEY_ALGS, OWNER_SCOPES, SCOPES, VERSION } from './constants.js';
 import type { IssuerContext } from './context.js';
 import { OAuthError } from './errors.js';
 import { redirectUriMatches, registerClient, resolveClient, type ClientContext } from './clients.js';
-import type { Client, Transaction } from './store.js';
+import type { Client, OwnerVerifiedVia, SessionAuth, Transaction } from './store.js';
 import * as tx from './transactions.js';
 import { authenticateClient, exchangeCode, userinfo } from './tokens.js';
 import * as agents from './agents.js';
@@ -23,6 +23,9 @@ const HTML_HEADERS = {
   'Referrer-Policy': 'no-referrer',
 };
 
+/** Lifetime of the one-time code of the Owner email sign-in, seconds. */
+const OWNER_CODE_TTL = 600;
+
 const escapeHtml = (s: string) => s.replace(/[&<>"']/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[ch]!);
 /** Section 5.3: JSON embedded in HTML with <, >, &, U+2028 and U+2029 escaped. */
 const embedJson = (v: unknown) => JSON.stringify(v).replace(/[<>&\u2028\u2029]/g, (ch) => `\\u${ch.charCodeAt(0).toString(16).padStart(4, '0')}`);
@@ -33,6 +36,13 @@ export function createIssuerApp(ctx: IssuerContext): Hono {
   const base = ctx.issuer;
   const secureCookies = base.startsWith('https:');
 
+  // Section 5: every response of Sections 5 to 7, redirects and CORS preflights included, carries Cache-Control: no-store.
+  const noStore = async (c: Context, next: () => Promise<void>) => {
+    await next();
+    if (!c.res.headers.has('Cache-Control')) c.res.headers.set('Cache-Control', 'no-store');
+  };
+  for (const path of ['/authorize', '/transactions/*', '/token', '/userinfo', '/register', '/agents/*', '/owner/*']) app.use(path, noStore);
+  // Section 6: CORS for browser-based Agent Clients, never with Access-Control-Allow-Credentials.
   app.use('/transactions/*', cors({ origin: '*', allowHeaders: ['Authorization', 'Content-Type', 'Accept'], allowMethods: ['GET', 'POST', 'OPTIONS'] }));
   app.use('/agents/*', cors({ origin: '*', allowHeaders: ['Authorization', 'Content-Type', 'Accept'], allowMethods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'] }));
 
@@ -108,14 +118,24 @@ export function createIssuerApp(ctx: IssuerContext): Hono {
       if (v.length > 1) throw new OAuthError(400, 'invalid_request', `repeated parameter ${k}`);
       return v[0];
     };
-    const clientId = one('client_id');
-    const redirectUri = one('redirect_uri');
-    if (!clientId || !redirectUri) throw new OAuthError(400, 'invalid_request', 'client_id and redirect_uri are required');
-    const client = await resolveClient(clientCtx, clientId);
+    // Section 5.2 steps 1 and 2: a failure here is answered 400 directly, never by redirect; as HTML unless JSON is preferred.
+    const direct = (text: string) => c.html(page('Sign-in request rejected', `<p>${escapeHtml(text)}</p>`), 400, { ...NO_STORE, ...HTML_HEADERS });
+    let client: Client;
+    let redirectUri: string;
+    try {
+      const clientId = one('client_id');
+      redirectUri = one('redirect_uri') ?? '';
+      if (!clientId || !redirectUri) throw new OAuthError(400, 'invalid_request', 'client_id and redirect_uri are required');
+      client = await resolveClient(clientCtx, clientId);
+    } catch (e) {
+      // Step 1: every way the client fails to resolve, an Open Client document the Issuer refuses included (Sections 3.2, 4.2), is `invalid_request`.
+      if (!(e instanceof OAuthError) || e.status !== 400) throw e;
+      if (!json) return direct('The application could not be identified.');
+      throw new OAuthError(400, 'invalid_request', e.description);
+    }
     if (!redirectUriMatches(client, redirectUri)) {
-      // Section 5.2 step 2: never redirect to an unvalidated URI.
       if (json) throw new OAuthError(400, 'invalid_request', 'redirect_uri does not match');
-      return c.html(page('Sign-in request rejected', '<p>The application sent a redirect address that it did not register.</p>'), 400, { ...NO_STORE, ...HTML_HEADERS });
+      return direct('The application sent a redirect address that it did not register.');
     }
     const redirectError = (error: string, description: string, state?: string) => {
       const u = new URL(redirectUri);
@@ -216,20 +236,26 @@ export function createIssuerApp(ctx: IssuerContext): Hono {
     return c.html(html, 200, { ...NO_STORE, ...HTML_HEADERS, Link: `<${tx.txUrl(ctx, t.id)}>; rel="agent-login-transaction"` });
   });
 
+  // Section 6.7 precedence: the transaction is loaded (`invalid_transaction`), the credential checked (`invalid_token`)
+  // and a terminal status reported (`transaction_expired`) before a malformed body is; every error of an existing
+  // transaction then carries `status` and `next`.
   app.post('/transactions/:id/assertion', async (c) => {
-    const body = await jsonBody(c);
+    const body = await deferredJsonBody(c);
     return ctx.locks.run(c.req.param('id') ?? '', async () => {
       const { t, client } = await loadTx(c);
-      const token = await tx.assert(ctx, t, client, body);
+      tx.requireOpen(t);
+      const token = await tx.assert(ctx, t, client, body());
       return c.json({ ...tx.resource(ctx, t, client, { kind: 'transaction_token' }), transaction_token: token }, 200, NO_STORE);
     });
   });
 
   app.post('/transactions/:id/review', async (c) => {
-    const body = await jsonBody(c);
+    const body = await deferredJsonBody(c);
     return ctx.locks.run(c.req.param('id') ?? '', async () => {
       const { t, client, viewer } = await loadTx(c);
-      await tx.review(ctx, t, client, viewer, body);
+      tx.requireTransactionToken(viewer);
+      tx.requireOpen(t);
+      await tx.review(ctx, t, client, viewer, body());
       return c.json(tx.resource(ctx, t, client, viewer), 200, NO_STORE);
     });
   });
@@ -286,12 +312,12 @@ export function createIssuerApp(ctx: IssuerContext): Hono {
   app.get('/agents/:handle/keys', async (c) => {
     const handle = handleOf(c);
     await agents.authorizeManagement(ctx, c.req.header('authorization'), handle, true);
-    return c.json({ keys: (await ctx.store.listKeys(handle)).map((k) => agents.keyRecord(ctx, k)) }, 200, NO_STORE);
+    return c.json({ keys: (await agents.listLiveKeys(ctx, handle)).map((k) => agents.keyRecord(ctx, k)) }, 200, NO_STORE);
   });
   app.get('/agents/:handle/keys/:kid', async (c) => {
     const handle = handleOf(c);
     await agents.authorizeManagement(ctx, c.req.header('authorization'), handle, true);
-    const k = await ctx.store.getKey(decodeURIComponent(c.req.param('kid') ?? ''));
+    const k = await agents.getLiveKey(ctx, decodeURIComponent(c.req.param('kid') ?? ''));
     if (!k || k.handle !== handle) throw new OAuthError(404, 'not_found');
     return c.json(agents.keyRecord(ctx, k), 200, NO_STORE);
   });
@@ -300,22 +326,23 @@ export function createIssuerApp(ctx: IssuerContext): Hono {
     const body = await jsonBody(c);
     const wantsPermissions = isPlainObject(body) && body.permissions !== undefined;
     const cred = await agents.authorizeManagement(ctx, c.req.header('authorization'), handle, !wantsPermissions);
-    const k = await ctx.store.getKey(decodeURIComponent(c.req.param('kid') ?? ''));
+    const k = await agents.getLiveKey(ctx, decodeURIComponent(c.req.param('kid') ?? ''));
     if (!k || k.handle !== handle) throw new OAuthError(404, 'not_found');
     if (!isPlainObject(body)) throw new OAuthError(400, 'invalid_request');
-    if (typeof body.name === 'string') k.name = body.name.slice(0, 200);
     if (wantsPermissions) {
-      if (cred.kind !== 'owner') throw new OAuthError(403, 'insufficient_permission');
+      // Section 7.8: `share_owner` is granted only by an Owner Credential from a session that satisfies Section 6.6; nothing changes otherwise.
+      if (!agents.approvalSession(cred)) throw new OAuthError(403, 'insufficient_permission', 'share_owner requires an Owner Credential from a session of Section 6.6', { 'WWW-Authenticate': 'Bearer error="insufficient_scope"' });
       if (!isPlainObject(body.permissions) || typeof body.permissions.share_owner !== 'boolean') throw new OAuthError(400, 'invalid_request', 'permissions.share_owner');
       k.permissions.share_owner = body.permissions.share_owner;
     }
+    if (typeof body.name === 'string') k.name = body.name.slice(0, 200);
     await ctx.store.putKey(k);
     return c.json(agents.keyRecord(ctx, k), 200, NO_STORE);
   });
   app.delete('/agents/:handle/keys/:kid', async (c) => {
     const handle = handleOf(c);
     await agents.authorizeManagement(ctx, c.req.header('authorization'), handle, true);
-    const k = await ctx.store.getKey(decodeURIComponent(c.req.param('kid') ?? ''));
+    const k = await agents.getLiveKey(ctx, decodeURIComponent(c.req.param('kid') ?? ''));
     if (!k || k.handle !== handle) throw new OAuthError(404, 'not_found');
     if (k.status !== 'revoked') await agents.revokeKeyEffects(ctx, k);
     return c.body(null, 204, NO_STORE);
@@ -359,12 +386,18 @@ export function createIssuerApp(ctx: IssuerContext): Hono {
     const t = await tx.loadTransaction(ctx, c.req.param('id') ?? '');
     if (t.ownerId !== cred.ownerId) throw new OAuthError(404, 'invalid_transaction');
     const client = (await ctx.store.getClient(t.clientId))!;
+    // Section 6.6: the approval view names the client with its redirect_host, the requested Owner Claims and the handle;
+    // a client registered with relay_issuer is named as a Relay that forwards the Owner Claims under its op_policy_uri,
+    // which Section 4.4 has the Issuer read from the Relay's metadata.
     return c.json(
       {
         transaction_id: t.id,
         status: t.status,
         handle: t.handle,
-        client: { client_id: client.clientId, client_name: client.clientName, redirect_host: new URL(t.redirectUri).host, tos_uri: client.tosUri, policy_uri: client.policyUri },
+        client: { client_id: client.clientId, client_name: client.clientName, redirect_host: new URL(t.redirectUri).host, tos_uri: client.tosUri, policy_uri: client.policyUri, relay_issuer: client.relayIssuer },
+        relay: client.relayIssuer
+          ? { issuer: client.relayIssuer, op_policy_uri: client.relayPolicyUri, notice: `This client is a Relay. The Owner Claims will be forwarded to Relying Parties of that Relay under its policy at ${client.relayPolicyUri}.` }
+          : undefined,
         requested_owner_claims: t.scopes.filter((s) => OWNER_SCOPES.includes(s)).flatMap((s) => (s === 'owner_profile' ? ['owner_name'] : ['owner_email'])),
         expires_at: t.expiresAt,
       },
@@ -374,10 +407,40 @@ export function createIssuerApp(ctx: IssuerContext): Hono {
   });
   app.post('/owner/transactions/:id/decision', async (c) => {
     const cred = await ownerOf(c);
+    // Section 6.6: a session established by a one-time code or link alone cannot approve or refuse.
+    if (!agents.approvalSession(cred)) throw new OAuthError(403, 'insufficient_permission', 'Owner approval requires a session of Section 6.6', { 'WWW-Authenticate': 'Bearer error="insufficient_scope"' });
     const t = await tx.loadTransaction(ctx, c.req.param('id') ?? '');
     const body = await jsonBody(c);
     await ctx.locks.run(t.id, () => tx.ownerDecision(ctx, t, cred.ownerId, isPlainObject(body) ? body.decision : undefined));
     return c.json({ transaction_id: t.id, status: t.status, reason: t.reason }, 200, NO_STORE);
+  });
+
+  // ---- Section 7.5 `email`: Owner sign-in by a one-time code ------------------------------------------
+  // How an Owner authenticates is outside the wire protocol (Section 1.4). This is the method every Issuer supports;
+  // the Owner Credential it issues comes from a session established by a one-time code alone, so under Sections 6.6
+  // and 7.8 it manages the Owner's Agents but neither approves a transaction nor grants `share_owner`.
+  app.post('/owner/sessions/email', async (c) => {
+    const b = await jsonBody(c);
+    if (!isPlainObject(b) || typeof b.email !== 'string') throw new OAuthError(400, 'invalid_request', 'email required');
+    if (!ctx.sendOwnerCode) throw new OAuthError(501, 'not_supported', 'no delivery channel for one-time codes is configured');
+    const owner = await ctx.store.getOwnerByEmail(b.email);
+    if (owner) {
+      const code = randomId();
+      const expiresAt = ctx.now() + OWNER_CODE_TTL;
+      await ctx.store.putOwnerCode({ ownerId: owner.id, hash: sha256(code), expiresAt }); // replaces an earlier code for this Owner
+      await ctx.sendOwnerCode({ email: owner.email, code, expiresAt });
+    }
+    return c.json({ sent: true }, 202, NO_STORE); // the same answer whether or not the address belongs to an Owner
+  });
+  app.post('/owner/sessions/email/verify', async (c) => {
+    const b = await jsonBody(c);
+    if (!isPlainObject(b) || typeof b.email !== 'string' || typeof b.code !== 'string') throw new OAuthError(400, 'invalid_request', 'email and code required');
+    const owner = await ctx.store.getOwnerByEmail(b.email);
+    const pending = owner && (await ctx.store.takeOwnerCode(owner.id)); // single use: taken whether or not it matches
+    if (!owner || !pending || ctx.now() >= pending.expiresAt || !safeEqual(sha256(b.code), pending.hash)) throw new OAuthError(401, 'invalid_token', 'the code is wrong, used or expired', { 'WWW-Authenticate': 'Bearer error="invalid_token"' });
+    const credential = randomSecret();
+    await ctx.store.putCredential({ hash: sha256(credential), ownerId: owner.id, kind: 'owner', sessionAuth: 'email_only', createdAt: ctx.now() });
+    return c.json({ owner_id: owner.id, credential, session_auth: 'email_only' }, 200, NO_STORE);
   });
 
   // ---- Bootstrap API (outside the specification): owners, agents, credentials -----------------------
@@ -387,10 +450,20 @@ export function createIssuerApp(ctx: IssuerContext): Hono {
     if (!isPlainObject(b) || typeof b.email !== 'string') throw new OAuthError(400, 'invalid_request', 'email required');
     const id = randomId();
     const via = b.verified_via;
-    await ctx.store.putOwner({ id, ownerSub: randomSecret(), email: b.email, emailVerified: true, name: typeof b.name === 'string' ? b.name : undefined, verifiedVia: via === 'oidc' || via === 'domain' || via === 'passkey' ? via : 'email', createdAt: ctx.now() });
+    const sessionAuth = parseSessionAuth(b.session_auth);
+    // Section 7.5: `owner_verified_via` reports the strongest method used, the one of the credential's session included.
+    const verifiedVia = strongest(via === 'oidc' || via === 'domain' || via === 'passkey' ? via : 'email', methodOf(sessionAuth));
+    await ctx.store.putOwner({ id, ownerSub: randomSecret(), email: b.email, emailVerified: true, name: typeof b.name === 'string' ? b.name : undefined, verifiedVia, createdAt: ctx.now() });
     const credential = randomSecret();
-    await ctx.store.putCredential({ hash: sha256(credential), ownerId: id, kind: 'owner', createdAt: ctx.now() });
-    return c.json({ owner_id: id, credential }, 201, NO_STORE);
+    await ctx.store.putCredential({ hash: sha256(credential), ownerId: id, kind: 'owner', sessionAuth, createdAt: ctx.now() });
+    return c.json({ owner_id: id, credential, session_auth: sessionAuth, verified_via: verifiedVia }, 201, NO_STORE);
+  });
+  app.delete('/admin/agents/:handle', async (c) => {
+    requireAdmin(c);
+    const a = await ctx.store.getAgent(handleOf(c));
+    if (!a) throw new OAuthError(404, 'not_found');
+    await agents.deleteAgent(ctx, a);
+    return c.body(null, 204, NO_STORE);
   });
   app.post('/admin/agents', async (c) => {
     requireAdmin(c);
@@ -409,9 +482,7 @@ export function createIssuerApp(ctx: IssuerContext): Hono {
     const a = await ctx.store.getAgent(handle);
     const b = await jsonBody(c);
     if (!a || !isPlainObject(b) || typeof b.enabled !== 'boolean') throw new OAuthError(400, 'invalid_request');
-    a.enabled = b.enabled;
-    await ctx.store.putAgent(a);
-    if (!a.enabled) for (const t of await ctx.store.listAccessTokens({ handle })) { t.revoked = true; await ctx.store.putAccessToken(t); }
+    await agents.setAgentEnabled(ctx, a, b.enabled);
     return c.json({ handle, enabled: a.enabled }, 200, NO_STORE);
   });
   app.post('/admin/credentials', async (c) => {
@@ -421,9 +492,15 @@ export function createIssuerApp(ctx: IssuerContext): Hono {
     const kind = b.kind === 'delegated' ? 'delegated' : 'owner';
     const handle = typeof b.handle === 'string' ? parseHandle(b.handle)?.handle : undefined;
     if (kind === 'delegated' && !handle) throw new OAuthError(400, 'invalid_request', 'delegated credentials need a handle');
+    const owner = await ctx.store.getOwner(b.owner_id);
+    if (!owner) throw new OAuthError(404, 'not_found', 'owner');
     const credential = randomSecret();
-    await ctx.store.putCredential({ hash: sha256(credential), ownerId: b.owner_id, kind, handle, createdAt: ctx.now() });
-    return c.json({ credential, kind, handle }, 201, NO_STORE);
+    const sessionAuth = kind === 'owner' ? parseSessionAuth(b.session_auth) : undefined;
+    if (sessionAuth && strongest(owner.verifiedVia, methodOf(sessionAuth)) !== owner.verifiedVia) {
+      await ctx.store.putOwner({ ...owner, verifiedVia: methodOf(sessionAuth) }); // Section 7.5: the strongest method used
+    }
+    await ctx.store.putCredential({ hash: sha256(credential), ownerId: b.owner_id, kind, handle, sessionAuth, createdAt: ctx.now() });
+    return c.json({ credential, kind, handle, session_auth: sessionAuth }, 201, NO_STORE);
   });
 
   app.get('/static/wait.js', (c) => c.body(WAIT_JS, 200, { 'Content-Type': 'text/javascript; charset=utf-8', 'Cache-Control': 'public, max-age=3600' }));
@@ -436,6 +513,20 @@ export function createIssuerApp(ctx: IssuerContext): Hono {
   return app;
 }
 
+/**
+ * Bootstrap `session_auth`: how the session that obtained an Owner Credential authenticated the Owner (Section 6.6).
+ * It fails closed: a caller that does not state it gets `email_only`, which neither approves nor grants `share_owner`.
+ */
+function parseSessionAuth(v: unknown): SessionAuth {
+  if (v === undefined) return 'email_only';
+  if (v === 'passkey' || v === 'oidc' || v === 'domain' || v === 'email_factor' || v === 'email_only') return v;
+  throw new OAuthError(400, 'invalid_request', 'session_auth must be passkey, oidc, domain, email_factor or email_only');
+}
+/** Section 7.5: the verification methods from weakest to strongest, and the one a session of each kind amounts to. */
+const METHODS: OwnerVerifiedVia[] = ['email', 'oidc', 'domain', 'passkey'];
+const methodOf = (s: SessionAuth): OwnerVerifiedVia => (s === 'email_only' || s === 'email_factor' ? 'email' : s);
+const strongest = (a: OwnerVerifiedVia, b: OwnerVerifiedVia): OwnerVerifiedVia => (METHODS.indexOf(a) >= METHODS.indexOf(b) ? a : b);
+
 async function jsonBody(c: Context): Promise<unknown> {
   const ct = (c.req.header('content-type') ?? '').split(';')[0]!.trim().toLowerCase();
   if (ct !== 'application/json') throw new OAuthError(400, 'invalid_request', 'Content-Type must be application/json');
@@ -445,6 +536,18 @@ async function jsonBody(c: Context): Promise<unknown> {
     return JSON.parse(text);
   } catch {
     throw new OAuthError(400, 'invalid_request', 'malformed JSON');
+  }
+}
+
+/** Reads the body now and reports a malformed one only when it is used, so that the errors Section 6.7 ranks higher come first. */
+async function deferredJsonBody(c: Context): Promise<() => unknown> {
+  try {
+    const v = await jsonBody(c);
+    return () => v;
+  } catch (e) {
+    return () => {
+      throw e;
+    };
   }
 }
 

@@ -19,4 +19,9 @@ export interface IssuerContext {
   adminToken: string;
   now: () => number;
   locks: Locks;
+  /**
+   * Delivers the one-time code of the Owner email sign-in (Section 7.5 `email`) to the Owner's address. The sign-in is
+   * unavailable when absent. The code is a credential: an implementation sends it to the mailbox and nowhere else.
+   */
+  sendOwnerCode?: (m: { email: string; code: string; expiresAt: number }) => void | Promise<void>;
 }

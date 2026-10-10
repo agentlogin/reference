@@ -127,24 +127,28 @@ export async function resolveClient(ctx: ClientContext, clientId: string): Promi
   return fetchOpenClient(ctx, url);
 }
 
+/**
+ * A loopback IP literal redirect URI (`http://127.0.0.1:{port}/...` or `http://[::1]:{port}/...`, Section 5.2 step 2)
+ * split into what must be equal and the port, which may differ. The split is made on the string as sent, never on a
+ * parsed URL: a parser would equate other spellings of the host (`127.1`, `0x7f.0.0.1`, `2130706433`), an upper-case
+ * scheme, userinfo, dot segments, an empty query or a fragment, none of which simple string comparison accepts.
+ */
+const LOOPBACK_URI = /^(http:\/\/(?:127\.0\.0\.1|\[::1\]))(?::(0|[1-9]\d{0,4}))?([/?][^#]*)?$/;
+function loopbackParts(uri: string): { origin: string; rest: string } | null {
+  const m = LOOPBACK_URI.exec(uri);
+  if (!m || (m[2] !== undefined && Number(m[2]) > 65535)) return null;
+  return { origin: m[1]!, rest: m[3] ?? '' };
+}
+
 /** Section 5.2 step 2: simple string comparison, except that a Registered Client's loopback IP literal URI may vary its port (RFC 8252 Section 7.3). */
 export function redirectUriMatches(client: Client, uri: string): boolean {
   if (client.redirectUris.includes(uri)) return true;
   if (client.type !== 'registered') return false;
-  let u: URL;
-  try {
-    u = new URL(uri);
-  } catch {
-    return false;
-  }
-  if (u.protocol !== 'http:' || !(u.hostname === '127.0.0.1' || u.hostname === '[::1]')) return false;
+  const requested = loopbackParts(uri);
+  if (!requested) return false;
   return client.redirectUris.some((r) => {
-    try {
-      const reg = new URL(r);
-      return reg.protocol === 'http:' && reg.hostname === u.hostname && reg.pathname === u.pathname && reg.search === u.search;
-    } catch {
-      return false;
-    }
+    const registered = loopbackParts(r);
+    return !!registered && registered.origin === requested.origin && registered.rest === requested.rest;
   });
 }
 
@@ -162,9 +166,22 @@ export async function registerClient(ctx: ClientContext, body: unknown): Promise
   if (body.response_types !== undefined && !(Array.isArray(body.response_types) && body.response_types.every((r) => r === 'code'))) throw new OAuthError(400, 'invalid_client_metadata', 'response_types');
   const method = body.token_endpoint_auth_method ?? 'client_secret_basic';
   if (method !== 'client_secret_basic' && method !== 'client_secret_post') throw new OAuthError(400, 'invalid_client_metadata', 'token_endpoint_auth_method');
+  // Section 4.4: a Relay registering as a client names itself; every redirect URI must be on the Relay's host, and the
+  // Relay's `op_policy_uri` is taken from its metadata for the approval page of Section 6.6.
+  let relayIssuer: string | undefined;
+  let relayPolicyUri: string | undefined;
+  if (body.relay_issuer !== undefined) {
+    const relay = typeof body.relay_issuer === 'string' ? parseIssuerIdentifier(body.relay_issuer, ctx.allowInsecureClients) : null;
+    if (!relay) throw new OAuthError(400, 'invalid_client_metadata', 'relay_issuer must be an Issuer Identifier');
+    for (const u of common.redirectUris) {
+      if (new URL(u).host !== relay.host) throw new OAuthError(400, 'invalid_client_metadata', `redirect_uri ${u} is not on the host of relay_issuer`);
+    }
+    relayIssuer = relay.href.replace(/\/$/, '');
+    relayPolicyUri = await fetchRelayPolicyUri(ctx, relayIssuer);
+  }
   const clientId = randomId();
   const secret = randomSecret();
-  const client: Client = { clientId, type: 'registered', tokenEndpointAuthMethod: method, clientSecretHash: sha256(secret), ...common };
+  const client: Client = { clientId, type: 'registered', tokenEndpointAuthMethod: method, clientSecretHash: sha256(secret), relayIssuer, relayPolicyUri, ...common };
   await ctx.store.putClient(client);
   return {
     client_id: clientId,
@@ -180,5 +197,50 @@ export async function registerClient(ctx: ClientContext, body: unknown): Promise
     initiate_login_uri: client.initiateLoginUri,
     max_signups_per_owner: client.maxSignupsPerOwner,
     require_review: client.requireReview,
+    relay_issuer: client.relayIssuer,
   };
+}
+
+/**
+ * Section 4.4: the Relay's `op_policy_uri`, read from its metadata (Section 2.4) under the fetch protections of
+ * Section 2.2. A `relay_issuer` whose metadata cannot be fetched, names another Issuer or lacks the member is refused:
+ * the approval page of Section 6.6 could not say under which policy the Owner Claims are forwarded.
+ */
+async function fetchRelayPolicyUri(ctx: ClientContext, relayIssuer: string): Promise<string> {
+  const refuse = (d: string) => new OAuthError(400, 'invalid_client_metadata', `relay_issuer metadata: ${d}`);
+  let res;
+  try {
+    res = await safeFetch(`${relayIssuer}/.well-known/openid-configuration`, { maxBytes: ctx.constants.N_FETCH_BYTES, timeoutMs: ctx.constants.N_FETCH_MS, allowPrivate: ctx.allowInsecureClients, maxRedirects: 0 });
+  } catch (e) {
+    throw refuse(`unavailable (${(e as Error).message})`);
+  }
+  if (res.status !== 200) throw refuse(`status ${res.status}`);
+  let doc: unknown;
+  try {
+    doc = JSON.parse(res.body.toString('utf8'));
+  } catch {
+    throw refuse('not JSON');
+  }
+  if (!isPlainObject(doc) || doc.issuer !== relayIssuer) throw refuse('issuer does not equal relay_issuer');
+  const policy = optString(doc.op_policy_uri);
+  let scheme: string | undefined;
+  try {
+    scheme = policy ? new URL(policy).protocol : undefined;
+  } catch {
+    scheme = undefined;
+  }
+  if (!policy || !(scheme === 'https:' || (ctx.allowInsecureClients && scheme === 'http:'))) throw refuse('op_policy_uri is REQUIRED for a Relay and must be an https URL');
+  return policy;
+}
+
+/** An Issuer Identifier (Section 1.2 of [RFC8414]): https URL without query or fragment; http only in development. */
+function parseIssuerIdentifier(v: string, allowInsecure: boolean): URL | null {
+  try {
+    const u = new URL(v);
+    if (!(u.protocol === 'https:' || (allowInsecure && u.protocol === 'http:'))) return null;
+    if (u.search || u.hash || u.username || u.password) return null;
+    return u;
+  } catch {
+    return null;
+  }
 }
