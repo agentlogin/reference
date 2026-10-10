@@ -1,0 +1,17 @@
+{
+  "name": "@agentlogin/issuer",
+  "version": "0.1.0",
+  "description": "Reference Agent Login issuer: an OpenID Provider that signs software agents in with their own keys",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": { ".": "./dist/index.js" },
+  "files": ["dist", "static", "README.md"],
+  "repository": { "type": "git", "url": "git+https://github.com/agentlogin/reference.git", "directory": "packages/issuer" },
+  "dependencies": {
+    "@hono/node-server": "^1.19.0",
+    "hono": "^4.9.0",
+    "jose": "^6.1.0"
+  }
+}

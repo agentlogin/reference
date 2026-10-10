@@ -1,0 +1,22 @@
+{
+  "name": "agentlogin-reference",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Reference implementation of the Agent Login specification",
+  "license": "Apache-2.0",
+  "workspaces": ["packages/*"],
+  "type": "module",
+  "scripts": {
+    "build": "tsc -b packages/issuer packages/conformance",
+    "typecheck": "tsc -b packages/issuer packages/conformance --noEmit",
+    "test": "node --import tsx --test packages/issuer/test/*.test.ts",
+    "issuer": "node --import tsx packages/issuer/src/server.ts",
+    "conformance": "node --import tsx packages/conformance/bin/agentlogin-conformance.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^22.18.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0"
+  },
+  "engines": { "node": ">=22.12" }
+}

@@ -1,0 +1,13 @@
+{
+  "name": "@agentlogin/conformance",
+  "version": "0.1.0",
+  "description": "Black-box conformance harness for Agent Login issuers",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": { "agentlogin-conformance": "bin/agentlogin-conformance.js" },
+  "files": ["dist", "bin", "README.md"],
+  "repository": { "type": "git", "url": "git+https://github.com/agentlogin/reference.git", "directory": "packages/conformance" },
+  "dependencies": { "jose": "^6.1.0" }
+}

@@ -1,0 +1,136 @@
+// Section 2.2 fetch protections: no special-use addresses (RFC 6890), re-checked at every hop, size and
+// time limits, no credentials. Used for Client ID Metadata Documents (Section 4.2) and, by the client
+// library, for discovery. Implemented over node:https so that the resolved address can be filtered
+// before the connection is made.
+import { isIP } from 'node:net';
+import dns from 'node:dns';
+import http from 'node:http';
+import https from 'node:https';
+import type { LookupFunction } from 'node:net';
+
+export interface SafeFetchOptions {
+  maxBytes: number;
+  timeoutMs: number;
+  /** Development only: permit loopback and private addresses, and plain http. */
+  allowPrivate?: boolean;
+  accept?: string;
+  /** Maximum redirects to follow (each hop re-checked); 0 treats a 3xx as the final response. */
+  maxRedirects?: number;
+}
+export interface SafeFetchResult {
+  url: string;
+  status: number;
+  headers: http.IncomingHttpHeaders;
+  body: Buffer;
+}
+
+const V4_BLOCKED: Array<[number, number]> = [
+  ['0.0.0.0', 8], ['10.0.0.0', 8], ['100.64.0.0', 10], ['127.0.0.0', 8], ['169.254.0.0', 16], ['172.16.0.0', 12],
+  ['192.0.0.0', 24], ['192.0.2.0', 24], ['192.88.99.0', 24], ['192.168.0.0', 16], ['198.18.0.0', 15],
+  ['198.51.100.0', 24], ['203.0.113.0', 24], ['224.0.0.0', 4], ['240.0.0.0', 4],
+].map(([a, bits]) => [v4ToInt(a as string), bits as number]);
+
+function v4ToInt(a: string): number {
+  return a.split('.').reduce((acc, o) => ((acc << 8) | Number(o)) >>> 0, 0);
+}
+function v4Blocked(addr: string): boolean {
+  const n = v4ToInt(addr);
+  return V4_BLOCKED.some(([net, bits]) => bits === 0 || (n >>> (32 - bits)) === (net >>> (32 - bits)));
+}
+function expandV6(addr: string): bigint {
+  // returns the 128-bit value; handles :: and embedded IPv4
+  let a = addr;
+  const v4 = /:(\d+\.\d+\.\d+\.\d+)$/.exec(a);
+  if (v4) {
+    const n = v4ToInt(v4[1]!);
+    a = a.slice(0, v4.index) + `:${(n >>> 16).toString(16)}:${(n & 0xffff).toString(16)}`;
+  }
+  const [head, tail = ''] = a.split('::');
+  const hs = head ? head.split(':') : [];
+  const ts = tail ? tail.split(':') : [];
+  const groups = [...hs, ...new Array(8 - hs.length - ts.length).fill('0'), ...ts];
+  return groups.reduce((acc, g) => (acc << 16n) | BigInt(parseInt(g || '0', 16)), 0n);
+}
+function v6Blocked(addr: string): boolean {
+  const n = expandV6(addr);
+  const inRange = (prefix: string, bits: number) => (n >> BigInt(128 - bits)) === (expandV6(prefix) >> BigInt(128 - bits));
+  if (inRange('::ffff:0:0', 96)) return v4Blocked(intToV4(Number(n & 0xffffffffn)));
+  if (inRange('64:ff9b::', 96)) return v4Blocked(intToV4(Number(n & 0xffffffffn)));
+  if (inRange('64:ff9b:1::', 48)) return true;
+  if (inRange('2002::', 16)) return v4Blocked(intToV4(Number((n >> 80n) & 0xffffffffn)));
+  return (
+    n === 0n || n === 1n || inRange('100::', 64) || inRange('2001::', 23) || inRange('2001:db8::', 32) || inRange('fc00::', 7) ||
+    inRange('fe80::', 10) || inRange('ff00::', 8)
+  );
+}
+function intToV4(n: number): string {
+  return [n >>> 24, (n >>> 16) & 255, (n >>> 8) & 255, n & 255].join('.');
+}
+/** True when the address is special-use per RFC 6890 and must not be connected to. */
+export function isBlockedAddress(addr: string): boolean {
+  const fam = isIP(addr);
+  if (fam === 4) return v4Blocked(addr);
+  if (fam === 6) return v6Blocked(addr);
+  return true;
+}
+
+function filteredLookup(allowPrivate: boolean): LookupFunction {
+  return (hostname, options, callback) => {
+    dns.lookup(hostname, { all: true, verbatim: true }, (err, addresses) => {
+      if (err) return callback(err, [] as never);
+      const list = (addresses as dns.LookupAddress[]).filter((a) => allowPrivate || !isBlockedAddress(a.address));
+      if (list.length === 0) return callback(new Error(`blocked address for ${hostname}`), [] as never);
+      if ((options as { all?: boolean }).all) return callback(null, list as never);
+      return callback(null, list[0]!.address as never, list[0]!.family as never);
+    });
+  };
+}
+
+function one(url: URL, o: SafeFetchOptions): Promise<SafeFetchResult> {
+  return new Promise((resolve, reject) => {
+    const allowPrivate = !!o.allowPrivate;
+    if (url.protocol !== 'https:' && !(allowPrivate && url.protocol === 'http:')) return reject(new Error('scheme not permitted'));
+    if (url.username || url.password) return reject(new Error('userinfo not permitted'));
+    const host = url.hostname.replace(/^\[|\]$/g, '');
+    if (isIP(host) && !allowPrivate && isBlockedAddress(host)) return reject(new Error('blocked address literal'));
+    const mod = url.protocol === 'https:' ? https : http;
+    const req = mod.request(
+      url,
+      { method: 'GET', headers: { accept: o.accept ?? 'application/json', 'user-agent': 'agentlogin-issuer/0.1' }, lookup: filteredLookup(allowPrivate), timeout: o.timeoutMs },
+      (res) => {
+        const chunks: Buffer[] = [];
+        let size = 0;
+        res.on('data', (c: Buffer) => {
+          size += c.length;
+          if (size > o.maxBytes) {
+            req.destroy(new Error('response too large'));
+            return;
+          }
+          chunks.push(c);
+        });
+        res.on('end', () => resolve({ url: url.href, status: res.statusCode ?? 0, headers: res.headers, body: Buffer.concat(chunks) }));
+        res.on('error', reject);
+      },
+    );
+    req.on('timeout', () => req.destroy(new Error('fetch timed out')));
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+export async function safeFetch(input: string | URL, o: SafeFetchOptions): Promise<SafeFetchResult> {
+  const deadline = Date.now() + o.timeoutMs;
+  let url = new URL(input);
+  let hops = 0;
+  for (;;) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) throw new Error('fetch timed out');
+    const res = await one(url, { ...o, timeoutMs: remaining });
+    if (res.status >= 300 && res.status < 400 && (o.maxRedirects ?? 0) > hops && res.headers.location) {
+      hops += 1;
+      url = new URL(res.headers.location, url);
+      continue;
+    }
+    return res;
+  }
+}
