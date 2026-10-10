@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import { serve } from '@hono/node-server';
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { createIssuer } from '../src/index.js';
+import { createIssuer, MemoryStore, type Store } from '../src/index.js';
 import { runConformance } from '../../conformance/src/index.js';
 
 async function listen(handler: http.RequestListener): Promise<{ url: string; port: number; close: () => Promise<void> }> {
@@ -25,7 +25,45 @@ const json = (res: http.ServerResponse, body: unknown) => {
   res.end(JSON.stringify(body));
 };
 
-test('reference issuer passes the conformance harness', async () => {
+/**
+ * A store whose every operation completes on a later turn of the event loop, as one backed by a database does. The
+ * in-memory store answers within the same turn, which hides races between concurrent requests: with it, a handler
+ * is never interrupted between two store operations.
+ */
+function yielding(store: Store): Store {
+  return new Proxy(store, {
+    get(target, prop, receiver) {
+      const v = Reflect.get(target, prop, receiver) as unknown;
+      if (typeof v !== 'function') return v;
+      return async (...args: unknown[]) => {
+        await new Promise((r) => setImmediate(r));
+        return (v as (...a: unknown[]) => unknown).apply(target, args);
+      };
+    },
+  });
+}
+
+/**
+ * Database semantics in full: every read returns a copy taken at the time of the query, every write stores a copy,
+ * and each operation completes on a later turn. Nothing is shared by reference between two requests, so a handler
+ * that changes an object without writing it back, or that acts on a stale read, shows.
+ */
+function snapshotting(store: Store): Store {
+  const copy = <T>(v: T): T => (v === undefined ? v : structuredClone(v));
+  return new Proxy(store, {
+    get(target, prop, receiver) {
+      const v = Reflect.get(target, prop, receiver) as unknown;
+      if (typeof v !== 'function') return v;
+      return async (...args: unknown[]) => {
+        const result = await (v as (...a: unknown[]) => unknown).apply(target, args.map(copy));
+        await new Promise((r) => setImmediate(r));
+        return copy(result);
+      };
+    },
+  });
+}
+
+async function conformanceRun(store?: Store): Promise<void> {
   // Open Client metadata documents hosted by the test (Section 4.2); dev mode permits loopback http. Besides the valid
   // one, documents the issuer must refuse at step 1 of Section 5.2.
   const refused: Record<string, Record<string, unknown>> = {
@@ -60,6 +98,7 @@ test('reference issuer passes the conformance harness', async () => {
     handleDomains: ['example.com', '*.agents.example'],
     allowInsecureClients: true,
     adminToken: 'test-admin',
+    store,
     sendOwnerCode: ({ email, code }) => { mailbox.set(email, code); },
   });
   const server = serve({ fetch: app.fetch, port, hostname: '127.0.0.1' });
@@ -96,4 +135,8 @@ test('reference issuer passes the conformance harness', async () => {
     await rp.close();
     await relay.close();
   }
-});
+}
+
+test('reference issuer passes the conformance harness', () => conformanceRun());
+test('reference issuer passes the conformance harness with a store that yields like a database', () => conformanceRun(yielding(new MemoryStore())));
+test('reference issuer passes the conformance harness with a store that returns copies, as a database does', () => conformanceRun(snapshotting(new MemoryStore())));

@@ -691,6 +691,24 @@ class Harness {
       const list = await call(`${m.agents_endpoint}/${encodeURIComponent(fresh.handle)}/accounts`, { headers: { authorization: `Bearer ${this.credential}` } });
       expect(list.status === 200 && Array.isArray(obj(list.json).accounts), 'list accounts');
     });
+    await this.check('I-28', 'Two Agents asserting at once cannot both take the last place under the cap', async () => {
+      if (!this.o.adminToken) throw new Skip('needs adminToken');
+      const owner = await this.newOwner('race');
+      const saved = this.credential;
+      this.credential = owner.credential;
+      try {
+        const one = await this.register({ max_signups_per_owner: 1 });
+        const agents = [await this.newAgent(owner.owner_id), await this.newAgent(owner.owner_id), await this.newAgent(owner.owner_id)];
+        const started = [];
+        for (const a of agents) started.push({ a, tx: (await this.start(one)).tx });
+        const results = (await Promise.all(started.map(({ a, tx }) => this.assert(tx, a, { accept_disclosure: true })))).map((r) => obj(r.json));
+        const admitted = results.filter((r) => r.status === 'ready').length;
+        const refused = results.filter((r) => r.status === 'denied' && r.reason === 'signup_limit_reached').length;
+        expect(admitted === 1 && refused === agents.length - 1, `cap 1, three Agents at once → ${results.map((r) => `${r.status} ${r.reason ?? ''}`.trim()).join(', ')}`);
+      } finally {
+        this.credential = saved;
+      }
+    });
     await this.check('I-28', 'Concurrent first completions of one Agent count once toward the cap', async () => {
       if (!this.o.adminToken) throw new Skip('needs adminToken');
       const owner = await this.newOwner('twice');
