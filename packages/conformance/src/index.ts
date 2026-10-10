@@ -1,8 +1,8 @@
 // Black-box conformance harness for Agent Login issuers (checklist items I-*, Section numbers of the core spec).
-import { createRemoteJWKSet, decodeProtectedHeader, jwtVerify } from 'jose';
+import { calculateJwkThumbprint, createRemoteJWKSet, decodeProtectedHeader, jwtVerify } from 'jose';
 import { createHash } from 'node:crypto';
 import { AgentClient, rnd } from './agent.js';
-import { call, obj, type Res } from './http.js';
+import { call, callContext, obj, type CallContext, type Exchange, type Res } from './http.js';
 
 export interface HarnessOptions {
   issuer: string;
@@ -10,9 +10,31 @@ export interface HarnessOptions {
   adminToken?: string;
   /** Existing Agent to use when the harness cannot create one. */
   handle?: string;
+  /** Owner Credential of that Agent's Owner, obtained in a session that satisfies Section 6.6 (passkey, oidc, domain, or email plus a factor). */
   ownerCredential?: string;
+  /**
+   * I-45, with `handle` and `ownerCredential`: a second Owner Credential of the same Owner, obtained through the
+   * issuer's one-time-code (email) sign-in alone. It must neither approve a transaction nor grant `share_owner`.
+   */
+  emailOnlyOwnerCredential?: string;
+  /**
+   * I-45, with `adminToken`: signs the Owner with this address in through the issuer's one-time-code (email) sign-in,
+   * reading the code from wherever the issuer delivered it, and returns the Owner Credential that sign-in issued.
+   */
+  ownerEmailSignIn?: (email: string) => Promise<string>;
   /** Optional Open Client to exercise Section 4.2: a reachable metadata URL and one of its redirect URIs. */
   openClient?: { clientId: string; redirectUri: string };
+  /**
+   * I-39: reachable Client ID Metadata Documents the issuer must refuse (Sections 3.2, 4.2), for example one stating
+   * `id_token_signed_response_alg` `RS256`. Each must answer `400` `invalid_request` directly.
+   */
+  invalidOpenClients?: Array<{ name: string; clientId: string; redirectUri: string }>;
+  /**
+   * I-45, I-48: Issuer Identifier of a Relay whose metadata the issuer under test can fetch (Section 4.4), served at
+   * `{relayIssuer}/.well-known/openid-configuration` with `issuer` and `op_policy_uri`. Use a domain name, not an IP
+   * literal, so that look-alike hosts can be formed.
+   */
+  relayIssuer?: string;
   log?: (line: string) => void;
 }
 export type Outcome = 'pass' | 'fail' | 'skip';
@@ -21,6 +43,10 @@ export interface Report { issuer: string; results: CheckResult[]; passed: number
 
 interface Meta { [k: string]: any }
 interface RegisteredClient { client_id: string; client_secret: string; redirect_uri: string }
+/** What I-49 keeps of every exchange of the run: which check made it and the two headers it audits. */
+interface Seen { check: string; method: string; url: string; status: number; cacheControl: string | null; allowCredentials: string | null; location: string | null }
+const slug = (n = 4) => rnd(n).toLowerCase().replace(/[^a-z0-9]/g, 'x');
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 class Harness {
   results: CheckResult[] = [];
@@ -28,8 +54,17 @@ class Harness {
   agent!: AgentClient;
   credential!: string;
   ownerId?: string;
+  ownerEmail?: string;
   client!: RegisteredClient; // no cap, no review requirement
   cappedClient?: RegisteredClient; // max_signups_per_owner 1
+  /** Every exchange of the run, for the audit of I-49. */
+  seen: Seen[] = [];
+  current = 'bootstrap';
+  cx: CallContext = {
+    seen: (x: Exchange) => {
+      this.seen.push({ check: this.current, method: x.method, url: x.url, status: x.res.status, cacheControl: x.res.headers.get('cache-control'), allowCredentials: x.res.headers.get('access-control-allow-credentials'), location: x.res.headers.get('location') });
+    },
+  };
   constructor(public o: HarnessOptions) {}
 
   log(s: string) { this.o.log?.(s); }
@@ -39,6 +74,7 @@ class Harness {
   }
   /** Runs a check; an assertion failure (thrown Error) records a fail. */
   async check(id: string, title: string, fn: () => Promise<void>) {
+    this.current = id;
     try {
       await fn();
       this.record(id, title, 'pass');
@@ -113,13 +149,19 @@ class Harness {
   }
   async register(meta: Record<string, unknown>): Promise<RegisteredClient> {
     if (!this.o.adminToken) throw new Skip('needs adminToken for registration');
-    const redirect_uri = `https://rp-${rnd(4).toLowerCase().replace(/[^a-z0-9]/g, 'x')}.example/cb`;
+    const redirect_uri = `https://rp-${slug()}.example/cb`;
     const r = await call(this.meta.registration_endpoint, { method: 'POST', headers: { authorization: `Bearer ${this.o.adminToken}` }, json: { redirect_uris: [redirect_uri], client_name: 'Conformance harness', tos_uri: 'https://rp.example/terms', policy_uri: 'https://rp.example/privacy', token_endpoint_auth_method: 'client_secret_basic', ...meta } });
     expect(r.status === 201, `registration → ${r.status} ${r.text.slice(0, 200)}`);
     const j = obj(r.json);
     return { client_id: j.client_id, client_secret: j.client_secret, redirect_uri };
   }
-  async newAgent(ownerId: string, local = `agent-${rnd(4).toLowerCase().replace(/[^a-z0-9]/g, 'x')}`) {
+  /** A new Owner with an Owner Credential from a session that satisfies Section 6.6, stated to the bootstrap API with the matching `verified_via`. */
+  async newOwner(prefix: string): Promise<{ owner_id: string; credential: string; email: string }> {
+    const email = `${prefix}-${slug()}@example.com`;
+    const o = await this.admin('/admin/owners', { email, name: 'Jane Doe', verified_via: 'passkey', session_auth: 'passkey' });
+    return { owner_id: o.owner_id, credential: o.credential, email };
+  }
+  async newAgent(ownerId: string, local = `agent-${slug()}`) {
     const domain = (this.meta.handle_domains as string[]).find((d) => !d.startsWith('*.')) ?? 'example.com';
     const handle = `${local}@${domain}`;
     await this.admin('/admin/agents', { handle, owner_id: ownerId, name: 'Conformance agent' });
@@ -127,6 +169,56 @@ class Harness {
     const e = await agent.enroll(this.o.issuer, this.meta.agents_endpoint, this.credential);
     expect(e.proof.status === 200, `enroll/prove → ${e.enroll.status}/${e.proof.status} ${e.proof.text.slice(0, 200)}`);
     return agent;
+  }
+
+  /** I-45: an Owner Credential of the harness's Owner from the issuer's one-time-code sign-in, when the operator can supply one. */
+  async emailOnlyCredential(): Promise<string | undefined> {
+    if (this.o.handle && this.o.ownerCredential) return this.o.emailOnlyOwnerCredential;
+    if (this.o.ownerEmailSignIn && this.ownerEmail) return this.o.ownerEmailSignIn(this.ownerEmail);
+    return undefined;
+  }
+  /** The operator's Relay (Section 4.4) with the `op_policy_uri` its metadata publishes; undefined when none is configured. */
+  async relay(): Promise<{ issuer: string; policy: string } | undefined> {
+    if (!this.o.relayIssuer) return undefined;
+    const issuer = this.o.relayIssuer.replace(/\/+$/, '');
+    const r = await call(`${issuer}/.well-known/openid-configuration`);
+    const policy = obj(r.json).op_policy_uri;
+    expect(r.status === 200 && obj(r.json).issuer === issuer && typeof policy === 'string' && policy.length > 0, `relayIssuer metadata must state issuer and op_policy_uri: ${r.status} ${r.text.slice(0, 160)}`);
+    return { issuer, policy };
+  }
+  /**
+   * Sections 6.6 and 7.8, through the Owner approval API: `weak`, a valid Owner Credential of the Agent's Owner from a
+   * session that does not qualify, can neither approve, refuse nor grant `share_owner`, and changes nothing; the
+   * harness's own Owner Credential, from a qualifying session, then approves. `exact` also pins the reference issuer's
+   * answer (403 `insufficient_permission`); the specification names no status for these refusals.
+   */
+  async approvalRule(weak: string, what: string, agent: AgentClient, exact = false) {
+    const m = this.meta;
+    const keys = `${m.agents_endpoint}/${encodeURIComponent(agent.handle)}/keys`;
+    const asWeak = { authorization: `Bearer ${weak}` };
+    const asOwner = { authorization: `Bearer ${this.credential}` };
+    const valid = await call(keys, { headers: asWeak });
+    expect(valid.status === 200 && Array.isArray(obj(valid.json).keys), `${what} must be a valid Owner Credential of the Agent's Owner, or its refusals prove nothing: List keys → ${valid.status}`);
+    const refused = (name: string, r: Res) =>
+      expect(exact ? r.status === 403 && obj(r.json).error === 'insufficient_permission' : r.status >= 400 && r.status < 500, `${name} with ${what} → ${r.status} ${obj(r.json).error ?? ''}`);
+    const s = await this.start(this.client, { scope: 'openid email owner_email' });
+    const a = obj((await this.assert(s.tx, agent, { accept_disclosure: true })).json);
+    expect(a.status === 'awaiting_owner', `owner scope → ${a.status} ${a.reason ?? ''}`);
+    const decision = `${this.o.issuer}/owner/transactions/${s.tx.transaction_id}/decision`;
+    for (const d of ['approve', 'refuse']) {
+      refused(`decision ${d}`, await call(decision, { method: 'POST', headers: asWeak, json: { decision: d } }));
+      const now = obj((await this.get(s.tx, a.transaction_token)).json).status;
+      expect(now === 'awaiting_owner', `status after the refused ${d} with ${what}: ${now}`);
+    }
+    const keyUrl = `${keys}/${encodeURIComponent(agent.kid)}`;
+    refused('share_owner grant', await call(keyUrl, { method: 'PATCH', headers: asWeak, json: { permissions: { share_owner: true } } }));
+    const k = await call(keyUrl, { headers: asOwner });
+    expect(k.status === 200 && obj(k.json).permissions?.share_owner === false, `share_owner after the refused grant with ${what}: ${k.status} ${obj(k.json).permissions?.share_owner}`);
+    const again = obj((await this.assert((await this.start(this.client, { scope: 'openid email owner_email' })).tx, agent, { accept_disclosure: true })).json);
+    expect(again.status === 'awaiting_owner', `a sign-in with an Owner scope after the refused grant must still wait for the Owner: ${again.status}`);
+    const ok = await call(decision, { method: 'POST', headers: asOwner, json: { decision: 'approve' } });
+    expect(ok.status === 200 && obj(ok.json).status === 'ready', `approval from a qualifying session → ${ok.status} ${obj(ok.json).status ?? obj(ok.json).error ?? ''}`);
+    expect(obj((await this.get(s.tx, a.transaction_token)).json).status === 'ready', 'the transaction is ready after the approval from a qualifying session');
   }
 
   // ---- bootstrap ---------------------------------------------------------------------------------
@@ -140,8 +232,9 @@ class Harness {
       const e = await this.agent.enroll(this.o.issuer, this.meta.agents_endpoint, this.credential);
       expect(e.proof.status === 200, `enroll/prove → ${e.enroll.status}/${e.proof.status} ${e.proof.text.slice(0, 200)}`);
     } else {
-      const owner = await this.admin('/admin/owners', { email: `owner-${rnd(4).toLowerCase().replace(/[^a-z0-9]/g, 'x')}@example.com`, name: 'Jane Doe' });
+      const owner = await this.newOwner('owner');
       this.ownerId = owner.owner_id;
+      this.ownerEmail = owner.email;
       this.credential = owner.credential;
       this.agent = await this.newAgent(this.ownerId!, 'scout');
     }
@@ -150,7 +243,11 @@ class Harness {
   }
 
   // ---- checks ------------------------------------------------------------------------------------
-  async run(): Promise<Report> {
+  /** Runs every check inside this run's call context, so that each exchange, the Agent Client's included, is recorded. */
+  run(): Promise<Report> {
+    return callContext.run(this.cx, () => this.checks());
+  }
+  async checks(): Promise<Report> {
     await this.bootstrap();
     const m = this.meta;
     const iss = this.o.issuer;
@@ -368,7 +465,7 @@ class Harness {
       const sess = obj((await this.get(s2.tx, s2.tx.session_token)).json);
       expect(typeof sess.next?.url === 'string', 'continue URL released to the Session Holder with deliver_to_session');
       const html = await call(sess.next.url, { headers: { accept: 'text/html', authorization: `Bearer ${s2.tx.session_token}` } });
-      expect((html.status === 302 || html.status === 303) && (html.headers.get('location') ?? '').startsWith(this.client.redirect_uri) && (html.headers.get('cache-control') ?? '').includes('no-store'), `html continue → ${html.status} ${html.headers.get('cache-control')}`);
+      expect(html.status === 303 && (html.headers.get('location') ?? '').startsWith(this.client.redirect_uri) && (html.headers.get('cache-control') ?? '').includes('no-store'), `html continue → ${html.status} ${html.headers.get('cache-control')}`);
       expect(a2.transaction_token !== undefined, 'agent still receives a transaction_token');
       // denied path repeatable
       const s3 = await this.start(this.client, { prompt: 'none' });
@@ -432,7 +529,7 @@ class Harness {
       expect(keys.status === 200 && obj(keys.json).permissions?.share_owner === true, `share_owner grant → ${keys.status} ${keys.text.slice(0, 120)}`);
       const r = await this.signIn(this.client, fresh, 'openid email owner_email owner_profile');
       const { payload } = await jwtVerify(r.token.id_token, createRemoteJWKSet(new URL(m.jwks_uri)), { issuer: iss });
-      expect(payload.owner_email !== undefined && payload.owner_email_verified === true && typeof payload.owner_verified_via === 'string', `owner claims ${JSON.stringify(payload).slice(0, 200)}`);
+      expect(payload.owner_email !== undefined && payload.owner_email_verified === true && ['email', 'oidc', 'domain', 'passkey'].includes(payload.owner_verified_via as string), `owner claims ${JSON.stringify(payload).slice(0, 200)}`);
     });
     await this.check('I-23', 'UserInfo returns 401 invalid_token after key revocation; sub matches; accepted nowhere else', async () => {
       if (!this.ownerId) throw new Skip('needs adminToken');
@@ -527,7 +624,7 @@ class Harness {
     });
     await this.check('I-28', 'Per-owner cap counts Accounts ever created plus in-flight transactions; signup_limit_reached', async () => {
       if (!this.ownerId) throw new Skip('needs adminToken');
-      const owner = await this.admin('/admin/owners', { email: `capped-${rnd(3).toLowerCase().replace(/[^a-z0-9]/g, 'x')}@example.com` });
+      const owner = await this.newOwner('capped');
       const saved = this.credential;
       this.credential = owner.credential;
       try {
@@ -570,6 +667,572 @@ class Harness {
       const post = await call(`${r.tx.url}/assertion`, { method: 'POST', json: { assertion: await this.agent.assertion(iss, { transaction_id: r.tx.transaction_id, challenge: rnd() }) } });
       expect(post.status === 410 && obj(post.json).error === 'transaction_expired' && obj(post.json).status === 'completed', `POST after completion → ${post.status} ${post.text.slice(0, 120)}`);
     });
+    await this.check('I-38', 'Authentication Request by GET and POST; request, request_uri, response_mode and response_type refused on the JSON, HTML and POST paths; state and nonce never rejected on length', async () => {
+      expect(m.request_parameter_supported === false && m.request_uri_parameter_supported === false, `request_parameter_supported ${m.request_parameter_supported}, request_uri_parameter_supported ${m.request_uri_parameter_supported}`);
+      const form = (url: string) => Object.fromEntries(new URL(url).searchParams);
+      const post = await call(m.authorization_endpoint, { method: 'POST', form: form(this.authUrl(this.client).url) });
+      const pt = obj(post.json);
+      expect(post.status === 200 && pt.status === 'awaiting_agent' && typeof pt.session_token === 'string' && typeof pt.challenge === 'string', `POST form body → ${post.status} ${post.text.slice(0, 160)}`);
+      const cases: Array<[string, Record<string, string>, string]> = [
+        ['request', { request: 'eyJhbGciOiJub25lIn0.e30.' }, 'request_not_supported'],
+        ['request_uri', { request_uri: 'https://rp.example/request.jwt' }, 'request_uri_not_supported'],
+        ...['fragment', 'form_post', 'jwt', 'query.jwt', 'web_message'].map((v): [string, Record<string, string>, string] => [`response_mode=${v}`, { response_mode: v }, 'invalid_request']),
+        ...['token', 'id_token', 'none', 'code id_token', 'code token', 'Code'].map((v): [string, Record<string, string>, string] => [`response_type=${v}`, { response_type: v }, 'unsupported_response_type']),
+      ];
+      /** The error redirect of Section 5.2: to the registered redirect_uri, with error, the request's state and iss. */
+      const errorAt = (name: string, target: unknown, error: string, state: string | undefined) => {
+        expect(typeof target === 'string' && target.length > 0, `${name}: no redirect URL`);
+        const l = new URL(target);
+        expect(l.origin + l.pathname === this.client.redirect_uri && l.searchParams.get('error') === error && l.searchParams.get('state') === state && l.searchParams.get('iss') === iss, `${name}: error redirect ${target}`);
+      };
+      for (const [name, over, error] of cases) {
+        const u = this.authUrl(this.client, over);
+        for (const [path, r] of [['GET, JSON', await call(u.url)], ['POST, JSON', await call(m.authorization_endpoint, { method: 'POST', form: form(u.url) })]] as Array<[string, Res]>) {
+          const j = obj(r.json);
+          expect(r.status === 400 && j.error === error, `${name} (${path}): ${r.status} ${j.error ?? r.text.slice(0, 120)}`);
+          errorAt(`${name} (${path})`, j.redirect, error, u.params.state);
+        }
+        // The path a Relying Party's browser redirect takes.
+        const h = await call(u.url, { headers: { accept: 'text/html' } });
+        expect(h.status === 303, `${name} (GET, HTML): ${h.status} ${h.text.slice(0, 120)}`);
+        errorAt(`${name} (GET, HTML)`, h.headers.get('location'), error, u.params.state);
+      }
+      // Section 3.1 of RFC 6749 treats a parameter sent without a value as omitted, so an empty response_mode is either accepted as absent or refused like any other value.
+      const empty = await call(this.authUrl(this.client, { response_mode: '' }).url);
+      expect((empty.status === 200 && obj(empty.json).status === 'awaiting_agent') || (empty.status === 400 && obj(empty.json).error === 'invalid_request'), `response_mode without a value: ${empty.status} ${obj(empty.json).error ?? obj(empty.json).status ?? ''}`);
+      const query = await this.start(this.client, { response_mode: 'query' });
+      expect(query.tx.status === 'awaiting_agent', 'response_mode=query accepted');
+      const short = await this.start(this.client, { state: 's', nonce: 'n' });
+      expect(short.tx.status === 'awaiting_agent', 'one-character state and nonce accepted');
+      // 512 characters each: accepted on both paths and returned unchanged (Sections 5.4, 3.1).
+      const long = { state: rnd(384), nonce: rnd(384) };
+      const ls = await call(this.authUrl(this.client, long).url);
+      expect(ls.status === 200 && obj(ls.json).status === 'awaiting_agent', `512-character state and nonce (JSON) → ${ls.status} ${obj(ls.json).error ?? ''}`);
+      const lh = await call(this.authUrl(this.client, long).url, { headers: { accept: 'text/html' } });
+      expect(lh.status === 303 && !new URL(lh.headers.get('location') ?? 'http://invalid/?error=none').searchParams.has('error'), `512-character state and nonce (HTML) → ${lh.status} ${lh.headers.get('location') ?? ''}`);
+      const lp = this.authUrl(this.client, long);
+      const lt = obj((await call(lp.url)).json);
+      const la = obj((await this.assert(lt, this.agent, { accept_disclosure: true })).json);
+      expect(la.status === 'ready', `sign-in with a 512-character state and nonce → ${la.status} ${la.reason ?? ''}`);
+      const lr = new URL(obj((await this.cont(la.next.url, la.transaction_token)).json).redirect);
+      expect(lr.searchParams.get('state') === long.state, 'a 512-character state must come back unchanged on the redirect');
+      const tok = await this.exchange(this.client, lr.searchParams.get('code')!, lp.verifier);
+      expect(tok.status === 200, `exchange → ${tok.status} ${obj(tok.json).error ?? ''}`);
+      const { payload } = await jwtVerify(obj(tok.json).id_token, createRemoteJWKSet(new URL(m.jwks_uri)), { issuer: iss, audience: this.client.client_id });
+      expect(payload.nonce === long.nonce, 'a 512-character nonce must come back unchanged in the ID Token');
+    });
+    await this.check('I-39', 'Step 3/4 failure after a valid client: HTML 303 to redirect_uri with error, state, iss; JSON 400 with redirect; step 1 failure answers 400 directly', async () => {
+      const a = this.authUrl(this.client, { nonce: undefined });
+      const h = await call(a.url, { headers: { accept: 'text/html' } });
+      const loc = h.headers.get('location');
+      expect(h.status === 303 && !!loc, `HTML step 3 failure → ${h.status} ${loc ?? h.text.slice(0, 120)}`);
+      const l = new URL(loc!);
+      expect(l.origin + l.pathname === this.client.redirect_uri && l.searchParams.get('error') === 'invalid_request' && l.searchParams.get('state') === a.params.state && l.searchParams.get('iss') === iss, `HTML error redirect ${loc}`);
+      expect((h.headers.get('cache-control') ?? '').includes('no-store'), 'no-store on the error redirect');
+      const scope = this.authUrl(this.client, { scope: 'email profile' });
+      const j = await call(scope.url);
+      const jb = obj(j.json);
+      expect(j.status === 400 && jb.error === 'invalid_scope' && typeof jb.redirect === 'string', `JSON step 4 failure → ${j.status} ${j.text.slice(0, 160)}`);
+      const r = new URL(jb.redirect);
+      expect(r.origin + r.pathname === this.client.redirect_uri && r.searchParams.get('error') === 'invalid_scope' && r.searchParams.get('state') === scope.params.state && r.searchParams.get('iss') === iss, `JSON redirect member ${jb.redirect}`);
+      const h4 = await call(scope.url, { headers: { accept: 'text/html' } });
+      expect(h4.status === 303 && new URL(h4.headers.get('location') ?? 'http://invalid/').searchParams.get('error') === 'invalid_scope', `HTML step 4 failure → ${h4.status} ${h4.headers.get('location') ?? ''}`);
+      const unknown = this.authUrl({ ...this.client, client_id: `unknown-${rnd(4)}` });
+      const uj = await call(unknown.url);
+      expect(uj.status === 400 && obj(uj.json).error === 'invalid_request' && obj(uj.json).redirect === undefined && !uj.headers.get('location'), `JSON step 1 failure → ${uj.status} ${uj.text.slice(0, 120)}`);
+      const uh = await call(unknown.url, { headers: { accept: 'text/html' } });
+      expect(uh.status === 400 && !uh.headers.get('location') && (uh.headers.get('content-type') ?? '').includes('text/html'), `HTML step 1 failure → ${uh.status} ${uh.headers.get('content-type')} ${uh.headers.get('location') ?? ''}`);
+      // Step 1 also fails when the Client ID Metadata Document is one the Issuer must refuse (Sections 3.2, 4.2): invalid_request, whatever is wrong with it.
+      for (const oc of this.o.invalidOpenClients ?? []) {
+        const bad = this.authUrl({ client_id: oc.clientId, client_secret: '', redirect_uri: oc.redirectUri });
+        const bj = await call(bad.url);
+        expect(bj.status === 400 && obj(bj.json).error === 'invalid_request' && obj(bj.json).redirect === undefined && !bj.headers.get('location'), `Open Client document the Issuer must refuse (${oc.name}), JSON path → ${bj.status} ${bj.text.slice(0, 160)}`);
+        const bh = await call(bad.url, { headers: { accept: 'text/html' } });
+        expect(bh.status === 400 && !bh.headers.get('location') && (bh.headers.get('content-type') ?? '').includes('text/html'), `Open Client document the Issuer must refuse (${oc.name}), HTML path → ${bh.status} ${bh.headers.get('content-type')} ${bh.headers.get('location') ?? ''}`);
+      }
+    });
+    await this.check('I-40', 'Loopback IP literal redirect_uri of a Registered Client matches with any port and nothing else differing; everything else by simple string comparison', async () => {
+      const exact = `https://rp-${slug()}.example/cb`;
+      const reg = await this.register({ redirect_uris: ['http://127.0.0.1:8080/cb', 'http://[::1]:8080/cb', 'http://localhost:8080/cb', exact] });
+      const at = (redirect_uri: string): RegisteredClient => ({ ...reg, redirect_uri });
+      const v4 = await this.start(at('http://127.0.0.1:49152/cb'));
+      expect(v4.tx.client?.redirect_host === '127.0.0.1:49152', `IPv4 loopback with another port: redirect_host ${v4.tx.client?.redirect_host}`);
+      const v6 = await this.start(at('http://[::1]:49153/cb'));
+      expect(v6.tx.status === 'awaiting_agent', 'IPv6 loopback with another port');
+      const same = await this.start(at(exact));
+      expect(same.tx.status === 'awaiting_agent', 'exact https redirect_uri');
+      // Only the port may differ. Each of these is another string that a URL parser would equate with a registered value or with its host.
+      const rejected: Array<[string, string]> = [
+        ['loopback with another path', 'http://127.0.0.1:8080/cb/'],
+        ['loopback with a query', 'http://127.0.0.1:8080/cb?x=1'],
+        ['loopback with an empty query', 'http://127.0.0.1:49152/cb?'],
+        ['loopback with a fragment', 'http://127.0.0.1:49152/cb#frag'],
+        ['loopback with userinfo', 'http://user:pw@127.0.0.1:49152/cb'],
+        ['loopback written 127.1', 'http://127.1:49152/cb'],
+        ['loopback written as an integer', 'http://2130706433:49152/cb'],
+        ['loopback written in hexadecimal', 'http://0x7f.0.0.1:49152/cb'],
+        ['loopback with a .. segment', 'http://127.0.0.1:49152/x/../cb'],
+        ['loopback with a . segment', 'http://127.0.0.1:49152/./cb'],
+        ['loopback with an upper-case scheme', 'HTTP://127.0.0.1:49152/cb'],
+        ['another loopback address', 'http://127.0.0.2:8080/cb'],
+        ['IPv6 loopback written in full', 'http://[0:0:0:0:0:0:0:1]:49153/cb'],
+        ['localhost with another port', 'http://localhost:9090/cb'],
+        ['https on the loopback host', 'https://127.0.0.1:8080/cb'],
+        ['trailing slash', `${exact}/`],
+        ['upper-case path', exact.replace('/cb', '/CB')],
+        ['explicit default port', exact.replace('.example/', '.example:443/')],
+        ['upper-case scheme', exact.replace('https://', 'HTTPS://')],
+      ];
+      for (const [name, uri] of rejected) {
+        const r = await call(this.authUrl(at(uri)).url);
+        expect(r.status === 400 && obj(r.json).error === 'invalid_request' && obj(r.json).redirect === undefined && !r.headers.get('location'), `${name} (${uri}): ${r.status} ${r.text.slice(0, 120)}`);
+        const h = await call(this.authUrl(at(uri)).url, { headers: { accept: 'text/html' } });
+        expect(h.status === 400 && !h.headers.get('location'), `${name} (${uri}), HTML path: ${h.status} ${h.headers.get('location') ?? ''}`);
+      }
+      if (this.o.openClient) {
+        const u = new URL(this.o.openClient.redirectUri);
+        if (u.protocol === 'http:' && (u.hostname === '127.0.0.1' || u.hostname === '[::1]')) {
+          u.port = String(Number(u.port || 80) + 1);
+          const r = await call(this.authUrl({ client_id: this.o.openClient.clientId, client_secret: '', redirect_uri: u.href }).url);
+          expect(r.status === 400 && obj(r.json).redirect === undefined, `Open Client loopback with another port must not match: ${r.status}`);
+        }
+      }
+    });
+    await this.check('I-41', 'Concurrent assertions: exactly one accepted, the other assertion_replayed; concurrent ready continues: exactly one code', async () => {
+      const second = await AgentClient.generate(this.agent.handle);
+      const e = await second.enroll(iss, m.agents_endpoint, this.credential);
+      expect(e.proof.status === 200, `second key for the handle → ${e.enroll.status}/${e.proof.status}`);
+      const s = await this.start();
+      const [r1, r2] = await Promise.all([this.assert(s.tx, this.agent, { accept_disclosure: true }), this.assert(s.tx, second, { accept_disclosure: true })]);
+      const accepted = [r1, r2].filter((r) => r.status === 200);
+      const replayed = [r1, r2].filter((r) => r.status === 409 && obj(r.json).error === 'assertion_replayed');
+      expect(accepted.length === 1 && replayed.length === 1, `concurrent assertions → ${r1.status} ${obj(r1.json).error ?? obj(r1.json).status} / ${r2.status} ${obj(r2.json).error ?? obj(r2.json).status}`);
+      const t = obj(accepted[0]!.json);
+      expect(t.status === 'ready' && typeof t.transaction_token === 'string' && typeof t.next?.url === 'string', `accepted assertion → ${t.status}`);
+      expect(obj(replayed[0]!.json).transaction_token === undefined && obj(replayed[0]!.json).status === 'ready', 'the replayed assertion gets no transaction_token and sees the new status');
+      const [c1, c2] = await Promise.all([this.cont(t.next.url, t.transaction_token), this.cont(t.next.url, t.transaction_token)]);
+      const codes = [c1, c2].filter((c) => c.status === 200 && typeof obj(c.json).redirect === 'string' && new URL(obj(c.json).redirect).searchParams.has('code'));
+      const gone = [c1, c2].filter((c) => c.status === 410 && obj(c.json).error === 'transaction_expired');
+      expect(codes.length === 1 && gone.length === 1, `concurrent continues → ${c1.status} ${obj(c1.json).error ?? ''} / ${c2.status} ${obj(c2.json).error ?? ''}`);
+      const token = await this.exchange(this.client, new URL(obj(codes[0]!.json).redirect).searchParams.get('code')!, s.verifier);
+      expect(token.status === 200, `the single code exchanges → ${token.status} ${token.text.slice(0, 120)}`);
+    });
+    await this.check('I-42', 'typ application/agent-login+jwt and case variants accepted as agent-login+jwt; same for the enrollment type', async () => {
+      for (const typ of ['application/agent-login+jwt', 'Agent-Login+JWT', 'APPLICATION/AGENT-LOGIN+JWT']) {
+        const s = await this.start();
+        const r = await this.assert(s.tx, this.agent, { accept_disclosure: true }, { header: { typ } });
+        expect(r.status === 200 && obj(r.json).status === 'ready', `assertion typ ${typ} → ${r.status} ${r.text.slice(0, 120)}`);
+      }
+      const base = `${m.agents_endpoint}/${encodeURIComponent(this.agent.handle)}/keys`;
+      const prove = async (typ: string) => {
+        const k = await AgentClient.generate(this.agent.handle);
+        const en = await call(base, { method: 'POST', headers: { authorization: `Bearer ${this.credential}` }, json: { jwk: k.publicJwk, name: `typ ${typ}` } });
+        expect(en.status === 201, `enroll → ${en.status} ${en.text.slice(0, 120)}`);
+        const proof = await k.assertion(iss, { transaction_id: 'x', challenge: obj(en.json).challenge }, {}, { header: { typ }, payload: { txn: undefined } });
+        return call(obj(en.json).proof_url, { method: 'POST', json: { proof } });
+      };
+      for (const typ of ['application/agent-login-enrollment+jwt', 'Agent-Login-Enrollment+JWT', 'APPLICATION/AGENT-LOGIN-ENROLLMENT+JWT']) {
+        const r = await prove(typ);
+        expect(r.status === 200 && obj(r.json).status === 'active', `enrollment typ ${typ} → ${r.status} ${r.text.slice(0, 120)}`);
+      }
+      const wrong = await prove('application/jwt');
+      expect(wrong.status === 400 && obj(wrong.json).error === 'invalid_assertion', `enrollment typ application/jwt → ${wrong.status} ${obj(wrong.json).error}`);
+      const swapped = await prove('agent-login+jwt');
+      expect(swapped.status === 400 && obj(swapped.json).error === 'invalid_assertion', `assertion typ on an enrollment proof → ${swapped.status} ${obj(swapped.json).error}`);
+    });
+    await this.check('I-43', 'Bodies of an existing transaction carry next.url for continue only for the credential that releases it (ready and denied); error precedence invalid_transaction, invalid_token, transaction_expired, then any other', async () => {
+      interface T { tx: Record<string, any>; assertUrl: string; reviewUrl: string; token: string; session: string; continueUrl: string; status: string }
+      const auth = (t?: string): Record<string, string> => (t ? { authorization: `Bearer ${t}` } : {});
+      /** A transaction taken through the review step, which makes its assertion and review URLs known; `allow` leaves it ready, `deny` denied. */
+      const through = async (decision: 'allow' | 'deny', deliver: boolean): Promise<T> => {
+        const s = await this.start(this.client, { prompt: 'consent' });
+        const a = obj((await this.assert(s.tx, this.agent, deliver ? { deliver_to_session: true } : {})).json);
+        expect(a.status === 'awaiting_consent' && typeof a.next?.url === 'string' && typeof a.transaction_token === 'string', `prompt=consent → ${a.status} ${a.reason ?? ''}`);
+        const d = await call(a.next.url, { method: 'POST', headers: auth(a.transaction_token), json: { decision } });
+        const t = obj(d.json);
+        expect(d.status === 200 && t.status === (decision === 'allow' ? 'ready' : 'denied') && typeof t.next?.url === 'string', `${decision} → ${d.status} ${t.status ?? t.error}`);
+        return { tx: s.tx, assertUrl: s.tx.next.url, reviewUrl: a.next.url, token: a.transaction_token, session: s.tx.session_token, continueUrl: t.next.url, status: t.status };
+      };
+      /** One request and what its answer must be: HTTP status, error (none for a 200), the transaction's status, and next.url released or withheld. */
+      const says = async (name: string, request: Promise<Res>, status: number, error: string | undefined, t: T, released: boolean) => {
+        const r = await request;
+        const j = obj(r.json);
+        expect(r.status === status && j.error === error, `${name} → ${r.status} ${j.error ?? ''}, expected ${status} ${error ?? ''}`);
+        expect(j.status === t.status && j.next?.action === 'continue', `${name}: the body must carry status ${t.status} and next continue, has ${j.status} and ${j.next?.action}`);
+        expect(released ? j.next.url === t.continueUrl : j.next.url === undefined, `${name}: next.url must be ${released ? 'released to' : 'withheld from'} this requester`);
+      };
+      const replay = async (t: T, bearer?: string) => call(t.assertUrl, { method: 'POST', headers: auth(bearer), json: { assertion: await this.agent.assertion(iss, t.tx as never) } });
+      const decide = (t: T, bearer?: string, body: unknown = { decision: 'allow' }) => call(t.reviewUrl, { method: 'POST', headers: auth(bearer), json: body });
+      const read = (t: T, bearer?: string) => call(t.tx.url, { headers: auth(bearer) });
+      /** A POST whose body is not JSON at all: the errors Section 6.7 ranks higher must still come first. */
+      const garbled = (url: string, bearer?: string) => call(url, { method: 'POST', headers: { ...auth(bearer), 'content-type': 'application/json' }, body: '{' });
+
+      const r = await through('allow', false);
+      await says('ready: GET, anonymous', read(r), 200, undefined, r, false);
+      await says('ready: GET with the session_token', read(r, r.session), 200, undefined, r, false);
+      await says('ready: GET with the transaction_token', read(r, r.token), 200, undefined, r, true);
+      await says('ready: GET with a wrong bearer', read(r, rnd(32)), 401, 'invalid_token', r, false);
+      await says('ready: second assertion, anonymous', replay(r), 409, 'assertion_replayed', r, false);
+      await says('ready: second assertion with the session_token', replay(r, r.session), 409, 'assertion_replayed', r, false);
+      await says('ready: second assertion with the transaction_token', replay(r, r.token), 409, 'assertion_replayed', r, true);
+      await says('ready: decision with the session_token (invalid_token before invalid_request)', decide(r, r.session), 401, 'invalid_token', r, false);
+      await says('ready: decision without a credential and with a malformed body (invalid_token before invalid_request)', decide(r, undefined, { decision: 'maybe' }), 401, 'invalid_token', r, false);
+      await says('ready: decision that is not JSON, with the session_token (invalid_token before invalid_request)', garbled(r.reviewUrl, r.session), 401, 'invalid_token', r, false);
+      await says('ready: decision with the transaction_token', decide(r, r.token), 400, 'invalid_request', r, true);
+
+      const rd = await through('allow', true);
+      await says('ready, deliver_to_session: GET with the session_token', read(rd, rd.session), 200, undefined, rd, true);
+      await says('ready, deliver_to_session: GET, anonymous', read(rd), 200, undefined, rd, false);
+      await says('ready, deliver_to_session: second assertion with the session_token', replay(rd, rd.session), 409, 'assertion_replayed', rd, true);
+      await says('ready, deliver_to_session: second assertion, anonymous', replay(rd), 409, 'assertion_replayed', rd, false);
+      await says('ready, deliver_to_session: decision with the session_token', decide(rd, rd.session), 401, 'invalid_token', rd, true);
+
+      const d = await through('deny', false);
+      await says('denied: GET, anonymous', read(d), 200, undefined, d, false);
+      await says('denied: GET with the session_token', read(d, d.session), 200, undefined, d, false);
+      await says('denied: GET with the transaction_token', read(d, d.token), 200, undefined, d, true);
+      await says('denied: GET with a wrong bearer', read(d, rnd(32)), 401, 'invalid_token', d, false);
+      await says('denied: assertion, anonymous', replay(d), 410, 'transaction_expired', d, false);
+      await says('denied: malformed assertion (transaction_expired before invalid_assertion)', call(d.assertUrl, { method: 'POST', json: { assertion: 'nonsense' } }), 410, 'transaction_expired', d, false);
+      await says('denied: assertion that is not JSON (transaction_expired before invalid_request)', garbled(d.assertUrl), 410, 'transaction_expired', d, false);
+      await says('denied: assertion with the session_token', replay(d, d.session), 410, 'transaction_expired', d, false);
+      await says('denied: assertion with the transaction_token', replay(d, d.token), 410, 'transaction_expired', d, true);
+      await says('denied: decision with the session_token (invalid_token before transaction_expired)', decide(d, d.session), 401, 'invalid_token', d, false);
+      await says('denied: decision without a credential (invalid_token before transaction_expired)', decide(d), 401, 'invalid_token', d, false);
+      await says('denied: decision with the transaction_token', decide(d, d.token), 410, 'transaction_expired', d, true);
+      await says('denied: decision with the transaction_token and a malformed body (transaction_expired before invalid_request)', decide(d, d.token, { decision: 'maybe' }), 410, 'transaction_expired', d, true);
+      await says('denied: decision that is not JSON, with the transaction_token (transaction_expired before invalid_request)', garbled(d.reviewUrl, d.token), 410, 'transaction_expired', d, true);
+
+      const dd = await through('deny', true);
+      await says('denied, deliver_to_session: GET with the session_token', read(dd, dd.session), 200, undefined, dd, true);
+      await says('denied, deliver_to_session: GET, anonymous', read(dd), 200, undefined, dd, false);
+      await says('denied, deliver_to_session: assertion with the session_token', replay(dd, dd.session), 410, 'transaction_expired', dd, true);
+      await says('denied, deliver_to_session: decision with the session_token', decide(dd, dd.session), 401, 'invalid_token', dd, true);
+
+      // invalid_transaction comes first: an unknown identifier answers 404 whatever else is wrong with the request.
+      const ghostId = rnd();
+      const ghost = (u: string) => u.replace(r.tx.transaction_id, ghostId);
+      const unknown: Array<[string, () => Promise<Res>]> = [['GET with a bearer', () => call(`${m.transaction_endpoint}/${ghostId}`, { headers: auth(rnd(32)) })]];
+      if (r.assertUrl.includes(r.tx.transaction_id)) {
+        unknown.push(['malformed assertion with a bearer', () => call(ghost(r.assertUrl), { method: 'POST', headers: auth(rnd(32)), json: { assertion: 1 } })]);
+        unknown.push(['assertion that is not JSON', () => garbled(ghost(r.assertUrl))]);
+      }
+      if (r.reviewUrl.includes(r.tx.transaction_id)) {
+        unknown.push(['decision without a credential', () => call(ghost(r.reviewUrl), { method: 'POST', json: { decision: 'allow' } })]);
+        unknown.push(['malformed decision with a bearer', () => call(ghost(r.reviewUrl), { method: 'POST', headers: auth(rnd(32)), json: { decision: 'maybe' } })]);
+        unknown.push(['decision that is not JSON', () => garbled(ghost(r.reviewUrl))]);
+      }
+      for (const [name, request] of unknown) {
+        const u = await request();
+        expect(u.status === 404 && obj(u.json).error === 'invalid_transaction', `unknown transaction, ${name} (invalid_transaction first) → ${u.status} ${obj(u.json).error ?? ''}`);
+      }
+    });
+    await this.check('I-44', 'Decision outside awaiting_consent → 400 (410 when terminal) and the Consent Record is unchanged', async () => {
+      const fresh = await this.newAgent(this.ownerId ?? (() => { throw new Skip('needs adminToken'); })());
+      const s1 = await this.start(this.client, { prompt: 'none' });
+      const a1 = obj((await this.assert(s1.tx, fresh)).json);
+      expect(a1.status === 'denied' && a1.reason === 'consent_required', `prompt=none on a first visit → ${a1.status} ${a1.reason ?? ''}`);
+      const d1 = await call(`${s1.tx.url}/review`, { method: 'POST', headers: { authorization: `Bearer ${a1.transaction_token}` }, json: { decision: 'allow' } });
+      expect(d1.status === 410 && obj(d1.json).error === 'transaction_expired' && obj(d1.json).status === 'denied', `decision on a terminal transaction → ${d1.status} ${d1.text.slice(0, 120)}`);
+      const s2 = await this.start(this.client, { scope: 'openid email owner_email' });
+      const a2 = obj((await this.assert(s2.tx, fresh)).json);
+      expect(a2.status === 'awaiting_owner', `owner scope without accept_disclosure → ${a2.status}`);
+      const d2 = await call(`${s2.tx.url}/review`, { method: 'POST', headers: { authorization: `Bearer ${a2.transaction_token}` }, json: { decision: 'allow' } });
+      expect(d2.status === 400 && obj(d2.json).error === 'invalid_request' && obj(d2.json).status === 'awaiting_owner', `decision while awaiting_owner → ${d2.status} ${d2.text.slice(0, 120)}`);
+      const s3 = await this.start(this.client, { scope: 'openid email' });
+      const a3 = obj((await this.assert(s3.tx, fresh)).json);
+      expect(a3.status === 'awaiting_consent' && a3.consent_reason === 'first_visit', `refused decisions must not create a Consent Record: ${a3.status} ${a3.consent_reason ?? ''}`);
+      const allow = await call(a3.next.url, { method: 'POST', headers: { authorization: `Bearer ${a3.transaction_token}` }, json: { decision: 'allow' } });
+      expect(allow.status === 200 && obj(allow.json).status === 'ready', `allow → ${allow.status} ${allow.text.slice(0, 120)}`);
+      const s4 = await this.start(this.client, { scope: 'openid email' });
+      const a4 = obj((await this.assert(s4.tx, fresh)).json);
+      expect(a4.status === 'ready', `the Consent Record covers the next sign-in: ${a4.status} ${a4.consent_reason ?? ''}`);
+      const d4 = await call(`${s4.tx.url}/review`, { method: 'POST', headers: { authorization: `Bearer ${a4.transaction_token}` }, json: { decision: 'deny' } });
+      expect(d4.status === 400 && obj(d4.json).error === 'invalid_request' && obj(d4.json).status === 'ready', `deny while ready → ${d4.status} ${d4.text.slice(0, 120)}`);
+      expect(obj((await this.get(s4.tx, a4.transaction_token)).json).status === 'ready', 'status unchanged by the refused deny');
+      const s5 = await this.start(this.client, { scope: 'openid email' });
+      const a5 = obj((await this.assert(s5.tx, fresh)).json);
+      expect(a5.status === 'ready', `the Consent Record survives the refused deny: ${a5.status} ${a5.consent_reason ?? ''}`);
+    });
+    await this.check('I-45', 'Owner approval only from a qualifying session: an Owner Credential from the one-time-code sign-in can neither approve, refuse nor grant share_owner; the approval view names a Relay client and its op_policy_uri', async () => {
+      const missing: string[] = [];
+      const agent = this.ownerId ? await this.newAgent(this.ownerId) : this.agent;
+      const asOwner = { authorization: `Bearer ${this.credential}` };
+      const claims = (v: Record<string, any>) => Array.isArray(v.requested_owner_claims) && v.requested_owner_claims.includes('owner_email');
+      const s = await this.start(this.client, { scope: 'openid email owner_email' });
+      const a = obj((await this.assert(s.tx, agent, { accept_disclosure: true })).json);
+      expect(a.status === 'awaiting_owner', `owner scope → ${a.status} ${a.reason ?? ''}`);
+      const plainRes = await call(`${iss}/owner/transactions/${s.tx.transaction_id}`, { headers: asOwner });
+      const plain = obj(plainRes.json);
+      expect(plainRes.status === 200 && plain.client?.client_id === this.client.client_id && plain.client?.redirect_host === new URL(this.client.redirect_uri).host && plain.handle === agent.handle && claims(plain), `approval view of a plain client → ${plainRes.status} ${plainRes.text.slice(0, 300)}`);
+      expect(plain.client.relay_issuer === undefined && plain.relay === undefined, 'a client without relay_issuer must not be named as a Relay');
+      const relay = await this.relay();
+      if (!relay) missing.push('the approval view of a Relay client (needs relayIssuer, a Relay whose metadata the issuer can fetch)');
+      else {
+        const redirect_uri = `${relay.issuer}/upstream/cb-${slug()}`;
+        const rc: RegisteredClient = { ...(await this.register({ relay_issuer: relay.issuer, redirect_uris: [redirect_uri] })), redirect_uri };
+        const s2 = await this.start(rc, { scope: 'openid email owner_email' });
+        const a2 = obj((await this.assert(s2.tx, agent, { accept_disclosure: true })).json);
+        expect(a2.status === 'awaiting_owner', `Relay client with an owner scope → ${a2.status} ${a2.reason ?? ''}`);
+        const viewRes = await call(`${iss}/owner/transactions/${s2.tx.transaction_id}`, { headers: asOwner });
+        const view = obj(viewRes.json);
+        expect(viewRes.status === 200 && view.client?.client_id === rc.client_id && view.client?.relay_issuer === relay.issuer && view.relay?.issuer === relay.issuer, `the approval view must name the Relay ${relay.issuer}: ${viewRes.status} ${viewRes.text.slice(0, 300)}`);
+        expect(typeof view.relay.notice === 'string' && view.relay.notice.trim().length > 0, 'the approval view of a Relay client must say that it is a Relay and that the Owner Claims are forwarded');
+        expect(view.relay.op_policy_uri === relay.policy, `the approval view must show the op_policy_uri of the Relay's metadata (${relay.policy}): ${view.relay.op_policy_uri}`);
+        expect(view.client.redirect_host === new URL(redirect_uri).host && view.handle === agent.handle && claims(view), `approval view of the Relay client: ${viewRes.text.slice(0, 300)}`);
+      }
+      const weak = await this.emailOnlyCredential();
+      if (!weak) missing.push('the session rule (needs an Owner Credential from the issuer\'s own one-time-code sign-in: emailOnlyOwnerCredential, or ownerEmailSignIn with adminToken; the bootstrap marker alone is checked as M-2)');
+      else await this.approvalRule(weak, 'the Owner Credential of a one-time-code sign-in', agent);
+      if (missing.length) throw new Skip(`not run: ${missing.join('; ')}`);
+    });
+    await this.check('I-46', 'DELETE keys revokes pending and active keys and Delegated Credentials; a disabled Agent cannot assert, exchange or use UserInfo; a re-created handle has no Account, Consent Record, key or Delegated Credential of its predecessor', async () => {
+      if (!this.ownerId) throw new Skip('needs adminToken');
+      const hdr = { authorization: `Bearer ${this.credential}` };
+      const bearer = (t: string) => ({ authorization: `Bearer ${t}` });
+      const keysUrl = (h: string) => `${m.agents_endpoint}/${encodeURIComponent(h)}/keys`;
+      const accountsUrl = (h: string) => `${m.agents_endpoint}/${encodeURIComponent(h)}/accounts`;
+      const jwks = createRemoteJWKSet(new URL(m.jwks_uri));
+
+      // DELETE .../keys with an Owner Credential (Section 7.3).
+      const a = await this.newAgent(this.ownerId);
+      const base = keysUrl(a.handle);
+      const pending = await AgentClient.generate(a.handle);
+      const en = await call(base, { method: 'POST', headers: hdr, json: { jwk: pending.publicJwk } });
+      expect(en.status === 201 && obj(en.json).status === 'pending', `pending key → ${en.status} ${en.text.slice(0, 120)}`);
+      const delegated = await this.admin('/admin/credentials', { owner_id: this.ownerId, kind: 'delegated', handle: a.handle });
+      expect((await call(base, { headers: bearer(delegated.credential) })).status === 200, 'Delegated Credential works before the revocation');
+      const del = await call(base, { method: 'DELETE', headers: hdr });
+      expect(del.status === 204, `DELETE keys → ${del.status} ${del.text.slice(0, 120)}`);
+      const listed = await call(base, { headers: hdr });
+      const keys = obj(listed.json).keys as Array<Record<string, any>> | undefined;
+      expect(listed.status === 200 && Array.isArray(keys) && keys.every((k) => k.status === 'revoked'), `every key still listed after revoke-all must be revoked: ${listed.status} ${JSON.stringify(keys?.map((k) => k.status))}`);
+      const asRevoked = await this.assert((await this.start()).tx, a);
+      expect(asRevoked.status === 401 && obj(asRevoked.json).error === 'key_revoked', `assertion with the revoked active key → ${asRevoked.status} ${obj(asRevoked.json).error}`);
+      const proof = await call(obj(en.json).proof_url, { method: 'POST', json: { proof: await pending.assertion(iss, { transaction_id: 'x', challenge: obj(en.json).challenge }, {}, { header: { typ: 'agent-login-enrollment+jwt' }, payload: { txn: undefined } }) } });
+      expect(proof.status === 401 && obj(proof.json).error === 'key_revoked', `proof with the revoked pending key → ${proof.status} ${obj(proof.json).error}`);
+      const dAfter = await call(base, { headers: bearer(delegated.credential) });
+      expect(dAfter.status === 401 && obj(dAfter.json).error === 'invalid_token', `Delegated Credential after an Owner's revoke-all → ${dAfter.status} ${dAfter.text.slice(0, 120)}`);
+
+      // A disabled Agent (Section 7.4 table).
+      const b = await this.newAgent(this.ownerId);
+      const signed = await this.signIn(this.client, b);
+      expect(signed.tokenRes.status === 200, 'sign-in before the disable');
+      const open = await this.start();
+      const oa = obj((await this.assert(open.tx, b)).json);
+      expect(oa.status === 'ready', `open transaction before the disable: ${oa.status}`);
+      const unredeemed = await this.start();
+      const ua = obj((await this.assert(unredeemed.tx, b)).json);
+      const code = new URL(obj((await this.cont(ua.next.url, ua.transaction_token)).json).redirect).searchParams.get('code')!;
+      const dis = await this.admin(`/admin/agents/${encodeURIComponent(b.handle)}`, { enabled: false }, 'PATCH');
+      expect(dis.enabled === false, `disable → ${JSON.stringify(dis)}`);
+      const asDisabled = await this.assert((await this.start()).tx, b);
+      expect(asDisabled.status === 401 && obj(asDisabled.json).error === 'unknown_key', `assertion by a disabled Agent → ${asDisabled.status} ${obj(asDisabled.json).error}`);
+      const ex = await this.exchange(this.client, code, unredeemed.verifier);
+      expect(ex.status === 400 && obj(ex.json).error === 'invalid_grant', `code of a disabled Agent → ${ex.status} ${obj(ex.json).error}`);
+      const ui = await call(m.userinfo_endpoint, { headers: bearer(signed.token.access_token) });
+      expect(ui.status === 401 && /invalid_token/.test(ui.headers.get('www-authenticate') ?? ''), `UserInfo for a disabled Agent → ${ui.status} ${ui.headers.get('www-authenticate')}`);
+      const openAfter = obj((await this.get(open.tx, oa.transaction_token)).json);
+      expect(openAfter.status === 'denied' && openAfter.reason === 'access_denied', `open transaction of a disabled Agent → ${openAfter.status} ${openAfter.reason ?? ''}`);
+      const re = await this.admin(`/admin/agents/${encodeURIComponent(b.handle)}`, { enabled: true }, 'PATCH');
+      expect(re.enabled === true && obj((await this.assert((await this.start()).tx, b)).json).status === 'ready', 're-enabled Agent signs in again');
+
+      // Deletion and re-creation: Consent Records and Accounts belong to the Agent, not to the handle (Section 7.4).
+      const c = await this.newAgent(this.ownerId);
+      const local = c.handle.split('@')[0]!;
+      const first = await this.signIn(this.client, c);
+      const { payload: p1 } = await jwtVerify(first.token.id_token, jwks, { issuer: iss });
+      const before = obj((await call(accountsUrl(c.handle), { headers: hdr })).json).accounts;
+      expect(Array.isArray(before) && before.length === 1 && before[0].sign_in_count === 1, `Account before the deletion: ${JSON.stringify(before)}`);
+      const dc = await this.admin('/admin/credentials', { owner_id: this.ownerId, kind: 'delegated', handle: c.handle });
+      expect((await call(keysUrl(c.handle), { headers: bearer(dc.credential) })).status === 200, 'Delegated Credential works before the deletion');
+      await this.admin(`/admin/agents/${encodeURIComponent(c.handle)}`, undefined, 'DELETE');
+      const gone = await call(keysUrl(c.handle), { headers: hdr });
+      expect(gone.status === 404, `management of a deleted Agent → ${gone.status}`);
+      expect((await call(m.userinfo_endpoint, { headers: bearer(first.token.access_token) })).status === 401, 'UserInfo after the deletion → 401');
+      /** What a successor of `old` under the current Owner Credential must and must not inherit. */
+      const successor = async (label: string, old: AgentClient, oldSubs: unknown[], oldDelegated: string, next: AgentClient) => {
+        const mine = { authorization: `Bearer ${this.credential}` };
+        const inherited = await call(accountsUrl(next.handle), { headers: mine });
+        expect(inherited.status === 200 && Array.isArray(obj(inherited.json).accounts) && obj(inherited.json).accounts.length === 0, `${label}: Accounts of the re-created handle → ${inherited.status} ${inherited.text.slice(0, 160)}`);
+        const live = obj((await call(keysUrl(next.handle), { headers: mine })).json).keys as Array<Record<string, any>> | undefined;
+        expect(Array.isArray(live) && live.filter((k) => k.status === 'active').length === 1 && live.every((k) => k.kid !== old.kid || k.status !== 'active'), `${label}: the re-created handle must hold only its own key: ${JSON.stringify(live?.map((k) => k.status))}`);
+        const oldKey = await this.assert((await this.start()).tx, old);
+        expect(oldKey.status === 401 && ['unknown_key', 'key_revoked'].includes(obj(oldKey.json).error), `${label}: assertion with the deleted Agent's key → ${oldKey.status} ${obj(oldKey.json).error ?? obj(oldKey.json).status}`);
+        const oldCred = await call(keysUrl(next.handle), { headers: bearer(oldDelegated) });
+        expect(oldCred.status === 401 || oldCred.status === 404, `${label}: Delegated Credential of the deleted Agent → ${oldCred.status}`);
+        const na = obj((await this.assert((await this.start()).tx, next)).json);
+        expect(na.status === 'awaiting_consent' && na.consent_reason === 'first_visit', `${label}: the re-created handle must start without a Consent Record: ${na.status} ${na.consent_reason ?? ''}`);
+        const signIn = await this.signIn(this.client, next);
+        const { payload } = await jwtVerify(signIn.token.id_token, jwks, { issuer: iss, audience: this.client.client_id });
+        expect(payload.email === old.handle, `${label}: the same handle is re-created: email ${payload.email}`);
+        expect(typeof payload.sub === 'string' && !oldSubs.includes(payload.sub), `${label}: sub must differ for a re-created handle`);
+        const accounts = obj((await call(accountsUrl(next.handle), { headers: mine })).json).accounts as Array<Record<string, any>> | undefined;
+        expect(Array.isArray(accounts) && accounts.length === 1 && accounts[0]!.client_id === this.client.client_id && accounts[0]!.sign_in_count === 1 && accounts[0]!.status === 'enabled', `${label}: after its first sign-in the re-created handle has one Account counting one sign-in: ${JSON.stringify(accounts)}`);
+        return payload;
+      };
+      // Under the same Owner: a Delegated Credential or key that survived would work again here.
+      const c2 = await this.newAgent(this.ownerId, local);
+      const p2 = await successor('same Owner', c, [p1.sub], dc.credential, c2);
+      const dc2 = await this.admin('/admin/credentials', { owner_id: this.ownerId, kind: 'delegated', handle: c2.handle });
+      await this.admin(`/admin/agents/${encodeURIComponent(c2.handle)}`, undefined, 'DELETE');
+      // Under a second Owner: nothing of the first Owner reaches the handle.
+      const owner2 = await this.newOwner('second');
+      const saved = this.credential;
+      this.credential = owner2.credential;
+      try {
+        const c3 = await this.newAgent(owner2.owner_id, local);
+        const p3 = await successor('second Owner', c2, [p1.sub, p2.sub], dc2.credential, c3);
+        expect(typeof p3.owner_sub === 'string' && p3.owner_sub !== p2.owner_sub, 'owner_sub is the second Owner\'s');
+        const foreign = await call(keysUrl(c3.handle), { headers: hdr });
+        expect(foreign.status === 404, `the first Owner's credential on the handle now owned by another Owner → ${foreign.status}`);
+      } finally {
+        this.credential = saved;
+      }
+    });
+    await this.check('I-47', 'Delegated Credential: 404 for every operation on a sibling handle, which stays untouched; 403 insufficient_permission with WWW-Authenticate insufficient_scope and no change for permissions or status enabled; disabled permitted', async () => {
+      if (!this.ownerId) throw new Skip('needs adminToken');
+      const fresh = await this.newAgent(this.ownerId);
+      const sibling = await this.newAgent(this.ownerId);
+      const d = await this.admin('/admin/credentials', { owner_id: this.ownerId, kind: 'delegated', handle: fresh.handle });
+      const hdr = { authorization: `Bearer ${d.credential}` };
+      const asOwner = { authorization: `Bearer ${this.credential}` };
+      const sib = (p: string) => `${m.agents_endpoint}/${encodeURIComponent(sibling.handle)}${p}`;
+      const own = (p: string) => `${m.agents_endpoint}/${encodeURIComponent(fresh.handle)}${p}`;
+      const client = encodeURIComponent(this.client.client_id);
+      // The sibling gets an Account and a Consent Record first, so that a 404 is told apart from "nothing there".
+      await this.signIn(this.client, sibling);
+      const siblingOps: Array<[string, () => Promise<Res>]> = [
+        ['list keys', () => call(sib('/keys'), { headers: hdr })],
+        ['enroll key', async () => call(sib('/keys'), { method: 'POST', headers: hdr, json: { jwk: (await AgentClient.generate(sibling.handle)).publicJwk } })],
+        ['get key', () => call(sib(`/keys/${encodeURIComponent(sibling.kid)}`), { headers: hdr })],
+        ['update key', () => call(sib(`/keys/${encodeURIComponent(sibling.kid)}`), { method: 'PATCH', headers: hdr, json: { name: 'x' } })],
+        ['revoke key', () => call(sib(`/keys/${encodeURIComponent(sibling.kid)}`), { method: 'DELETE', headers: hdr })],
+        ['revoke all keys', () => call(sib('/keys'), { method: 'DELETE', headers: hdr })],
+        ['list accounts', () => call(sib('/accounts'), { headers: hdr })],
+        ['set account status disabled', () => call(sib(`/accounts/${client}`), { method: 'PATCH', headers: hdr, json: { status: 'disabled' } })],
+        ['set account status enabled', () => call(sib(`/accounts/${client}`), { method: 'PATCH', headers: hdr, json: { status: 'enabled' } })],
+        ['revoke consent', () => call(sib(`/consents/${client}`), { method: 'DELETE', headers: hdr })],
+      ];
+      for (const [name, fn] of siblingOps) {
+        const r = await fn();
+        // Re-enabling is not delegable either, and Section 7.8 does not rank that 403 against this 404.
+        expect(r.status === 404 || (name === 'set account status enabled' && r.status === 403), `${name} on a sibling handle of the same Owner → ${r.status} ${r.text.slice(0, 120)}`);
+      }
+      const sibKeys = await call(sib('/keys'), { headers: asOwner });
+      const listed = obj(sibKeys.json).keys as Array<Record<string, any>> | undefined;
+      expect(sibKeys.status === 200 && Array.isArray(listed) && listed.length === 1 && listed[0]!.kid === sibling.kid && listed[0]!.status === 'active' && listed[0]!.name !== 'x', `the sibling's keys must be untouched by the refused operations: ${JSON.stringify(listed?.map((k) => [k.status, k.name]))}`);
+      const sibAccounts = obj((await call(sib('/accounts'), { headers: asOwner })).json).accounts as Array<Record<string, any>> | undefined;
+      expect(sibAccounts?.length === 1 && sibAccounts[0]!.client_id === this.client.client_id && sibAccounts[0]!.status === 'enabled', `the sibling's Account must still be enabled: ${JSON.stringify(sibAccounts)}`);
+      const sibAgain = obj((await this.assert((await this.start()).tx, sibling)).json);
+      expect(sibAgain.status === 'ready', `the sibling's Consent Record and Account must be intact: ${sibAgain.status} ${sibAgain.reason ?? sibAgain.consent_reason ?? ''}`);
+      const keyUrl = own(`/keys/${encodeURIComponent(fresh.kid)}`);
+      const perm = await call(keyUrl, { method: 'PATCH', headers: hdr, json: { name: 'delegated rename', permissions: { share_owner: true } } });
+      expect(perm.status === 403 && obj(perm.json).error === 'insufficient_permission', `permissions via a Delegated Credential → ${perm.status} ${perm.text.slice(0, 120)}`);
+      expect(/insufficient_scope/.test(perm.headers.get('www-authenticate') ?? ''), `WWW-Authenticate on the 403: ${perm.headers.get('www-authenticate')}`);
+      const k = obj((await call(keyUrl, { headers: hdr })).json);
+      expect(k.permissions?.share_owner === false && k.name !== 'delegated rename', 'the refused PATCH must change nothing, not even name');
+      const named = await call(keyUrl, { method: 'PATCH', headers: hdr, json: { name: 'delegated name' } });
+      expect(named.status === 200 && obj(named.json).name === 'delegated name', `name-only PATCH via a Delegated Credential → ${named.status} ${named.text.slice(0, 120)}`);
+      await this.signIn(this.client, fresh);
+      const acct = own(`/accounts/${client}`);
+      const dis = await call(acct, { method: 'PATCH', headers: hdr, json: { status: 'disabled' } });
+      expect(dis.status === 200 && obj(dis.json).status === 'disabled', `disable via a Delegated Credential → ${dis.status} ${dis.text.slice(0, 120)}`);
+      const en = await call(acct, { method: 'PATCH', headers: hdr, json: { status: 'enabled' } });
+      expect(en.status === 403 && obj(en.json).error === 'insufficient_permission' && /insufficient_scope/.test(en.headers.get('www-authenticate') ?? ''), `enable via a Delegated Credential → ${en.status} ${en.headers.get('www-authenticate')} ${en.text.slice(0, 120)}`);
+      const list = obj((await call(own('/accounts'), { headers: hdr })).json).accounts as Array<Record<string, any>> | undefined;
+      expect(list?.find((x) => x.client_id === this.client.client_id)?.status === 'disabled', `Account status after the refused enable: ${JSON.stringify(list)}`);
+      const none = await call(keyUrl);
+      expect(none.status === 401 && /invalid_token/.test(none.headers.get('www-authenticate') ?? ''), `no credential → ${none.status} ${none.headers.get('www-authenticate')}`);
+    });
+    await this.check('I-48', 'Enrollment refuses non-canonical coordinates and, comparing by decoded point, keys already enrolled or revoked for the handle; relay_issuer needs every redirect URI on exactly its host; unoffered id_token_signed_response_alg refused', async () => {
+      if (!this.ownerId) throw new Skip('needs adminToken');
+      const fresh = await this.newAgent(this.ownerId);
+      const base = `${m.agents_endpoint}/${encodeURIComponent(fresh.handle)}/keys`;
+      const hdr = { authorization: `Bearer ${this.credential}` };
+      const enroll = (jwk: unknown) => call(base, { method: 'POST', headers: hdr, json: { jwk } });
+      // Section 6.7 pairs invalid_request with 400; Section 7.2 names no other answer for a refused key.
+      const refused = (name: string, r: Res) => expect(r.status === 400 && obj(r.json).error === 'invalid_request', `${name} → ${r.status} ${obj(r.json).error ?? ''} ${r.status === 201 ? `(enrolled as ${obj(r.json).kid})` : ''}`);
+      // Another spelling of the same 32 octets: the last of 43 base64url characters carries two unused bits.
+      const B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+      const respell = (s: string) => s.slice(0, -1) + B64[B64.indexOf(s.at(-1)!) ^ 1];
+      const sameOctets = (a: string, b: string) => a !== b && Buffer.from(a, 'base64url').equals(Buffer.from(b, 'base64url'));
+      const pt = smallXPoint();
+      const canonical = { kty: 'EC', crv: 'P-256', x: b64u32(pt.x), y: b64u32(pt.y) };
+      const fx = fresh.publicJwk.x!;
+      const fy = fresh.publicJwk.y!;
+      expect(sameOctets(canonical.x, respell(canonical.x)) && sameOctets(canonical.y, respell(canonical.y)) && sameOctets(fx, respell(fx)) && sameOctets(fy, respell(fy)), 'harness: a respelled coordinate must decode to the same octets');
+      const minimal = Buffer.from(pt.x.toString(16).padStart(2, '0'), 'hex');
+      // Coordinates that do not decode to exactly 32 octets below the field prime (Section 7.2).
+      refused('x + p (the same point, not less than the field prime)', await enroll({ ...canonical, x: b64u32(pt.x + P256.p) }));
+      refused('x with a leading zero octet (33 octets)', await enroll({ ...canonical, x: Buffer.concat([Buffer.alloc(1), Buffer.from(canonical.x, 'base64url')]).toString('base64url') }));
+      refused(`x in minimal length (${minimal.length} octet)`, await enroll({ ...canonical, x: minimal.toString('base64url') }));
+      // A key not seen before under another spelling: refused, or enrolled as the point it decodes to.
+      const unseen = await AgentClient.generate(fresh.handle);
+      const spelled = await enroll({ ...unseen.publicJwk, x: respell(unseen.publicJwk.x!) });
+      expect((spelled.status === 400 && obj(spelled.json).error === 'invalid_request') || (spelled.status === 201 && obj(spelled.json).kid === unseen.kid), `a new key with a respelled coordinate must be refused or enrolled under the thumbprint of its point → ${spelled.status} ${obj(spelled.json).kid ?? obj(spelled.json).error}`);
+      const ok = await enroll(canonical);
+      expect(ok.status === 201 && obj(ok.json).status === 'pending' && obj(ok.json).kid === (await calculateJwkThumbprint(canonical, 'sha256')), `a canonically encoded key → ${ok.status} ${ok.text.slice(0, 120)}`);
+      // Already enrolled, pending.
+      refused('pending key again', await enroll(canonical));
+      refused('pending key again, members reordered', await enroll({ y: canonical.y, x: canonical.x, crv: 'P-256', kty: 'EC' }));
+      refused('pending key again, x respelled', await enroll({ ...canonical, x: respell(canonical.x) }));
+      refused('pending key again, y respelled', await enroll({ ...canonical, y: respell(canonical.y) }));
+      // Already enrolled, active.
+      refused('active key again', await enroll(fresh.publicJwk));
+      refused('active key again, x respelled', await enroll({ ...fresh.publicJwk, x: respell(fx) }));
+      refused('active key again, y respelled', await enroll({ ...fresh.publicJwk, y: respell(fy) }));
+      // Revoked for the handle.
+      const other = await AgentClient.generate(fresh.handle);
+      const e = await other.enroll(iss, m.agents_endpoint, this.credential);
+      expect(e.proof.status === 200, `second key → ${e.enroll.status}/${e.proof.status}`);
+      const del = await call(`${base}/${encodeURIComponent(other.kid)}`, { method: 'DELETE', headers: hdr });
+      expect(del.status === 204, `revoke → ${del.status}`);
+      refused('revoked key again', await enroll(other.publicJwk));
+      refused('revoked key again, x respelled', await enroll({ ...other.publicJwk, x: respell(other.publicJwk.x!) }));
+      refused('revoked key again, y respelled', await enroll({ ...other.publicJwk, y: respell(other.publicJwk.y!) }));
+      const stillRevoked = await this.assert((await this.start()).tx, other);
+      expect(stillRevoked.status === 401 && obj(stillRevoked.json).error === 'key_revoked', `the revoked key after the refused re-enrollments → ${stillRevoked.status} ${obj(stillRevoked.json).error}`);
+      const active = (obj((await call(base, { headers: hdr })).json).keys as Array<Record<string, any>>).filter((k) => k.status === 'active');
+      expect(active.length === 1 && active[0]!.kid === fresh.kid, `the handle must still have one active key: ${JSON.stringify(active.map((k) => k.kid))}`);
+
+      // Section 4.4: every redirect URI of a relay_issuer registration is on exactly the Relay's host.
+      const reg = (meta: Record<string, unknown>) => call(m.registration_endpoint, { method: 'POST', headers: { authorization: `Bearer ${this.o.adminToken}` }, json: { redirect_uris: ['https://rp-reg.example/cb'], client_name: 'I-48', token_endpoint_auth_method: 'client_secret_basic', ...meta } });
+      const relay = await this.relay();
+      const relayIss = relay?.issuer ?? `https://relay-${slug()}.example`;
+      const rh = new URL(relayIss);
+      const port = rh.port ? `:${rh.port}` : '';
+      const lookalikes: Array<[string, string]> = [
+        ['another host', 'https://rp-reg.example/cb'],
+        ['a host that ends with the Relay\'s', `https://evil-${rh.hostname}${port}/cb`],
+        ['a subdomain of the Relay\'s host', `https://sub.${rh.hostname}${port}/cb`],
+        ['a host that starts with the Relay\'s', `https://${rh.hostname}.evil.example${port}/cb`],
+        ['another host with the Relay\'s in the path', `https://evil.example/${rh.host}/cb`],
+        ['another host with the Relay\'s as userinfo', `https://${rh.host}@evil.example/cb`],
+      ];
+      for (const [name, uri] of lookalikes) {
+        for (const uris of [[uri], [`${relayIss}/cb`, uri]]) {
+          const r = await reg({ relay_issuer: relayIss, redirect_uris: uris });
+          expect(r.status === 400 && obj(r.json).error === 'invalid_client_metadata', `relay_issuer with a redirect_uri on ${name} (${uri})${uris.length > 1 ? ', beside one on its host' : ''} → ${r.status} ${r.text.slice(0, 120)}`);
+        }
+      }
+      if (relay) {
+        const onHost = await reg({ relay_issuer: relay.issuer, redirect_uris: [`${relay.issuer}/cb`, `${relay.issuer}/cb2`] });
+        expect(onHost.status === 201 && obj(onHost.json).relay_issuer === relay.issuer, `relay_issuer with redirect URIs on its host → ${onHost.status} ${obj(onHost.json).error ?? ''} ${obj(onHost.json).error_description ?? ''}`);
+      }
+
+      // Section 3.2: id_token_signed_response_alg is ES256, an advertised EdDSA, or refused.
+      const offered: string[] = (m.id_token_signing_alg_values_supported as string[]).filter((alg) => alg === 'ES256' || alg === 'EdDSA');
+      for (const alg of ['RS256', 'none', 'HS256', 'PS256', 'ES384', 'EdDSA', 'es256'].filter((x) => !offered.includes(x))) {
+        const r = await reg({ id_token_signed_response_alg: alg });
+        expect(r.status === 400 && obj(r.json).error === 'invalid_client_metadata', `id_token_signed_response_alg ${alg} → ${r.status} ${r.text.slice(0, 120)}`);
+      }
+      for (const alg of offered) {
+        const r = await reg({ id_token_signed_response_alg: alg });
+        expect(r.status === 201, `id_token_signed_response_alg ${alg} → ${r.status} ${obj(r.json).error ?? ''}`);
+      }
+      if (!relay) throw new Skip('enrollment and id_token_signed_response_alg parts passed; not run: acceptance of a relay_issuer registration on the Relay\'s host, without which its refusals prove little (needs relayIssuer, a Relay whose metadata the issuer can fetch)');
+    });
     await this.check('M-1', 'Delegated Credential: bound to its handle, cannot grant share_owner, cannot re-enable an Account', async () => {
       if (!this.ownerId) throw new Skip('needs adminToken');
       const fresh = await this.newAgent(this.ownerId);
@@ -580,6 +1243,12 @@ class Harness {
       expect(own.status === 200, `own keys → ${own.status}`);
       const sib = await call(`${m.agents_endpoint}/${encodeURIComponent(sibling.handle)}/keys`, { headers: hdr });
       expect(sib.status === 404, `sibling keys → ${sib.status}`);
+      await this.signIn(this.client, sibling);
+      const sibAcct = `${m.agents_endpoint}/${encodeURIComponent(sibling.handle)}/accounts/${encodeURIComponent(this.client.client_id)}`;
+      const sibDis = await call(sibAcct, { method: 'PATCH', headers: hdr, json: { status: 'disabled' } });
+      expect(sibDis.status === 404, `disable of a sibling's Account → ${sibDis.status}`);
+      const sibAccounts = obj((await call(`${m.agents_endpoint}/${encodeURIComponent(sibling.handle)}/accounts`, { headers: { authorization: `Bearer ${this.credential}` } })).json).accounts as Array<Record<string, any>> | undefined;
+      expect(sibAccounts?.length === 1 && sibAccounts[0]!.status === 'enabled', `the sibling's Account is untouched: ${JSON.stringify(sibAccounts)}`);
       const perm = await call(`${m.agents_endpoint}/${encodeURIComponent(fresh.handle)}/keys/${encodeURIComponent(fresh.kid)}`, { method: 'PATCH', headers: hdr, json: { name: 'x', permissions: { share_owner: true } } });
       expect(perm.status === 403 && obj(perm.json).error === 'insufficient_permission', `share_owner via delegated → ${perm.status}`);
       const k = obj((await call(`${m.agents_endpoint}/${encodeURIComponent(fresh.handle)}/keys/${encodeURIComponent(fresh.kid)}`, { headers: hdr })).json);
@@ -590,6 +1259,154 @@ class Harness {
       expect(dis.status === 200, `delegated disable → ${dis.status}`);
       const en = await call(acct, { method: 'PATCH', headers: hdr, json: { status: 'enabled' } });
       expect(en.status === 403, `delegated re-enable → ${en.status}`);
+    });
+    await this.check('M-2', 'Reference bootstrap session_auth: an Owner Credential marked email_only, or with no stated session, neither approves nor grants share_owner; passkey, oidc, domain and email_factor do', async () => {
+      if (!this.ownerId) throw new Skip('needs adminToken');
+      const mint = (session_auth?: string) => this.admin('/admin/credentials', { owner_id: this.ownerId, kind: 'owner', ...(session_auth ? { session_auth } : {}) });
+      const agent = await this.newAgent(this.ownerId);
+      const weak = await mint('email_only');
+      expect(weak.session_auth === 'email_only' && typeof weak.credential === 'string', `the bootstrap API does not record how the credential's session was established: session_auth ${weak.session_auth}`);
+      await this.approvalRule(weak.credential, 'an Owner Credential marked email_only', agent, true);
+      const unstated = await mint();
+      expect(unstated.session_auth === 'email_only', `an Owner Credential whose session is not stated must fail closed: session_auth ${unstated.session_auth}`);
+      await this.approvalRule(unstated.credential, 'an Owner Credential with no stated session', agent, true);
+      const keyUrl = `${m.agents_endpoint}/${encodeURIComponent(agent.handle)}/keys/${encodeURIComponent(agent.kid)}`;
+      for (const session_auth of ['passkey', 'oidc', 'domain', 'email_factor']) {
+        const c = await mint(session_auth);
+        for (const share_owner of [true, false]) {
+          const r = await call(keyUrl, { method: 'PATCH', headers: { authorization: `Bearer ${c.credential}` }, json: { permissions: { share_owner } } });
+          expect(r.status === 200 && obj(r.json).permissions?.share_owner === share_owner, `share_owner ${share_owner} from a ${session_auth} session → ${r.status} ${obj(r.json).error ?? ''}`);
+        }
+        const s = await this.start(this.client, { scope: 'openid email owner_email' });
+        const a = obj((await this.assert(s.tx, agent, { accept_disclosure: true })).json);
+        const ok = await call(`${iss}/owner/transactions/${s.tx.transaction_id}/decision`, { method: 'POST', headers: { authorization: `Bearer ${c.credential}` }, json: { decision: 'approve' } });
+        expect(a.status === 'awaiting_owner' && ok.status === 200 && obj(ok.json).status === 'ready', `approval from a ${session_auth} session → ${a.status}, ${ok.status} ${obj(ok.json).status ?? obj(ok.json).error ?? ''}`);
+      }
+    });
+    await this.check('I-49', 'Cache-Control: no-store on every response of the run from the endpoints of Sections 5 to 7, redirects included; Pragma: no-cache on the Token Response; never Access-Control-Allow-Credentials: true; auth_time is the time of the assertion when max_age was sent', async () => {
+      const bearer = (t: string) => ({ authorization: `Bearer ${t}` });
+      const preflights: Array<[string, Res]> = [];
+      // Every request of this check is a cross-origin one; the rest of the run sent none.
+      this.cx.headers = { origin: 'https://agent.example' };
+      try {
+        // Section 5: the Authentication Request on its paths, with the failures of steps 1 to 3.
+        const s = await this.start();
+        await call(m.authorization_endpoint, { method: 'POST', form: Object.fromEntries(new URL(this.authUrl(this.client).url).searchParams) });
+        const h = await call(this.authUrl(this.client).url, { headers: { accept: 'text/html' } });
+        if (h.status === 303 && h.headers.get('location')) await call(new URL(h.headers.get('location')!, m.authorization_endpoint).href, { headers: { accept: 'text/html', cookie: (h.headers.get('set-cookie') ?? '').split(';')[0]! } });
+        for (const accept of ['application/json', 'text/html']) {
+          await call(this.authUrl(this.client, { nonce: undefined }).url, { headers: { accept } });
+          await call(this.authUrl(this.client, { redirect_uri: 'https://attacker.example/cb' }).url, { headers: { accept } });
+          await call(this.authUrl({ ...this.client, client_id: `unknown-${rnd(4)}` }).url, { headers: { accept } });
+        }
+        // Section 6: the transaction, its errors, the review and the continue step.
+        preflights.push(['transaction endpoint', await call(s.tx.next.url, { method: 'OPTIONS', headers: { 'access-control-request-method': 'POST', 'access-control-request-headers': 'authorization, content-type' } })]);
+        await this.get(s.tx);
+        await this.get(s.tx, rnd(32));
+        await call(`${m.transaction_endpoint}/${rnd()}`);
+        await call(s.tx.next.url, { method: 'POST', json: { assertion: 'nonsense' } });
+        const reviewed = await this.start(this.client, { prompt: 'consent' });
+        const ra = obj((await this.assert(reviewed.tx, this.agent)).json);
+        expect(ra.status === 'awaiting_consent', `prompt=consent → ${ra.status} ${ra.reason ?? ''}`);
+        await call(ra.next.url, { method: 'POST', json: { decision: 'allow' } });
+        await call(ra.next.url, { method: 'POST', headers: bearer(ra.transaction_token), json: { decision: 'maybe' } });
+        await call(ra.next.url, { method: 'POST', headers: bearer(ra.transaction_token), json: { decision: 'allow' } });
+        const t = obj((await this.assert(s.tx, this.agent, { accept_disclosure: true })).json);
+        expect(t.status === 'ready', `assertion → ${t.status} ${t.reason ?? ''}`);
+        await this.assert(s.tx, this.agent);
+        await call(t.next.url);
+        const c = await this.cont(t.next.url, t.transaction_token);
+        expect(c.status === 200 && typeof obj(c.json).redirect === 'string', `continue → ${c.status} ${obj(c.json).error ?? ''}`);
+        await this.cont(t.next.url, t.transaction_token);
+        const code = new URL(obj(c.json).redirect).searchParams.get('code')!;
+        const tok = await this.exchange(this.client, code, s.verifier);
+        expect(tok.status === 200 && /no-cache/i.test(tok.headers.get('pragma') ?? ''), `Token Response → ${tok.status}, Pragma "${tok.headers.get('pragma')}"`);
+        await this.exchange(this.client, code, s.verifier);
+        await call(m.token_endpoint, { method: 'POST', form: { grant_type: 'authorization_code', code, redirect_uri: this.client.redirect_uri, code_verifier: s.verifier, client_id: this.client.client_id, client_secret: 'wrong' } });
+        await call(m.userinfo_endpoint, { headers: bearer(obj(tok.json).access_token) });
+        await call(m.userinfo_endpoint);
+        const s2 = await this.start();
+        await this.assert(s2.tx, this.agent, { accept_disclosure: true, deliver_to_session: true });
+        const released = obj((await this.get(s2.tx, s2.tx.session_token)).json);
+        expect(typeof released.next?.url === 'string', `continue URL for the Session Holder after deliver_to_session: ${released.status}`);
+        await call(released.next.url, { headers: { accept: 'text/html', ...bearer(s2.tx.session_token) } });
+        // Section 7: management, with its refusals. Destructive operations only on an Agent the harness created.
+        const subject = this.ownerId ? await this.newAgent(this.ownerId) : this.agent;
+        const agentUrl = `${m.agents_endpoint}/${encodeURIComponent(subject.handle)}`;
+        const hdr = bearer(this.credential);
+        preflights.push(['agents endpoint', await call(`${agentUrl}/keys`, { method: 'OPTIONS', headers: { 'access-control-request-method': 'POST', 'access-control-request-headers': 'authorization, content-type' } })]);
+        const k = await AgentClient.generate(subject.handle);
+        await call(`${agentUrl}/keys`, { method: 'POST', headers: hdr, json: { jwk: { ...k.publicJwk, use: 'sig' } } });
+        const en = await call(`${agentUrl}/keys`, { method: 'POST', headers: hdr, json: { jwk: k.publicJwk } });
+        expect(en.status === 201, `enroll → ${en.status} ${obj(en.json).error ?? ''}`);
+        const proof = await k.assertion(iss, { transaction_id: 'x', challenge: obj(en.json).challenge }, {}, { header: { typ: 'agent-login-enrollment+jwt' }, payload: { txn: undefined } });
+        await call(obj(en.json).proof_url, { method: 'POST', json: { proof: 'nonsense' } });
+        await call(obj(en.json).proof_url, { method: 'POST', json: { proof } });
+        await call(obj(en.json).proof_url, { method: 'POST', json: { proof } });
+        await call(`${agentUrl}/keys`, { headers: hdr });
+        await call(`${agentUrl}/keys/${encodeURIComponent(k.kid)}`, { headers: hdr });
+        await call(`${agentUrl}/keys/${encodeURIComponent(k.kid)}`, { method: 'PATCH', headers: hdr, json: { name: 'I-49' } });
+        await call(`${agentUrl}/keys/${encodeURIComponent(k.kid)}`, { method: 'DELETE', headers: hdr });
+        await call(`${agentUrl}/accounts`, { headers: hdr });
+        await call(`${agentUrl}/keys`);
+        await call(`${m.agents_endpoint}/${encodeURIComponent(`nobody-${slug()}@${subject.handle.split('@')[1]}`)}/keys`, { headers: hdr });
+        if (this.ownerId) {
+          await this.signIn(this.client, subject);
+          const account = `${agentUrl}/accounts/${encodeURIComponent(this.client.client_id)}`;
+          const delegated = await this.admin('/admin/credentials', { owner_id: this.ownerId, kind: 'delegated', handle: subject.handle });
+          await call(account, { method: 'PATCH', headers: hdr, json: { status: 'disabled' } });
+          await call(account, { method: 'PATCH', headers: bearer(delegated.credential), json: { status: 'enabled' } });
+          await call(account, { method: 'PATCH', headers: hdr, json: { status: 'enabled' } });
+          await call(`${agentUrl}/keys/${encodeURIComponent(subject.kid)}`, { method: 'PATCH', headers: bearer(delegated.credential), json: { permissions: { share_owner: true } } });
+          await call(`${agentUrl}/consents/${encodeURIComponent(this.client.client_id)}`, { method: 'DELETE', headers: hdr });
+          await call(`${agentUrl}/keys`, { method: 'DELETE', headers: hdr });
+        }
+        if (this.o.adminToken) {
+          await call(m.registration_endpoint, { method: 'POST', headers: bearer(this.o.adminToken), json: { redirect_uris: ['https://rp-cache.example/cb'], token_endpoint_auth_method: 'client_secret_basic' } });
+          await call(m.registration_endpoint, { method: 'POST', headers: bearer(this.o.adminToken), json: { redirect_uris: ['https://rp-cache.example/cb'], token_endpoint_auth_method: 'none' } });
+          await call(m.registration_endpoint, { method: 'POST', json: { redirect_uris: ['https://rp-cache.example/cb'], token_endpoint_auth_method: 'client_secret_basic' } });
+        }
+      } finally {
+        this.cx.headers = undefined;
+      }
+
+      // The audit: every response the run received from these endpoints, whichever check asked for it.
+      const bare = (u: string) => u.split(/[?#]/)[0]!;
+      const waitPages = new Set(this.seen.filter((x) => bare(x.url) === m.authorization_endpoint && x.status === 303 && x.location).map((x) => bare(new URL(x.location!, x.url).href)).filter((u) => u.startsWith(`${iss}/`)));
+      const endpoints = [m.authorization_endpoint, m.transaction_endpoint, m.token_endpoint, m.userinfo_endpoint, m.registration_endpoint, m.agents_endpoint, `${iss}/owner`].filter((e): e is string => typeof e === 'string');
+      const audited = this.seen.filter((x) => endpoints.some((e) => bare(x.url) === e || bare(x.url).startsWith(`${e}/`)) || waitPages.has(bare(x.url)));
+      // Long path segments are secrets or identifiers (continue URLs must stay out of logs): shortened.
+      const brief = (x: Seen) => `${x.check} ${x.method} ${new URL(x.url).pathname.split('/').map((seg) => (seg.length > 30 ? `${seg.slice(0, 6)}…` : seg)).join('/')} (${x.status})`;
+      const stale = audited.filter((x) => !(x.cacheControl ?? '').toLowerCase().split(',').map((d) => d.trim()).includes('no-store'));
+      expect(audited.length > 0 && stale.length === 0, `${stale.length} of ${audited.length} responses lack Cache-Control: no-store: ${stale.slice(0, 6).map((x) => `${brief(x)} "${x.cacheControl ?? ''}"`).join('; ')}`);
+      const credentialed = this.seen.filter((x) => x.url.startsWith(`${iss}/`) && (x.allowCredentials ?? '').trim().toLowerCase() === 'true');
+      expect(credentialed.length === 0, `${credentialed.length} responses set Access-Control-Allow-Credentials: true: ${credentialed.slice(0, 6).map(brief).join('; ')}`);
+      // Section 6 requires the preflights of an Issuer that supports browser-based Agent Clients; one that answers neither offers no CORS.
+      const answered = preflights.filter(([, r]) => r.status < 400 && !!r.headers.get('access-control-allow-origin'));
+      if (answered.length > 0) for (const [name, r] of preflights) expect(answered.some(([n]) => n === name), `CORS is offered on the ${answered[0]![0]}, so the preflight of the ${name} must be answered too: ${r.status}, Access-Control-Allow-Origin "${r.headers.get('access-control-allow-origin')}"`);
+
+      // auth_time (Section 3.1) is the time the assertion was accepted: not when the transaction was created, 2.5 s
+      // earlier, and not when the token was issued, 1.5 s later. It is compared with iat, so that both readings come from
+      // the Issuer's clock, against what the harness's clock allows for the same interval: no tolerance to tune.
+      const s3 = await this.start(this.client, { max_age: '300' });
+      await sleep(2500);
+      const a0 = Date.now();
+      const a3 = obj((await this.assert(s3.tx, this.agent, { accept_disclosure: true })).json);
+      const a1 = Date.now();
+      expect(a3.status === 'ready', `assertion on a request with max_age → ${a3.status} ${a3.reason ?? ''}`);
+      await sleep(1500);
+      const c3 = new URL(obj((await this.cont(a3.next.url, a3.transaction_token)).json).redirect);
+      const e0 = Date.now();
+      const t3 = await this.exchange(this.client, c3.searchParams.get('code')!, s3.verifier);
+      const e1 = Date.now();
+      expect(t3.status === 200, `exchange after a request with max_age → ${t3.status} ${obj(t3.json).error ?? ''}`);
+      const { payload } = await jwtVerify(obj(t3.json).id_token, createRemoteJWKSet(new URL(m.jwks_uri)), { issuer: iss, audience: this.client.client_id });
+      expect(typeof payload.auth_time === 'number', `auth_time is REQUIRED when the request carried max_age: ${payload.auth_time}`);
+      // The assertion was accepted between a0 and a1 and the token issued between e0 and e1; whole seconds add or lose up to one.
+      const gap = payload.iat! - (payload.auth_time as number);
+      const least = (e0 - a1) / 1000 - 1;
+      const most = (e1 - a0) / 1000 + 1;
+      expect(gap > least && gap < most, `auth_time must be the time the assertion was accepted: the token was issued ${((e0 - a1) / 1000).toFixed(1)} to ${((e1 - a0) / 1000).toFixed(1)} s after the assertion, but iat - auth_time is ${gap} s`);
     });
 
     const passed = this.results.filter((r) => r.outcome === 'pass').length;
@@ -602,6 +1419,33 @@ class Harness {
 class Skip extends Error {}
 function expect(cond: unknown, message: string): asserts cond {
   if (!cond) throw new Error(message);
+}
+
+/** P-256 field prime and curve coefficient b (Section 7.2: coordinates must be less than the field prime). */
+const P256 = {
+  p: BigInt('0xffffffff00000001000000000000000000000000ffffffffffffffffffffffff'),
+  b: BigInt('0x5ac635d8aa3a93e7b3ebbd55769886bc651d06b0cc53b0f63bce3c3e27d2604b'),
+};
+function modPow(base: bigint, exp: bigint, mod: bigint): bigint {
+  let r = 1n;
+  base %= mod;
+  while (exp > 0n) {
+    if (exp & 1n) r = (r * base) % mod;
+    base = (base * base) % mod;
+    exp >>= 1n;
+  }
+  return r;
+}
+/** 32-octet big-endian base64url encoding of a coordinate. */
+const b64u32 = (n: bigint) => Buffer.from(n.toString(16).padStart(64, '0'), 'hex').toString('base64url');
+/** A P-256 point with a small x coordinate, so that x + p still fits in 32 octets and encodes the same point non-canonically. */
+function smallXPoint(): { x: bigint; y: bigint } {
+  const { p, b } = P256;
+  for (let x = 1n; ; x += 1n) {
+    const rhs = (((x * x * x - 3n * x + b) % p) + p) % p;
+    const y = modPow(rhs, (p + 1n) / 4n, p); // p ≡ 3 (mod 4)
+    if ((y * y) % p === rhs) return { x, y };
+  }
 }
 
 export async function runConformance(o: HarnessOptions): Promise<Report> {

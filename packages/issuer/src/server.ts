@@ -4,7 +4,7 @@
 //   PORT             listen port (default 3000)
 //   ADMIN_TOKEN      bootstrap/registration token (generated and printed when absent)
 //   SIGNING_JWK      private ES256 JWK as JSON (ephemeral when absent)
-//   INSECURE_DEV=1   permit http issuer and loopback clients
+//   INSECURE_DEV=1   permit http issuer and loopback clients; print Owner sign-in codes instead of mailing them
 import { serve } from '@hono/node-server';
 import { createIssuer } from './index.js';
 
@@ -20,6 +20,8 @@ const { app, ctx } = await createIssuer({
   allowInsecureClients: insecure,
   adminToken,
   signingJwk: process.env.SIGNING_JWK ? JSON.parse(process.env.SIGNING_JWK) : undefined,
+  // Development only: the one-time code of the Owner email sign-in is printed instead of mailed. A deployment passes a mailer.
+  sendOwnerCode: insecure ? ({ email, code }) => console.log(`INSECURE_DEV: one-time code for ${email}: ${code}`) : undefined,
 });
 serve({ fetch: app.fetch, port }, () => {
   console.log(`Agent Login issuer ${issuer} listening on :${port}; handle domains ${handleDomains.join(', ')}`);

@@ -3,6 +3,7 @@ import { compactVerify, decodeProtectedHeader, importJWK } from 'jose';
 import { AGENT_KEY_ALGS, ASSERTION_TYP, DISCLOSURE, OWNER_SCOPES, SCOPES, type Scope } from './constants.js';
 import type { IssuerContext } from './context.js';
 import { OAuthError } from './errors.js';
+import { getLiveKey } from './agents.js';
 import { TERMINAL, type Client, type Consent, type ConsentReason, type DenyReason, type Transaction, type TxStatus } from './store.js';
 import { domainServed, handlesEqual, isPlainObject, nowSeconds, parseHandle, randomId, randomSecret, sha256, typMatches } from './util.js';
 
@@ -187,9 +188,20 @@ function setReady(ctx: IssuerContext, tx: Transaction): void {
   tx.continueSecret ??= randomSecret();
 }
 
+/**
+ * Section 6.7 precedence: `invalid_transaction` (loading), then `invalid_token`, then `transaction_expired`, then any
+ * other error. The two guards below are applied in that order before a request body or the status is looked at.
+ */
+export function requireTransactionToken(viewer: Viewer): void {
+  if (viewer.kind !== 'transaction_token') throw new OAuthError(401, 'invalid_token', undefined, { 'WWW-Authenticate': 'Bearer error="invalid_token"' });
+}
+export function requireOpen(tx: Transaction): void {
+  if (TERMINAL.has(tx.status)) throw new OAuthError(410, 'transaction_expired');
+}
+
 /** Section 6.3: verify an assertion and advance the transaction. Returns the transaction_token. */
 export async function assert(ctx: IssuerContext, tx: Transaction, client: Client, body: unknown): Promise<string> {
-  if (TERMINAL.has(tx.status)) throw new OAuthError(410, 'transaction_expired');
+  requireOpen(tx);
   if (!isPlainObject(body) || typeof body.assertion !== 'string') throw new OAuthError(400, 'invalid_request', 'assertion required');
   const jws = body.assertion;
   const c = ctx.constants;
@@ -220,7 +232,7 @@ export async function assert(ctx: IssuerContext, tx: Transaction, client: Client
   if (!parsed) throw bad('handle syntax');
 
   // Step 2: resolve the key.
-  const key = await ctx.store.getKey(header.kid);
+  const key = await getLiveKey(ctx, header.kid);
   if (!key || !handlesEqual(key.handle, parsed.handle) || !domainServed(parsed.domain, ctx.handleDomains)) throw new OAuthError(401, 'unknown_key');
   if (key.status === 'active' && ctx.now() >= key.expiresAt) key.status = 'expired';
   if (key.status !== 'active') throw new OAuthError(401, 'key_revoked');
@@ -313,8 +325,8 @@ export async function assert(ctx: IssuerContext, tx: Transaction, client: Client
 
 /** Section 6.4: the review decision, authorised by the transaction_token only. */
 export async function review(ctx: IssuerContext, tx: Transaction, client: Client, viewer: Viewer, body: unknown): Promise<void> {
-  if (TERMINAL.has(tx.status)) throw new OAuthError(410, 'transaction_expired');
-  if (viewer.kind !== 'transaction_token') throw new OAuthError(401, 'invalid_token', undefined, { 'WWW-Authenticate': 'Bearer error="invalid_token"' });
+  requireTransactionToken(viewer); // the session binding does not authorise this step
+  requireOpen(tx);
   if (tx.status !== 'awaiting_consent') throw new OAuthError(400, 'invalid_request', 'no review is outstanding');
   if (!isPlainObject(body) || (body.decision !== 'allow' && body.decision !== 'deny')) throw new OAuthError(400, 'invalid_request', 'decision must be allow or deny');
   if (body.decision === 'deny') {

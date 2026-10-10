@@ -23,13 +23,26 @@ export interface Agent {
   enabled: boolean;
   createdAt: number;
 }
+/**
+ * How the session that issued an Owner Credential authenticated the Owner (Section 6.6): `passkey`, `oidc`, `domain`,
+ * `email_factor` (email plus a factor the Agent cannot read) qualify for Owner approval and `share_owner`;
+ * `email_only` (a one-time code or link alone) does not.
+ */
+export type SessionAuth = 'passkey' | 'oidc' | 'domain' | 'email_factor' | 'email_only';
 /** Owner Credential or Delegated Credential (Section 1.2), stored hashed. */
 export interface Credential {
   hash: string;
   ownerId: string;
   kind: 'owner' | 'delegated';
   handle?: string; // delegated credentials are bound to one handle
+  sessionAuth?: SessionAuth; // owner credentials only
   createdAt: number;
+}
+/** One-time code of the Owner email sign-in (Section 7.5 `email`), stored hashed; one outstanding code per Owner. */
+export interface OwnerCode {
+  ownerId: string;
+  hash: string;
+  expiresAt: number;
 }
 export type KeyStatus = 'pending' | 'active' | 'revoked' | 'expired';
 export interface P256Jwk { kty: 'EC'; crv: 'P-256'; x: string; y: string }
@@ -57,6 +70,10 @@ export interface Client {
   initiateLoginUri?: string;
   maxSignupsPerOwner?: number;
   requireReview: boolean;
+  /** Section 4.4: the Relay registering as a client; every redirect URI is on its host. */
+  relayIssuer?: string;
+  /** Section 4.4: the Relay's `op_policy_uri`, from its metadata as of registration (shown by the approval page, Section 6.6). */
+  relayPolicyUri?: string;
   tokenEndpointAuthMethod: AuthMethod;
   clientSecretHash?: string;
   fetchedAt?: number;
@@ -153,8 +170,14 @@ export interface Store {
   // owners, agents, credentials
   putOwner(o: Owner): Promise<void>;
   getOwner(id: string): Promise<Owner | undefined>;
+  /** The Owner with this address (compared without regard to case); the most recently created when several share it. */
+  getOwnerByEmail(email: string): Promise<Owner | undefined>;
+  putOwnerCode(c: OwnerCode): Promise<void>;
+  /** Returns and deletes the Owner's outstanding code, atomically. */
+  takeOwnerCode(ownerId: string): Promise<OwnerCode | undefined>;
   putAgent(a: Agent): Promise<void>;
   getAgent(handle: string): Promise<Agent | undefined>;
+  deleteAgent(handle: string): Promise<void>;
   listAgentsByOwner(ownerId: string): Promise<Agent[]>;
   putCredential(c: Credential): Promise<void>;
   getCredential(hash: string): Promise<Credential | undefined>;
@@ -163,6 +186,7 @@ export interface Store {
   // keys
   putKey(k: AgentKey): Promise<void>;
   getKey(kid: string): Promise<AgentKey | undefined>;
+  deleteKey(kid: string): Promise<void>;
   listKeys(handle: string): Promise<AgentKey[]>;
   wasRevoked(handle: string, kid: string): Promise<boolean>;
   rememberRevoked(handle: string, kid: string): Promise<void>;
@@ -183,10 +207,12 @@ export interface Store {
   // consent, accounts, caps
   putConsent(c: Consent): Promise<void>;
   getConsent(handle: string, clientId: string): Promise<Consent | undefined>;
+  listConsents(handle: string): Promise<Consent[]>;
   deleteConsent(handle: string, clientId: string): Promise<void>;
   putAccount(a: Account): Promise<void>;
   getAccount(handle: string, clientId: string): Promise<Account | undefined>;
   listAccounts(handle: string): Promise<Account[]>;
+  deleteAccount(handle: string, clientId: string): Promise<void>;
   /** Number of Accounts ever created for (Owner, client), including disabled and deleted ones. */
   signupsEver(ownerId: string, clientId: string): Promise<number>;
   countSignup(ownerId: string, clientId: string): Promise<void>;
@@ -195,6 +221,7 @@ export interface Store {
 export class MemoryStore implements Store {
   private owners = new Map<string, Owner>();
   private agents = new Map<string, Agent>();
+  private ownerCodes = new Map<string, OwnerCode>();
   private credentials = new Map<string, Credential>();
   private keys = new Map<string, AgentKey>();
   private revoked = new Set<string>();
@@ -208,8 +235,19 @@ export class MemoryStore implements Store {
 
   async putOwner(o: Owner) { this.owners.set(o.id, o); }
   async getOwner(id: string) { return this.owners.get(id); }
+  async getOwnerByEmail(email: string) {
+    const wanted = email.toLowerCase();
+    return [...this.owners.values()].filter((o) => o.email.toLowerCase() === wanted).sort((a, b) => b.createdAt - a.createdAt)[0];
+  }
+  async putOwnerCode(c: OwnerCode) { this.ownerCodes.set(c.ownerId, c); }
+  async takeOwnerCode(ownerId: string) {
+    const c = this.ownerCodes.get(ownerId);
+    this.ownerCodes.delete(ownerId);
+    return c;
+  }
   async putAgent(a: Agent) { this.agents.set(a.handle, a); }
   async getAgent(handle: string) { return this.agents.get(handle); }
+  async deleteAgent(handle: string) { this.agents.delete(handle); }
   async listAgentsByOwner(ownerId: string) { return [...this.agents.values()].filter((a) => a.ownerId === ownerId); }
   async putCredential(c: Credential) { this.credentials.set(c.hash, c); }
   async getCredential(hash: string) { return this.credentials.get(hash); }
@@ -219,6 +257,7 @@ export class MemoryStore implements Store {
   async deleteCredential(hash: string) { this.credentials.delete(hash); }
   async putKey(k: AgentKey) { this.keys.set(k.kid, k); }
   async getKey(kid: string) { return this.keys.get(kid); }
+  async deleteKey(kid: string) { this.keys.delete(kid); }
   async listKeys(handle: string) { return [...this.keys.values()].filter((k) => k.handle === handle); }
   async wasRevoked(handle: string, kid: string) { return this.revoked.has(`${handle}\u0000${kid}`); }
   async rememberRevoked(handle: string, kid: string) { this.revoked.add(`${handle}\u0000${kid}`); }
@@ -262,10 +301,12 @@ export class MemoryStore implements Store {
   }
   async putConsent(c: Consent) { this.consents.set(`${c.handle}\u0000${c.clientId}`, c); }
   async getConsent(handle: string, clientId: string) { return this.consents.get(`${handle}\u0000${clientId}`); }
+  async listConsents(handle: string) { return [...this.consents.values()].filter((c) => c.handle === handle); }
   async deleteConsent(handle: string, clientId: string) { this.consents.delete(`${handle}\u0000${clientId}`); }
   async putAccount(a: Account) { this.accounts.set(`${a.handle}\u0000${a.clientId}`, a); }
   async getAccount(handle: string, clientId: string) { return this.accounts.get(`${handle}\u0000${clientId}`); }
   async listAccounts(handle: string) { return [...this.accounts.values()].filter((a) => a.handle === handle); }
+  async deleteAccount(handle: string, clientId: string) { this.accounts.delete(`${handle}\u0000${clientId}`); }
   async signupsEver(ownerId: string, clientId: string) { return this.signups.get(`${ownerId}\u0000${clientId}`) ?? 0; }
   async countSignup(ownerId: string, clientId: string) {
     const k = `${ownerId}\u0000${clientId}`;

@@ -18,6 +18,8 @@ export interface IssuerOptions {
   /** Development only: permits http/loopback clients and private addresses in fetches. */
   allowInsecureClients?: boolean;
   now?: () => number;
+  /** Delivers the one-time code of the Owner email sign-in (`POST /owner/sessions/email`); the sign-in is off when absent. */
+  sendOwnerCode?: IssuerContext['sendOwnerCode'];
 }
 
 export async function loadSigningKey(jwk?: JWK): Promise<SigningKey> {
@@ -45,6 +47,7 @@ export async function createIssuer(opts: IssuerOptions) {
     adminToken: opts.adminToken ?? randomSecret(),
     now: opts.now ?? nowSeconds,
     locks: new Locks(),
+    sendOwnerCode: opts.sendOwnerCode,
   };
   return { app: createIssuerApp(ctx), ctx };
 }
