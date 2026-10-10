@@ -49,16 +49,30 @@ export async function discoverIssuer(handle: string, o: DiscoveryOptions = {}): 
   }
   const link = (jrd.links ?? []).find((l) => l.rel === REL);
   if (!link?.href) throw new Error(`no issuer link for ${h.handle}`);
-  const iss = new URL(link.href);
-  if (!(iss.protocol === 'https:' || (o.allowInsecure && iss.protocol === 'http:')) || iss.search || iss.hash) throw new Error(`invalid issuer identifier ${link.href}`);
-  return iss.href.replace(/\/$/, '');
+  return checkIssuerIdentifier(link.href, o);
+}
+
+/** An Issuer Identifier is an https URL without query or fragment; it is compared as a string, never normalised. */
+export function checkIssuerIdentifier(issuer: string, o: DiscoveryOptions = {}): string {
+  let u: URL;
+  try {
+    u = new URL(issuer);
+  } catch {
+    throw new Error(`invalid issuer identifier ${issuer}`);
+  }
+  if (!(u.protocol === 'https:' || (o.allowInsecure && u.protocol === 'http:')) || u.search || u.hash || issuer.includes('?') || issuer.includes('#') || u.username || u.password) {
+    throw new Error(`invalid issuer identifier ${issuer}`);
+  }
+  return issuer;
 }
 
 /** Section 2.4: fetches and validates Issuer metadata; `issuer` must equal the identifier. */
 export async function fetchMetadata(issuer: string, o: DiscoveryOptions = {}): Promise<IssuerMetadata> {
   const hit = cache.get(issuer);
   if (hit && hit.until > Date.now()) return hit.value;
-  const res = await safeFetch(`${issuer}/.well-known/openid-configuration`, { maxBytes: MAX_BYTES, timeoutMs: o.timeoutMs ?? 10_000, allowPrivate: o.allowInsecure, maxRedirects: 0 });
+  checkIssuerIdentifier(issuer, o);
+  // Section 4 of OpenID Connect Discovery: a terminating "/" is removed before the well-known path is appended.
+  const res = await safeFetch(`${issuer.replace(/\/$/, '')}/.well-known/openid-configuration`, { maxBytes: MAX_BYTES, timeoutMs: o.timeoutMs ?? 10_000, allowPrivate: o.allowInsecure, maxRedirects: 0 });
   if (res.status !== 200) throw new Error(`metadata for ${issuer} failed with status ${res.status}`);
   const m = JSON.parse(res.body.toString('utf8')) as IssuerMetadata;
   if (m.issuer !== issuer) throw new Error(`metadata issuer ${m.issuer} does not equal ${issuer}`);

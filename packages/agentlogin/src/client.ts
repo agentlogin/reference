@@ -3,11 +3,14 @@
 import { SignJWT, calculateJwkThumbprint, exportJWK, generateKeyPair, importJWK, type JWK } from 'jose';
 import { randomBytes } from 'node:crypto';
 import { discover, fetchMetadata, type DiscoveryOptions, type IssuerMetadata } from './discovery.js';
+import { safeFetch } from './safefetch.js';
 import { parseHandle, domainServed } from './handle.js';
 import { MemoryCookieJar, type CookieJar } from './cookies.js';
 import { MemoryKeystore, type Keystore, type StoredKey } from './keystore.js';
 
 const rnd = (n = 16) => randomBytes(n).toString('base64url');
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, Number.isFinite(v) ? v : lo));
 
 export interface TransactionResource {
   transaction_id: string;
@@ -113,7 +116,7 @@ export class AgentLogin {
   private readonly keystore: Keystore;
   readonly cookies: CookieJar;
   private readonly disc: DiscoveryOptions;
-  private resolved?: { issuer: string; metadata: IssuerMetadata };
+  private resolved?: { issuer: string; metadata: IssuerMetadata; at: number };
 
   constructor(private readonly opts: AgentLoginOptions) {
     const h = parseHandle(opts.handle);
@@ -121,24 +124,29 @@ export class AgentLogin {
     this.handle = h.handle;
     this.keystore = opts.keystore ?? new MemoryKeystore();
     this.cookies = opts.cookies ?? new MemoryCookieJar();
-    this.disc = { allowInsecure: opts.allowInsecure };
+    this.disc = { allowInsecure: opts.allowInsecure, timeoutMs: opts.timeoutMs };
   }
   static async open(opts: AgentLoginOptions): Promise<AgentLogin> {
     return new AgentLogin(opts);
   }
   private log(m: string) { this.opts.log?.(m); }
 
-  /** Section 2: the Home Issuer for this Agent (A-1). */
+  /** Section 2: the Home Issuer for this Agent (A-1). Refreshed after five minutes. */
   async discover(): Promise<{ issuer: string; metadata: IssuerMetadata }> {
-    if (this.resolved) return this.resolved;
-    if (this.opts.issuer) {
-      const issuer = this.opts.issuer.replace(/\/$/, '');
-      const metadata = await fetchMetadata(issuer, this.disc);
-      const h = parseHandle(this.handle)!;
-      if (!domainServed(h.domain, metadata.handle_domains)) throw new AgentLoginError(`${issuer} does not serve ${h.domain}`, 'issuer_mismatch');
-      this.resolved = { issuer, metadata };
-    } else {
-      this.resolved = await discover(this.handle, this.disc);
+    if (this.resolved && Date.now() - this.resolved.at < 300_000) return this.resolved;
+    try {
+      if (this.opts.issuer) {
+        const issuer = this.opts.issuer;
+        const metadata = await fetchMetadata(issuer, this.disc);
+        const h = parseHandle(this.handle)!;
+        if (!domainServed(h.domain, metadata.handle_domains)) throw new AgentLoginError(`${issuer} does not serve ${h.domain}`, 'issuer_mismatch');
+        this.resolved = { issuer, metadata, at: Date.now() };
+      } else {
+        this.resolved = { ...(await discover(this.handle, this.disc)), at: Date.now() };
+      }
+    } catch (e) {
+      if (e instanceof AgentLoginError) throw e;
+      throw new AgentLoginError(`could not find the Issuer for ${this.handle}: ${(e as Error).message}`, 'discovery_failed');
     }
     return this.resolved;
   }
@@ -161,7 +169,7 @@ export class AgentLogin {
     const base = `${metadata.agents_endpoint}/${encodeURIComponent(this.handle)}/keys`;
     const en = await this.json(base, { method: 'POST', headers: { authorization: `Bearer ${p.credential}` }, body: { jwk: key.publicJwk, name: p.name, expires_at: p.expiresAt } });
     if (en.status !== 201) throw this.error('enrollment refused', en);
-    const rec = en.json as { challenge: string; proof_url: string; kid: string };
+    const rec = en.json as { challenge: string; proof_url: string; kid: string; expires_at?: number };
     if (rec.kid !== key.kid) throw new AgentLoginError('issuer computed a different kid', 'kid_mismatch');
     this.assertUnder(rec.proof_url, metadata.agents_endpoint);
     const now = Math.floor(Date.now() / 1000);
@@ -172,13 +180,15 @@ export class AgentLogin {
     const pr = await this.json(rec.proof_url, { method: 'POST', body: { proof } });
     if (pr.status !== 200) throw this.error('enrollment proof refused', pr);
     key.status = 'active';
+    if (typeof rec.expires_at === 'number') key.expiresAt = rec.expires_at;
     await this.keystore.put(key);
     return key;
   }
   async activeKey(): Promise<StoredKey> {
     const { issuer } = await this.discover();
-    const keys = (await this.keystore.list(this.handle)).filter((k) => k.status === 'active' && k.issuer === issuer);
-    if (keys.length === 0) throw new AgentLoginError(`no active key for ${this.handle} at ${issuer}; run enroll first`, 'no_key');
+    const now = Math.floor(Date.now() / 1000);
+    const keys = (await this.keystore.list(this.handle)).filter((k) => k.status === 'active' && k.issuer === issuer && (k.expiresAt === undefined || k.expiresAt > now + 60));
+    if (keys.length === 0) throw new AgentLoginError(`no usable key for ${this.handle} at ${issuer}; enroll one first`, 'no_key');
     return keys.sort((a, b) => b.createdAt - a.createdAt)[0]!;
   }
   async listKeys(credential: string): Promise<unknown> {
@@ -197,13 +207,16 @@ export class AgentLogin {
 
   // ---- sign-in (Sections 5, 6) -------------------------------------------------------------------------
   async signIn(o: SignInOptions): Promise<SignInResult> {
-    const { issuer, metadata } = await this.discover();
+    const deadline = Date.now() + (o.deadlineMs ?? 600_000);
+    // Everything that can be decided locally is decided before the Issuer is asked to create a transaction.
+    if (!o.unsafeSkipHostCheck && !o.expectedHost) throw new AgentLoginError('expectedHost is required: the host of the application you are signing in to', 'expected_host_required');
     let authUrl: URL;
     try {
       authUrl = new URL(o.authorizationUrl);
     } catch {
       throw new AgentLoginError('authorizationUrl is not a URL', 'invalid_request');
     }
+    const { issuer, metadata } = await this.discover();
     // A transaction this client starts itself (Section 6.3): its own Authentication Request, sent to the published
     // authorization_endpoint and answered on the JSON path of Section 5.3. Any other URL at the Issuer, for example a
     // Transaction Resource someone else started, is refused, and so is a response without a session_token.
@@ -211,15 +224,16 @@ export class AgentLogin {
     if (authUrl.origin !== ae.origin || authUrl.pathname !== ae.pathname || authUrl.username || authUrl.password) {
       throw new AgentLoginError(`not the authorization endpoint of this Agent's Issuer (${issuer})`, 'wrong_issuer');
     }
-    const start = await this.json(authUrl.href, { headers: { accept: 'application/json' } });
+    const key = await this.activeKey();
+    const start = await this.json(authUrl.href);
+    if (start.status >= 300 && start.status < 400) throw new AgentLoginError('the Issuer answered with a redirect: it does not offer the JSON response of Section 5.3', 'protocol_error', start.status);
     if (start.status !== 200) throw this.error('the Issuer refused the Authentication Request', start);
     let tx = start.json as TransactionResource;
-    if (typeof tx !== 'object' || tx === null || typeof tx.session_token !== 'string' || typeof tx.transaction_id !== 'string' || typeof tx.client !== 'object' || tx.client === null) {
+    if (typeof tx !== 'object' || tx === null || typeof tx.session_token !== 'string' || typeof tx.transaction_id !== 'string' || typeof tx.client !== 'object' || tx.client === null || typeof tx.next !== 'object' || tx.next === null) {
       throw new AgentLoginError('the Issuer did not answer with the Transaction Resource of Section 5.3; this client did not start this transaction', 'protocol_error', start.status);
     }
     this.check(tx, issuer, metadata, o);
-    const key = await this.activeKey();
-    if (tx.status !== 'awaiting_agent' || tx.next.action !== 'assert' || !tx.challenge || !tx.next.url) throw new AgentLoginError(`unexpected initial status ${tx.status}`, 'unexpected_status', undefined, tx);
+    if (tx.status !== 'awaiting_agent' || tx.next.action !== 'assert' || typeof tx.challenge !== 'string' || !tx.next.url) throw new AgentLoginError(`unexpected initial status ${tx.status}`, 'unexpected_status', undefined, tx);
 
     // Section 6.3: the assertion. deliver_to_session is never set: this client is itself the Session Holder (A-4).
     const now = Math.floor(Date.now() / 1000);
@@ -228,35 +242,48 @@ export class AgentLogin {
       .setIssuer(this.handle).setSubject(this.handle).setAudience(issuer).setIssuedAt(now).setExpirationTime(now + 60)
       .sign(await importJWK(key.privateJwk, 'ES256'));
     const a = await this.json(tx.next.url, { method: 'POST', body: { assertion } });
-    if (a.status !== 200) throw this.error('assertion refused', a);
+    if (a.status !== 200) {
+      const code = (a.json as { error?: string } | undefined)?.error;
+      if (code === 'key_revoked' || code === 'unknown_key') await this.keystore.put({ ...key, status: 'revoked' }); // the Issuer no longer accepts this key
+      throw this.error('assertion refused', a);
+    }
     tx = a.json as TransactionResource;
     const token = tx.transaction_token;
-    if (!token) throw new AgentLoginError('no transaction_token returned', 'protocol_error', 200, tx);
+    if (typeof token !== 'string') throw new AgentLoginError('no transaction_token returned', 'protocol_error', 200, tx);
     const bearer = { authorization: `Bearer ${token}` };
-    const deadline = Date.now() + (o.deadlineMs ?? 600_000);
     let notified = false;
 
-    // A-5, A-8: act on status and next only.
+    // A-5, A-8: act on status and next only, until the deadline.
     for (;;) {
       this.check(tx, issuer, metadata, o);
       if (tx.status === 'ready') break;
       if (tx.status === 'denied' || tx.status === 'expired') throw new AgentLoginError(`sign-in ${tx.status}${tx.reason ? ` (${tx.reason})` : ''}`, tx.reason ?? tx.status, undefined, tx);
       if (tx.status === 'completed') throw new AgentLoginError('transaction already completed', 'completed', undefined, tx);
+      if (Date.now() > deadline) throw new AgentLoginError('sign-in did not finish before the deadline', 'timeout', undefined, tx);
       if (tx.status === 'awaiting_consent') {
+        if (!tx.next.url) throw new AgentLoginError('review step without a URL', 'protocol_error', undefined, tx);
         const decision = o.onReview ? await o.onReview(tx) : o.acceptDisclosure === false ? 'deny' : 'allow';
         this.log(`review (${tx.consent_reason}): ${decision}`);
-        const r = await this.json(tx.next.url!, { method: 'POST', headers: bearer, body: { decision } });
+        const r = await this.json(tx.next.url, { method: 'POST', headers: bearer, body: { decision } });
         if (r.status !== 200) throw this.error('review refused', r);
         tx = r.json as TransactionResource;
         continue;
       }
       if (tx.status === 'awaiting_owner') {
-        if (!notified) { notified = true; o.onOwnerApproval?.(tx); this.log('waiting for the Owner to approve'); }
-        if (Date.now() > deadline || Date.now() / 1000 > tx.expires_at) throw new AgentLoginError('timed out waiting for the Owner', 'timeout', undefined, tx);
-        await new Promise((r) => setTimeout(r, Math.max(1, tx.next.retry_after ?? 5) * 1000));
+        if (!notified) {
+          notified = true;
+          if (o.onOwnerApproval) o.onOwnerApproval(tx);
+          else this.log('waiting for the Owner to approve');
+        }
+        if (Date.now() / 1000 > tx.expires_at) throw new AgentLoginError('the transaction expired while waiting for the Owner', 'timeout', undefined, tx);
+        await sleep(clamp(tx.next.retry_after ?? 5, 1, 60) * 1000);
         const g = await this.json(tx.url, { headers: bearer });
+        if (g.status === 429) { // Section 6.7: honour Retry-After, then poll again
+          await sleep(clamp(Number(g.retryAfter) || 5, 1, 60) * 1000);
+          continue;
+        }
         if (g.status !== 200) throw this.error('polling failed', g);
-        tx = g.json as TransactionResource;
+        tx = g.json as TransactionResource; // expires_at is re-read on every poll (Section 6.6)
         continue;
       }
       throw new AgentLoginError(`unexpected status ${tx.status}`, 'unexpected_status', undefined, tx);
@@ -264,11 +291,17 @@ export class AgentLogin {
     // Section 6.5: the continue step, with the transaction_token (A-6). Never with the session credential and
     // never followed when deliver_to_session was set (it never is here).
     if (!tx.next.url) throw new AgentLoginError('continue URL withheld', 'protocol_error', undefined, tx);
-    this.assertUnder(tx.next.url, metadata.transaction_endpoint);
-    const c = await this.json(tx.next.url, { headers: { ...bearer, accept: 'application/json' } });
-    if (c.status !== 200 || typeof (c.json as { redirect?: unknown }).redirect !== 'string') throw this.error('continue failed', c);
-    const redirectUrl = (c.json as { redirect: string }).redirect;
-    const rh = new URL(redirectUrl);
+    const c = await this.json(tx.next.url, { headers: bearer });
+    let redirectUrl: string | undefined;
+    if (c.status === 200 && typeof (c.json as { redirect?: unknown } | undefined)?.redirect === 'string') redirectUrl = (c.json as { redirect: string }).redirect;
+    else if ((c.status === 302 || c.status === 303) && c.location) redirectUrl = c.location; // an Issuer that answered the HTML form
+    if (!redirectUrl) throw this.error('continue failed', c);
+    let rh: URL;
+    try {
+      rh = new URL(redirectUrl);
+    } catch {
+      throw new AgentLoginError('the Issuer returned a malformed redirect', 'protocol_error');
+    }
     if (rh.host !== tx.client.redirect_host) throw new AgentLoginError('redirect does not go to the client host', 'protocol_error');
     const result = { handle: this.handle, issuer, client: tx.client, scopes: tx.requested_scopes } as SignInResult;
     Object.defineProperty(result, 'redirectUrl', { value: redirectUrl, enumerable: false });
@@ -363,35 +396,43 @@ export class AgentLogin {
     if (tx.iss !== issuer) throw new AgentLoginError(`transaction iss ${tx.iss} is not ${issuer}`, 'wrong_issuer', undefined, tx);
     this.assertUnder(tx.url, m.transaction_endpoint);
     if (tx.next?.url) this.assertUnder(tx.next.url, m.transaction_endpoint);
+    if (typeof tx.client?.redirect_host !== 'string') throw new AgentLoginError('transaction without client.redirect_host', 'protocol_error');
     if (!o.unsafeSkipHostCheck) {
-      if (!o.expectedHost) throw new AgentLoginError('expectedHost is required: the host of the site you are signing in to', 'expected_host_required');
-      const ok = [o.expectedHost, ...(o.acceptHosts ?? [])].map((h) => h.toLowerCase());
+      const ok = [o.expectedHost!, ...(o.acceptHosts ?? [])].map((h) => h.toLowerCase());
       if (!ok.includes(tx.client.redirect_host.toLowerCase())) throw new AgentLoginError(`this sign-in is for ${tx.client.redirect_host}, not ${o.expectedHost}`, 'unexpected_client', undefined, tx);
     }
   }
+  /** `url` must lie under `base`: same origin, and the same path or a descendant of it, after URL normalisation. */
   private assertUnder(url: string, base: string) {
-    if (!url.startsWith(base.endsWith('/') ? base : `${base}/`) && url !== base) throw new AgentLoginError(`URL ${new URL(url).origin}... is not under ${base}`, 'wrong_issuer');
-    const u = new URL(url);
+    let u: URL;
+    try {
+      u = new URL(url);
+    } catch {
+      throw new AgentLoginError('malformed URL from the Issuer', 'protocol_error');
+    }
+    const b = new URL(base);
+    const basePath = b.pathname.replace(/\/$/, '');
+    if (u.origin !== b.origin || u.username || u.password || !(u.pathname === basePath || u.pathname.startsWith(`${basePath}/`))) {
+      throw new AgentLoginError(`a URL from the Issuer is not under ${base}`, 'wrong_issuer');
+    }
     if (u.protocol !== 'https:' && !this.opts.allowInsecure) throw new AgentLoginError('non-https URL from the Issuer', 'insecure_url');
   }
-  /** One request to the Issuer: no cookies, no redirects, bounded in time and size. */
-  private async json(url: string, init: { method?: string; headers?: Record<string, string>; body?: unknown } = {}): Promise<{ status: number; json: unknown; text: string; headers: Headers }> {
-    const headers: Record<string, string> = { accept: 'application/json', ...init.headers };
+  /** One request to the Issuer: no cookies, no redirects, the fetch protections of Section 2.2, bounded in time and size. */
+  private async json(url: string, init: { method?: string; headers?: Record<string, string>; body?: unknown } = {}): Promise<{ status: number; json: unknown; text: string; retryAfter?: string; location?: string }> {
+    const headers: Record<string, string> = { ...init.headers };
     let body: string | undefined;
     if (init.body !== undefined) { headers['content-type'] = 'application/json'; body = JSON.stringify(init.body); }
-    let res: Response;
-    let text: string;
+    let res;
     try {
-      res = await fetch(url, { method: init.method ?? 'GET', headers, body, redirect: 'manual', signal: AbortSignal.timeout(this.opts.timeoutMs ?? 10_000) });
-      const buf = await res.arrayBuffer();
-      if (buf.byteLength > 64 * 1024) throw new Error('response larger than 64 KiB');
-      text = Buffer.from(buf).toString('utf8');
+      res = await safeFetch(url, { method: init.method ?? 'GET', headers, body, accept: 'application/json', maxBytes: 64 * 1024, timeoutMs: this.opts.timeoutMs ?? 10_000, allowPrivate: this.opts.allowInsecure, maxRedirects: 0 });
     } catch (e) {
       throw new AgentLoginError(`request to the Issuer failed: ${(e as Error).message}`, 'network_error');
     }
+    const text = res.body.toString('utf8');
     let json: unknown;
     try { json = text ? JSON.parse(text) : undefined; } catch { json = undefined; }
-    return { status: res.status, json, text, headers: res.headers };
+    const h = (k: string) => { const v = res.headers[k]; return Array.isArray(v) ? v[0] : v; };
+    return { status: res.status, json, text, retryAfter: h('retry-after'), location: h('location') };
   }
   private error(what: string, r: { status: number; json: unknown; text: string }): AgentLoginError {
     const j = (r.json ?? {}) as { error?: string; error_description?: string; status?: string; reason?: string };

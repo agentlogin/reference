@@ -1,7 +1,7 @@
 // Agent Key storage (Section 7.1). The private key never leaves the keystore except to sign; it is never logged.
-import { mkdirSync, readFileSync, writeFileSync, chmodSync, existsSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { join } from 'node:path';
+import { readPrivateJson, writePrivateJson } from './files.js';
 import type { JWK } from 'jose';
 
 export interface StoredKey {
@@ -12,6 +12,8 @@ export interface StoredKey {
   publicJwk: JWK;
   name?: string;
   createdAt: number;
+  /** Expiry the Issuer recorded for the key (Section 7.1), seconds since the epoch. */
+  expiresAt?: number;
   status: 'pending' | 'active' | 'revoked';
 }
 export interface Keystore {
@@ -34,15 +36,8 @@ export class MemoryKeystore implements Keystore {
 /** JSON file with mode 0600 in a 0700 directory. */
 export class FileKeystore implements Keystore {
   constructor(public readonly path: string = join(agentloginHome(), 'keys.json')) {}
-  private read(): StoredKey[] {
-    if (!existsSync(this.path)) return [];
-    return JSON.parse(readFileSync(this.path, 'utf8')) as StoredKey[];
-  }
-  private write(keys: StoredKey[]) {
-    mkdirSync(dirname(this.path), { recursive: true, mode: 0o700 });
-    writeFileSync(this.path, JSON.stringify(keys, null, 1), { mode: 0o600 });
-    chmodSync(this.path, 0o600);
-  }
+  private read(): StoredKey[] { return readPrivateJson<StoredKey[]>(this.path, []); }
+  private write(keys: StoredKey[]) { writePrivateJson(this.path, keys); }
   async list(handle?: string) { return this.read().filter((k) => !handle || k.handle === handle); }
   async get(kid: string) { return this.read().find((k) => k.kid === kid); }
   async put(key: StoredKey) { this.write([...this.read().filter((k) => k.kid !== key.kid), key]); }

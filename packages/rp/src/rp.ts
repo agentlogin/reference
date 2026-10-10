@@ -107,7 +107,7 @@ export class RelyingParty {
     if (o.stateSecret.length < 32) throw new Error('stateSecret must be at least 32 characters');
     for (const i of o.issuers) {
       const c = typeof i === 'string' ? { issuer: i } : i;
-      this.issuers.set(c.issuer.replace(/\/$/, ''), { ...c, issuer: c.issuer.replace(/\/$/, '') });
+      this.issuers.set(c.issuer, { ...c, issuer: c.issuer });
     }
     if (this.issuers.size === 0 && o.federation !== 'any') throw new Error('configure at least one Issuer, or federation: "any"');
     this.algs = o.idTokenAlgs ?? ['ES256'];
@@ -115,7 +115,7 @@ export class RelyingParty {
 
   get options(): Readonly<RelyingPartyOptions> { return this.o; }
   /** True when `issuer` is one this Relying Party is configured to accept (Section 5.8). */
-  isConfigured(issuer: string): boolean { return this.issuers.has(issuer.replace(/\/$/, '')); }
+  isConfigured(issuer: string): boolean { return this.issuers.has(issuer); }
   private clientFor(issuer: string): { clientId: string; clientSecret?: string } {
     const c = this.issuers.get(issuer);
     return { clientId: c?.clientId ?? this.o.clientId, clientSecret: c?.clientSecret ?? this.o.clientSecret };
@@ -126,7 +126,7 @@ export class RelyingParty {
     const h = parseHandle(handle);
     if (!h) throw new RelyingPartyError('invalid_handle', 'not an Agent Handle');
     const pinned = this.o.staticIssuers?.[h.domain];
-    if (pinned) return pinned.replace(/\/$/, '');
+    if (pinned) return pinned;
     const hit = this.discoveryCache.get(h.domain);
     if (hit && hit.until > Date.now()) return hit.issuer;
     let issuer: string;
@@ -152,7 +152,7 @@ export class RelyingParty {
   /** Chooses the Issuer for a sign-in (Section 9 item 10). */
   private async choose(p: BeginOptions): Promise<string> {
     if (p.issuer) {
-      const iss = p.issuer.replace(/\/$/, '');
+      const iss = p.issuer;
       if (!this.issuers.has(iss)) throw new RelyingPartyError('issuer_not_accepted', 'this application does not accept that Issuer');
       return iss;
     }
@@ -203,7 +203,7 @@ export class RelyingParty {
    * discovery for `login_hint` yields exactly that Issuer.
    */
   async beginInitiated(p: { iss: string; loginHint?: string; returnTo?: string }): Promise<Begun> {
-    const iss = p.iss.replace(/\/$/, '');
+    const iss = p.iss;
     if (this.issuers.has(iss)) return this.begin({ issuer: iss, handle: p.loginHint, returnTo: p.returnTo });
     if (this.o.federation === 'any' && p.loginHint && (await this.resolve(p.loginHint)) === iss) return this.begin({ handle: p.loginHint, returnTo: p.returnTo });
     throw new RelyingPartyError('issuer_not_accepted', 'this application does not accept that Issuer');
@@ -288,7 +288,7 @@ export class RelyingParty {
     if (payload.email !== undefined) {
       if (typeof payload.email !== 'string' || payload.email_verified !== true) throw bad('email without email_verified true');
       const discovered = await this.resolve(payload.email);
-      const expected = typeof homeIss === 'string' ? homeIss.replace(/\/$/, '') : x.issuer;
+      const expected = typeof homeIss === 'string' ? homeIss : x.issuer;
       if (discovered !== expected) throw new RelyingPartyError('handle_binding_failed', 'the handle\'s domain does not designate this Issuer');
     }
     return payload;

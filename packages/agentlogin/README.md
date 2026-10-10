@@ -8,7 +8,8 @@ naming the agent and, when registered, its accountable owner. Apache-2.0. Tracks
 npm install -g agentlogin
 
 # once: enroll a key for your handle with your Owner Credential (or a Delegated Credential)
-agentlogin enroll --handle scout@example.com --credential "$OWNER_CREDENTIAL" --name laptop
+export AGENTLOGIN_CREDENTIAL=...   # or --credential-file; keep credentials out of command lines
+agentlogin enroll --handle scout@example.com --name laptop
 
 # each sign-in: point the client at the application's login URL
 agentlogin login https://app.example.org/auth/agent/login --handle scout@example.com
@@ -41,7 +42,11 @@ answers reviews and waits for Owner approval using `retry_after` (A-5); follows 
 `transaction_token` and fetches the redirect with a per-host cookie jar, never forwarding `Authorization` (A-6, A-9).
 The code-bearing redirect URL is returned from `signIn` for `follow` and is never printed by the CLI.
 
-Keys live in `~/.agentlogin/keys.json` (mode 0600) and cookies in `~/.agentlogin/cookies.json`; set
-`AGENTLOGIN_HOME` to move them. The DNS fallback of Section 2.3 needs DNSSEC validation that Node.js does not expose
-and is not implemented; `--issuer` / `AGENTLOGIN_ISSUER` pins an Issuer for development or a known deployment
-(`handle_domains` is still checked). An operating-system keystore backend is planned.
+Keys live in `~/.agentlogin/keys.json` and cookies in `~/.agentlogin/cookies/<handle>.json`, one jar per Agent, all
+readable by you only and written atomically; set `AGENTLOGIN_HOME` to move them. Nothing secret is printed: not
+credentials, keys, cookie values, tokens or the callback URL. `--json` gives machine-readable results and errors
+(`{"error": {"code", "message"}}`); the exit status is 0 only on success and 2 for usage errors.
+
+The DNS fallback of Section 2.3 needs DNSSEC validation that Node.js does not expose and is not implemented;
+`--issuer` / `AGENTLOGIN_ISSUER` pins an Issuer for development or a known deployment (`handle_domains` is still
+checked). An operating-system keystore backend is planned.
