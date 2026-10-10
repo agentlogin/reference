@@ -85,6 +85,10 @@ test('usage errors exit 2 and name the problem', async () => {
   assert.equal(JSON.parse(order.stdout).error.code, 'no_key');
   assert.equal(order.code, 1);
   assert.equal((await cli(['--help'])).code, 0);
+  const argv = await cli(['enroll', '--credential', 'secret-on-argv']);
+  assert.equal(argv.code, 2);
+  assert.match(argv.stderr, /not accepted on the command line/);
+  assert.equal((await cli(['login', `${appUrl}/auth/agent/login`, '--timeout', 'soon'])).code, 2);
 });
 
 test('enroll, login, fetch, cookies and revoke', async () => {
@@ -123,6 +127,10 @@ test('enroll, login, fetch, cookies and revoke', async () => {
   const wrong = await cli(['login', `${appUrl}/auth/agent/login`, '--site', 'other.example', '--json']);
   assert.equal(wrong.code, 1);
   assert.equal(JSON.parse(wrong.stdout).error.code, 'unexpected_client');
+
+  // the callback may live on another host that the caller names explicitly
+  const accept = await cli(['login', `${appUrl}/auth/agent/login`, '--site', 'app.example', '--accept-host', new URL(appUrl).host, '--json']);
+  assert.equal(JSON.parse(accept.stdout).signed_in, true, accept.stdout);
 
   // --no-follow reports that no session was created
   const nofollow = await cli(['login', `${appUrl}/auth/agent/login`, '--no-follow', '--json']);

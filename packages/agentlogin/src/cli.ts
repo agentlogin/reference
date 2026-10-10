@@ -11,8 +11,10 @@ const USAGE = `agentlogin: sign a software agent in to web applications (Agent L
   agentlogin enroll                      enroll a new key for the handle (needs a credential)
         [--name N]
   agentlogin login <login-url>           sign in at an application, starting from its login URL; iss and login_hint
-        [--site HOST] [--no-hint]          are appended (Section 5.8) unless --no-hint; stores the session cookies
-        [--deny-review] [--no-follow]
+        [--no-hint] [--deny-review]        are appended (Section 5.8) unless --no-hint; stores the session cookies.
+        [--no-follow] [--timeout SECONDS]  Blocks while the agent's owner has to approve (default limit 600 s).
+        [--site HOST] [--accept-host HOST] --site: the host that receives the sign-in callback, when it is not the
+                                           login URL's host; the sign-in is refused for any other host
   agentlogin login <url> --authorization-url --site HOST
                                          the same, starting from an Authentication Request URL
   agentlogin fetch <url>                 request with the session cookies stored for that application
@@ -33,14 +35,16 @@ Options for every command:
 
 Files: keys and cookies are kept under ~/.agentlogin (AGENTLOGIN_HOME), readable by you only.`;
 
-const VALUE_FLAGS = new Set(['handle', 'issuer', 'credential', 'credential-file', 'name', 'site', 'method', 'data', 'content-type', 'kid']);
-const BOOLEAN_FLAGS = new Set(['json', 'insecure', 'help', 'no-hint', 'deny-review', 'no-follow', 'authorization-url', 'unsafe-skip-host-check', 'clear']);
+const VALUE_FLAGS = new Set(['handle', 'issuer', 'credential-file', 'name', 'site', 'accept-host', 'timeout', 'method', 'data', 'content-type', 'kid']);
+const REPEATABLE = new Set(['accept-host']);
+const BOOLEAN_FLAGS = new Set(['json', 'insecure', 'help', 'no-hint', 'deny-review', 'no-follow', 'authorization-url', 'clear']);
 const COMMANDS = new Set(['enroll', 'login', 'fetch', 'cookies', 'keys', 'revoke', 'keygen', 'whoami']);
 
 class UsageError extends Error {}
 
 function parseArgs(argv: string[]) {
   const flags = new Map<string, string | true>();
+  const multi = new Map<string, string[]>();
   const positional: string[] = [];
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i]!;
@@ -53,12 +57,16 @@ function parseArgs(argv: string[]) {
     } else if (VALUE_FLAGS.has(name)) {
       const value = eq >= 0 ? a.slice(eq + 1) : argv[++i];
       if (value === undefined || (eq < 0 && value.startsWith('--'))) throw new UsageError(`--${name} needs a value`);
+      if (flags.has(name) && !REPEATABLE.has(name)) throw new UsageError(`--${name} given twice`);
       flags.set(name, value);
+      multi.set(name, [...(multi.get(name) ?? []), value]);
+    } else if (name === 'credential') {
+      throw new UsageError('credentials are not accepted on the command line, where other users can see them: set AGENTLOGIN_CREDENTIAL or pass --credential-file');
     } else {
       throw new UsageError(`unknown option --${name}`);
     }
   }
-  return { flags, positional };
+  return { flags, multi, positional };
 }
 
 const hostOf = (site: string): string => {
@@ -69,7 +77,7 @@ const hostOf = (site: string): string => {
   }
 };
 
-async function run(argv: string[], flags: Map<string, string | true>, positional: string[]): Promise<void> {
+async function run(flags: Map<string, string | true>, multi: Map<string, string[]>, positional: string[]): Promise<void> {
   const cmd = positional[0];
   if (flags.has('help') || !cmd) { console.log(USAGE); return; }
   if (!COMMANDS.has(cmd)) throw new UsageError(`unknown command ${cmd}`);
@@ -87,7 +95,7 @@ async function run(argv: string[], flags: Map<string, string | true>, positional
   });
   const credential = (): string => {
     const file = str('credential-file');
-    const c = file ? readFileSync(file, 'utf8').trim() : str('credential', 'AGENTLOGIN_CREDENTIAL');
+    const c = file ? readFileSync(file, 'utf8').trim() : process.env.AGENTLOGIN_CREDENTIAL || undefined;
     if (!c) throw new UsageError('a credential is required: set AGENTLOGIN_CREDENTIAL or pass --credential-file');
     return c;
   };
@@ -112,9 +120,12 @@ async function run(argv: string[], flags: Map<string, string | true>, positional
       need(2, 'login <url> [--site HOST]');
       const url = positional[1]!;
       const site = str('site');
+      const timeout = str('timeout');
+      if (timeout !== undefined && !(Number(timeout) > 0)) throw new UsageError('--timeout takes a number of seconds');
       const common = {
         expectedHost: site ? hostOf(site) : undefined,
-        unsafeSkipHostCheck: flags.has('unsafe-skip-host-check'),
+        acceptHosts: (multi.get('accept-host') ?? []).map(hostOf),
+        deadlineMs: timeout !== undefined ? Number(timeout) * 1000 : undefined,
         acceptDisclosure: !flags.has('deny-review'),
         onOwnerApproval: () => console.error("The agent's owner must approve this sign-in; waiting."),
       };
@@ -170,15 +181,14 @@ async function run(argv: string[], flags: Map<string, string | true>, positional
       return;
     }
   }
-  void argv;
 }
 
 export async function main(argv: string[]): Promise<void> {
   let json = argv.includes('--json');
   try {
-    const { flags, positional } = parseArgs(argv);
+    const { flags, multi, positional } = parseArgs(argv);
     json = flags.has('json');
-    await run(argv, flags, positional);
+    await run(flags, multi, positional);
   } catch (e) {
     const code = e instanceof AgentLoginError ? e.code : e instanceof UsageError ? 'usage' : 'error';
     const message = e instanceof Error ? e.message : String(e);

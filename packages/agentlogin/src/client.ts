@@ -26,9 +26,34 @@ export interface TransactionResource {
   consent_reason?: string;
   reason?: string;
   login_hint?: string;
-  session_token?: string;
-  transaction_token?: string;
-  [k: string]: unknown;
+  requester?: { user_agent?: string; network?: string };
+}
+/** What callbacks receive: the transaction without its challenge, tokens or URLs. */
+export interface TransactionView {
+  transaction_id: string;
+  iss: string;
+  status: TransactionResource['status'];
+  expires_at: number;
+  client: TransactionResource['client'];
+  requested_scopes: string[];
+  disclosure: TransactionResource['disclosure'];
+  consent_reason?: string;
+  reason?: string;
+  login_hint?: string;
+  requester?: { user_agent?: string; network?: string };
+}
+const view = (t: TransactionResource): TransactionView => ({
+  transaction_id: t.transaction_id, iss: t.iss, status: t.status, expires_at: t.expires_at, client: { ...t.client }, requested_scopes: [...(t.requested_scopes ?? [])],
+  disclosure: (t.disclosure ?? []).map((d) => ({ ...d })), consent_reason: t.consent_reason, reason: t.reason, login_hint: t.login_hint, requester: t.requester ? { ...t.requester } : undefined,
+});
+/** Separates the bearer credentials from a parsed response so that they never travel with the resource. */
+function parseResource(json: unknown): { tx: TransactionResource; sessionToken?: string; transactionToken?: string } | null {
+  if (typeof json !== 'object' || json === null) return null;
+  const { session_token, transaction_token, ...rest } = json as Record<string, unknown>;
+  const tx = rest as unknown as TransactionResource;
+  if (typeof tx.transaction_id !== 'string' || typeof tx.status !== 'string' || typeof tx.iss !== 'string' || typeof tx.url !== 'string') return null;
+  if (typeof tx.client !== 'object' || tx.client === null || typeof tx.next !== 'object' || tx.next === null) return null;
+  return { tx, sessionToken: typeof session_token === 'string' ? session_token : undefined, transactionToken: typeof transaction_token === 'string' ? transaction_token : undefined };
 }
 
 /** What an error may carry about a transaction: no challenge, tokens or URLs (Section 6 forbids those in logs and tool output). */
@@ -82,9 +107,9 @@ export interface SignInOptions {
   /** Accept the disclosure in the assertion (skips the review when the Issuer permits). Default true. */
   acceptDisclosure?: boolean;
   /** Called when the Issuer requires a review; return 'allow' or 'deny'. Default: allow when acceptDisclosure, else deny. */
-  onReview?: (resource: TransactionResource) => Promise<'allow' | 'deny'> | 'allow' | 'deny';
+  onReview?: (transaction: TransactionView) => Promise<'allow' | 'deny'> | 'allow' | 'deny';
   /** Called once when the Owner must approve. */
-  onOwnerApproval?: (resource: TransactionResource) => void;
+  onOwnerApproval?: (transaction: TransactionView) => void;
   /** Overall deadline for waiting states, default 10 minutes. */
   deadlineMs?: number;
 }
@@ -166,19 +191,25 @@ export class AgentLogin {
   async enroll(p: { credential: string; name?: string; expiresAt?: number }): Promise<StoredKey> {
     const { issuer, metadata } = await this.discover();
     const key = await this.generateKey(p.name);
-    const base = `${metadata.agents_endpoint}/${encodeURIComponent(this.handle)}/keys`;
-    const en = await this.json(base, { method: 'POST', headers: { authorization: `Bearer ${p.credential}` }, body: { jwk: key.publicJwk, name: p.name, expires_at: p.expiresAt } });
-    if (en.status !== 201) throw this.error('enrollment refused', en);
-    const rec = en.json as { challenge: string; proof_url: string; kid: string; expires_at?: number };
-    if (rec.kid !== key.kid) throw new AgentLoginError('issuer computed a different kid', 'kid_mismatch');
-    this.assertUnder(rec.proof_url, metadata.agents_endpoint);
-    const now = Math.floor(Date.now() / 1000);
-    const proof = await new SignJWT({ nonce: rec.challenge, jti: rnd() })
-      .setProtectedHeader({ alg: 'ES256', typ: 'agent-login-enrollment+jwt', kid: key.kid })
-      .setIssuer(this.handle).setSubject(this.handle).setAudience(issuer).setIssuedAt(now).setExpirationTime(now + 60)
-      .sign(await importJWK(key.privateJwk, 'ES256'));
-    const pr = await this.json(rec.proof_url, { method: 'POST', body: { proof } });
-    if (pr.status !== 200) throw this.error('enrollment proof refused', pr);
+    let rec: { challenge: string; proof_url: string; kid: string; expires_at?: number };
+    try {
+      const base = `${metadata.agents_endpoint}/${encodeURIComponent(this.handle)}/keys`;
+      const en = await this.json(base, { method: 'POST', headers: { authorization: `Bearer ${p.credential}` }, body: { jwk: key.publicJwk, name: p.name, expires_at: p.expiresAt } });
+      if (en.status !== 201) throw this.error('enrollment refused', en);
+      rec = en.json as { challenge: string; proof_url: string; kid: string; expires_at?: number };
+      if (rec.kid !== key.kid) throw new AgentLoginError('issuer computed a different kid', 'kid_mismatch');
+      this.assertUnder(rec.proof_url, metadata.agents_endpoint);
+      const now = Math.floor(Date.now() / 1000);
+      const proof = await new SignJWT({ nonce: rec.challenge, jti: rnd() })
+        .setProtectedHeader({ alg: 'ES256', typ: 'agent-login-enrollment+jwt', kid: key.kid })
+        .setIssuer(this.handle).setSubject(this.handle).setAudience(issuer).setIssuedAt(now).setExpirationTime(now + 60)
+        .sign(await importJWK(key.privateJwk, 'ES256'));
+      const pr = await this.json(rec.proof_url, { method: 'POST', body: { proof } });
+      if (pr.status !== 200) throw this.error('enrollment proof refused', pr);
+    } catch (e) {
+      await this.keystore.remove(key.kid);
+      throw e;
+    }
     key.status = 'active';
     if (typeof rec.expires_at === 'number') key.expiresAt = rec.expires_at;
     await this.keystore.put(key);
@@ -228,10 +259,11 @@ export class AgentLogin {
     const start = await this.json(authUrl.href);
     if (start.status >= 300 && start.status < 400) throw new AgentLoginError('the Issuer answered with a redirect: it does not offer the JSON response of Section 5.3', 'protocol_error', start.status);
     if (start.status !== 200) throw this.error('the Issuer refused the Authentication Request', start);
-    let tx = start.json as TransactionResource;
-    if (typeof tx !== 'object' || tx === null || typeof tx.session_token !== 'string' || typeof tx.transaction_id !== 'string' || typeof tx.client !== 'object' || tx.client === null || typeof tx.next !== 'object' || tx.next === null) {
+    const started = parseResource(start.json);
+    if (!started || !started.sessionToken) {
       throw new AgentLoginError('the Issuer did not answer with the Transaction Resource of Section 5.3; this client did not start this transaction', 'protocol_error', start.status);
     }
+    let tx = started.tx;
     this.check(tx, issuer, metadata, o);
     if (tx.status !== 'awaiting_agent' || tx.next.action !== 'assert' || typeof tx.challenge !== 'string' || !tx.next.url) throw new AgentLoginError(`unexpected initial status ${tx.status}`, 'unexpected_status', undefined, tx);
 
@@ -247,10 +279,15 @@ export class AgentLogin {
       if (code === 'key_revoked' || code === 'unknown_key') await this.keystore.put({ ...key, status: 'revoked' }); // the Issuer no longer accepts this key
       throw this.error('assertion refused', a);
     }
-    tx = a.json as TransactionResource;
-    const token = tx.transaction_token;
-    if (typeof token !== 'string') throw new AgentLoginError('no transaction_token returned', 'protocol_error', 200, tx);
-    const bearer = { authorization: `Bearer ${token}` };
+    const asserted = parseResource(a.json);
+    if (!asserted || !asserted.transactionToken) throw new AgentLoginError('no transaction_token returned', 'protocol_error', 200, a.json);
+    tx = asserted.tx;
+    const bearer = { authorization: `Bearer ${asserted.transactionToken}` };
+    const next = (json: unknown, what: string): TransactionResource => {
+      const r = parseResource(json);
+      if (!r) throw new AgentLoginError(`${what}: the Issuer did not return a Transaction Resource`, 'protocol_error');
+      return r.tx;
+    };
     let notified = false;
 
     // A-5, A-8: act on status and next only, until the deadline.
@@ -262,17 +299,17 @@ export class AgentLogin {
       if (Date.now() > deadline) throw new AgentLoginError('sign-in did not finish before the deadline', 'timeout', undefined, tx);
       if (tx.status === 'awaiting_consent') {
         if (!tx.next.url) throw new AgentLoginError('review step without a URL', 'protocol_error', undefined, tx);
-        const decision = o.onReview ? await o.onReview(tx) : o.acceptDisclosure === false ? 'deny' : 'allow';
+        const decision = o.onReview ? await o.onReview(view(tx)) : o.acceptDisclosure === false ? 'deny' : 'allow';
         this.log(`review (${tx.consent_reason}): ${decision}`);
         const r = await this.json(tx.next.url, { method: 'POST', headers: bearer, body: { decision } });
         if (r.status !== 200) throw this.error('review refused', r);
-        tx = r.json as TransactionResource;
+        tx = next(r.json, 'review');
         continue;
       }
       if (tx.status === 'awaiting_owner') {
         if (!notified) {
           notified = true;
-          if (o.onOwnerApproval) o.onOwnerApproval(tx);
+          if (o.onOwnerApproval) o.onOwnerApproval(view(tx));
           else this.log('waiting for the Owner to approve');
         }
         if (Date.now() / 1000 > tx.expires_at) throw new AgentLoginError('the transaction expired while waiting for the Owner', 'timeout', undefined, tx);
@@ -283,7 +320,7 @@ export class AgentLogin {
           continue;
         }
         if (g.status !== 200) throw this.error('polling failed', g);
-        tx = g.json as TransactionResource; // expires_at is re-read on every poll (Section 6.6)
+        tx = next(g.json, 'polling'); // expires_at is re-read on every poll (Section 6.6)
         continue;
       }
       throw new AgentLoginError(`unexpected status ${tx.status}`, 'unexpected_status', undefined, tx);
@@ -357,9 +394,10 @@ export class AgentLogin {
     for (let i = 0; ; i += 1) {
       const res = await this.rpFetch(url);
       const location = res.headers.get('location');
-      if (res.status >= 300 && res.status < 400 && location && i < maxRedirects) {
+      if (res.status >= 300 && res.status < 400 && location) {
         const next = new URL(location, url);
         await res.arrayBuffer();
+        if (i >= maxRedirects) throw new AgentLoginError('too many redirects at the application after the callback', 'callback_failed', res.status);
         if (next.protocol === 'http:' && url.protocol === 'https:') throw new AgentLoginError('redirect downgraded to http', 'insecure_redirect');
         if (next.host !== host) return { status: res.status, url: `${url.origin}${url.pathname}`, body: '', headers: res.headers }; // do not leave the application
         url = next;

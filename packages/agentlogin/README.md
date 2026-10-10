@@ -30,6 +30,12 @@ await al.follow(result);                       // completes the application's si
 const me = await al.fetch('https://app.example.org/api/me');
 ```
 
+If the Issuer requires the agent's owner to approve, `login` prints `The agent's owner must approve this sign-in;
+waiting.` on stderr and blocks, polling the Issuer, until the owner approves or refuses or the limit is reached (600 s
+by default, `--timeout SECONDS`). A refusal or a timeout exits 1 with the reason. The sign-in is refused when its
+callback goes to a host other than the login URL's; name that host with `--site` (and `--accept-host` for further
+ones) when the application's callback lives elsewhere.
+
 `signInAt` starts at the application as Section 5.8 describes: it appends `iss` and `login_hint`, keeps the
 application's cookies, and takes the Authentication Request the application redirects to. If you already hold an
 Authentication Request URL, use `signIn({ authorizationUrl, expectedHost })` (CLI: `--authorization-url --site`).

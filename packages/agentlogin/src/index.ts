@@ -1,5 +1,5 @@
 export { AgentLogin, AgentLoginError } from './client.js';
-export type { AgentLoginOptions, SignInOptions, SignInAtOptions, SignInResult, FollowResult, TransactionResource, TransactionSummary } from './client.js';
+export type { AgentLoginOptions, SignInOptions, SignInAtOptions, SignInResult, FollowResult, TransactionResource, TransactionView, TransactionSummary } from './client.js';
 export { FileKeystore, MemoryKeystore, agentloginHome } from './keystore.js';
 export type { Keystore, StoredKey } from './keystore.js';
 export { FileCookieJar, MemoryCookieJar } from './cookies.js';

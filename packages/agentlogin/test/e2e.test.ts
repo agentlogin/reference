@@ -92,6 +92,15 @@ test('agent signs in to a relying party end to end', async () => {
     const me = (await (await al.fetch(`${rpUrl}/me`)).json()) as { email: string; sub: string };
     assert.equal(me.email, 'scout@example.com');
 
+    // Errors and callbacks never carry the challenge, tokens or URLs.
+    const loginX = await fetch(`${rpUrl}/login`, { redirect: 'manual' });
+    const wrong = await al.signIn({ authorizationUrl: loginX.headers.get('location')!, expectedHost: 'attacker.example' }).catch((e: unknown) => e as AgentLoginError);
+    const dumped = JSON.stringify(wrong) + JSON.stringify((wrong as AgentLoginError).resource);
+    for (const secret of ['session_token', 'transaction_token', 'challenge', '/assertion', '/continue/']) assert.equal(dumped.includes(secret), false, `error exposes ${secret}`);
+    assert.equal((wrong as AgentLoginError).resource?.redirect_host, new URL(rpUrl).host);
+    // A URL at the Issuer that is not the authorization endpoint is refused before any request is made.
+    await assert.rejects(al.signIn({ authorizationUrl: `${issuerUrl}/transactions/abc`, expectedHost: new URL(rpUrl).host }), (e: unknown) => e instanceof AgentLoginError && e.code === 'wrong_issuer');
+
     // Second sign-in: the Consent Record makes the review unnecessary and the sub is stable.
     const login3 = await fetch(`${rpUrl}/login`, { redirect: 'manual' });
     let reviewed = false;
