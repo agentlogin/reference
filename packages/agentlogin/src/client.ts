@@ -168,7 +168,7 @@ export class AgentLogin {
       else {
         const found = await lookupIssuer(this.handle, this.disc);
         issuer = found.issuer;
-        this.located = { issuer, until: Date.now() + Math.min(found.maxAge ?? 300, 300) * 1000 };
+        this.located = { issuer, until: Date.now() + Math.min(found.maxAge, 300) * 1000 };
       }
       const metadata = await fetchMetadata(issuer, this.disc);
       if (this.opts.issuer) {

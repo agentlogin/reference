@@ -180,7 +180,7 @@ export class RelyingParty {
     } catch (e) {
       throw new RelyingPartyError('discovery_failed', `could not find the Issuer for ${h.domain}`, undefined, { cause: e });
     }
-    const ttl = Math.min(found.maxAge ?? 300, T_CACHE);
+    const ttl = Math.min(found.maxAge, T_CACHE);
     if (ttl > 0) {
       if (this.discoveryCache.size >= 5000) this.discoveryCache.delete(this.discoveryCache.keys().next().value!);
       this.discoveryCache.set(h.handle, { issuer: found.issuer, until: Date.now() + ttl * 1000 });
@@ -395,7 +395,7 @@ export class RelyingParty {
       const parsed: unknown = JSON.parse(r.body.toString('utf8'));
       if (!isObject(parsed) || !Array.isArray(parsed.keys) || !parsed.keys.every(isObject)) throw new Error('not a JWK Set');
       jwks = parsed as unknown as JSONWebKeySet;
-      ttl = freshness(r.headers['cache-control'], 300);
+      ttl = freshness(r.headers, 300);
     } catch (e) {
       throw new RelyingPartyError('discovery_failed', 'JWK Set unavailable', undefined, { cause: e });
     }

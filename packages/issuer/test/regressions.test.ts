@@ -4,14 +4,15 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash, randomBytes } from 'node:crypto';
 import { SignJWT, calculateJwkThumbprint, exportJWK, generateKeyPair, decodeJwt, type CryptoKey, type JWK } from 'jose';
-import { createIssuer } from '../src/index.js';
+import { createIssuer, MemoryStore, type Store } from '../src/index.js';
+import { snapshotting } from './stores.js';
 
 const ISS = 'https://issuer.test';
 const rnd = (n = 16) => randomBytes(n).toString('base64url');
 
-async function world(opts: { name?: string | null; constants?: Record<string, number> } = {}) {
+async function world(opts: { name?: string | null; constants?: Record<string, number>; store?: Store } = {}) {
   let clock = Math.floor(Date.now() / 1000);
-  const { app, ctx } = await createIssuer({ issuer: ISS, handleDomains: ['example.com'], adminToken: 'admin', now: () => clock, constants: opts.constants });
+  const { app, ctx } = await createIssuer({ issuer: ISS, handleDomains: ['example.com'], adminToken: 'admin', now: () => clock, constants: opts.constants, store: opts.store });
   const req = async (method: string, path: string, o: { json?: unknown; form?: Record<string, string>; headers?: Record<string, string> } = {}) => {
     const headers: Record<string, string> = { accept: 'application/json', ...o.headers };
     let body: string | undefined;
@@ -201,4 +202,79 @@ test('#9 a requested Owner Claim that the Issuer cannot supply ends the sign-in 
   const c2 = await named.client();
   const ok = await named.signIn(c2, b, { scope: 'openid email owner_profile' });
   assert.equal(decodeJwt((await named.token(c2, ok.code, ok.verifier)).json.id_token).owner_name, 'Jane Doe');
+});
+
+test('cap: a completion racing another Agent\'s first sign-in cannot admit both', async () => {
+  // The window is between the two reads of the cap check (sign-ups so far, then transactions in flight). A store
+  // with database semantics and a hook after the first read puts the other Agent's completion exactly there.
+  let between: (() => Promise<void>) | undefined;
+  const db = snapshotting(new MemoryStore());
+  const store = new Proxy(db, {
+    get(target, prop, receiver) {
+      const v = Reflect.get(target, prop, receiver) as unknown;
+      if (prop !== 'signupsEver' || typeof v !== 'function') return v;
+      return async (...args: unknown[]) => {
+        const result = await (v as (...a: unknown[]) => unknown).apply(target, args);
+        const hook = between;
+        between = undefined;
+        if (hook) await hook();
+        return result;
+      };
+    },
+  });
+  const w = await world({ store });
+  const a = await w.agent('one@example.com');
+  const b = await w.agent('two@example.com');
+  const c = await w.client({ max_signups_per_owner: 1 });
+  const first = (await w.assertOn((await w.start(c)).tx, a, { accept_disclosure: true })).json;
+  assert.equal(first.status, 'ready');
+  const second = await w.start(c);
+  const turns = (n: number) => new Promise<void>((r) => { let i = 0; const tick = () => (i++ >= n ? r() : setImmediate(tick)); tick(); });
+  let completion: Promise<{ status: number }> | undefined;
+  between = async () => {
+    completion = w.cont(first); // the first Agent completes while the second is inside its cap check
+    await turns(200); // time enough to finish, if nothing makes it wait
+  };
+  const raced = (await w.assertOn(second.tx, b, { accept_disclosure: true })).json;
+  assert.ok(completion, 'the hook ran');
+  assert.equal((await completion!).status, 200);
+  assert.equal(raced.status, 'denied', `second Agent: ${raced.status}`);
+  assert.equal(raced.reason, 'signup_limit_reached');
+  assert.equal(await w.ctx.store.signupsEver(w.owner.owner_id, c.client_id), 1);
+});
+
+test('cap: an Agent that has an Account and another open transaction holds one place, not two', async () => {
+  const w = await world();
+  const a = await w.agent('one@example.com');
+  const b = await w.agent('two@example.com');
+  const c = await w.client({ max_signups_per_owner: 2 });
+  const t1 = (await w.assertOn((await w.start(c)).tx, a, { accept_disclosure: true })).json;
+  const t2 = (await w.assertOn((await w.start(c)).tx, a, { accept_disclosure: true })).json;
+  assert.equal(t2.status, 'ready');
+  assert.equal((await w.cont(t1)).status, 200); // the Account exists; t2 stays open
+  const other = (await w.assertOn((await w.start(c)).tx, b, { accept_disclosure: true })).json;
+  assert.equal(other.status, 'ready', `the Owner's second Agent under a cap of two: ${other.status} ${other.reason ?? ''}`);
+});
+
+test('a sign-in that ends denied does not renew the Consent Record', async () => {
+  const w = await world({ constants: { T_CONSENT: 1000 } });
+  const a = await w.agent('scout@example.com');
+  const strict = await w.client({ require_review: true });
+  // establish a record at a client that always demands a review
+  const first = (await w.assertOn((await w.start(strict)).tx, a, { accept_disclosure: true })).json;
+  await w.req('POST', first.next.url, { json: { decision: 'allow' }, headers: { authorization: `Bearer ${first.transaction_token}` } });
+  const record = async () => (await w.ctx.store.getConsent(a.handle, strict.client_id))!.lastUsedAt;
+  const t0 = await record();
+  w.advance(400);
+  const none = (await w.assertOn((await w.start(strict, { prompt: 'none' })).tx, a)).json;
+  assert.equal(none.reason, 'consent_required');
+  assert.equal(await record(), t0, 'prompt=none denial');
+  w.advance(100);
+  const refused = (await w.assertOn((await w.start(strict)).tx, a)).json;
+  await w.req('POST', refused.next.url, { json: { decision: 'deny' }, headers: { authorization: `Bearer ${refused.transaction_token}` } });
+  assert.equal(await record(), t0, 'review denied by the Agent');
+  w.advance(100);
+  const allowed = (await w.assertOn((await w.start(strict)).tx, a)).json;
+  await w.req('POST', allowed.next.url, { json: { decision: 'allow' }, headers: { authorization: `Bearer ${allowed.transaction_token}` } });
+  assert.equal(await record(), t0 + 600, 'a completed review renews it');
 });

@@ -52,7 +52,8 @@ The code-bearing redirect URL is returned from `signIn` for `follow` and is neve
 Keys live in `~/.agentlogin/keys.json` and cookies in `~/.agentlogin/cookies/<hash of the handle>.json`, one jar per
 agent: a session one agent obtained is never sent for another, and `Scout@example.com` and `scout@example.com` are
 different agents. Files are readable by you only, written atomically, and every change is locked across processes, so
-commands running at the same time lose nothing. Set `AGENTLOGIN_HOME` to move them. Nothing secret is printed: not
+commands running at the same time lose nothing. A lock left by a process that died is taken over; a process that was
+suspended long enough to lose its lock refuses to write when it resumes. Set `AGENTLOGIN_HOME` to move them. Nothing secret is printed: not
 credentials, keys, cookie values, tokens or the callback URL. `--json` gives machine-readable results and errors
 (`{"error": {"code", "message"}}`); the exit status is 0 only on success and 2 for usage errors.
 

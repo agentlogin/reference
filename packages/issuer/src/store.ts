@@ -114,6 +114,8 @@ export interface Transaction {
   deliverToSession: boolean;
   ownerApprovalOutstanding: boolean;
   reviewOutstanding: boolean;
+  /** The sign-in proceeds on the strength of an existing Consent Record; its last use is renewed when the transaction becomes ready. */
+  consentRelied?: boolean;
   passedCap: boolean; // passed step 9 without an existing Account (counts toward the cap, Section 7.6)
   // credentials (hashed) and the continue URL secret
   transactionTokenHash?: string;

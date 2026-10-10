@@ -2,13 +2,15 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { mkdtempSync, readFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, utimesSync, writeFileSync } from 'node:fs';
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { FileCookieJar, FileKeystore, acctUri, fetchMetadata, parseHandle, webfingerUrl } from '../src/index.js';
+import { FileCookieJar, FileKeystore, acctUri, fetchMetadata, freshness, parseHandle, safeFetch, webfingerUrl } from '../src/index.js';
+import { chainFreshness } from '../src/discovery.js';
+import { withFileLock, writePrivateJson } from '../src/files.js';
 
 const run = (file: string, args: string[], env: Record<string, string>) =>
   new Promise<{ code: number; stderr: string }>((resolve) => {
@@ -90,4 +92,103 @@ test('#8 the WebFinger query carries the acct URI with its userpart percent-enco
   }
   // On the wire the URI's own percent sign is encoded again: %23 becomes %2523.
   assert.ok(webfingerUrl('qa#bot@example.com').href.includes('resource=acct%3Aqa%2523bot%40example.com'));
+});
+
+const key = (kid: string) => ({ kid, handle: 'scout@example.com', issuer: 'https://issuer.example', privateJwk: { kty: 'EC' }, publicJwk: { kty: 'EC' }, createdAt: 0, status: 'active' as const });
+
+test('lock: a dead holder is taken over at once, and concurrent waiters lose nothing', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'al-dead-'));
+  const file = join(home, 'keys.json');
+  writeFileSync(`${file}.lock`, '999999:deadbeef', { mode: 0o600 }); // a holder that crashed: no such process
+  const started = Date.now();
+  await new FileKeystore(file).put(key('first'));
+  assert.ok(Date.now() - started < 5000, 'no waiting for a process that is gone');
+  // several processes arriving at a dead lock together
+  writeFileSync(`${file}.lock`, '999998:deadbeef', { mode: 0o600 });
+  const worker = fileURLToPath(new URL('./storage-worker.ts', import.meta.url));
+  const results = await Promise.all(Array.from({ length: 6 }, (_, i) => run(worker, [String(i), '10'], { AGENTLOGIN_HOME: home })));
+  for (const r of results) assert.equal(r.code, 0, r.stderr);
+  assert.equal((await new FileKeystore(file).list()).length, 61);
+  assert.equal(existsSync(`${file}.lock`), false);
+  assert.equal(existsSync(`${file}.lock.takeover`), false);
+});
+
+test('lock: a holder that was taken over neither writes nor removes the new holder\'s lock', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'al-lost-'));
+  const file = join(home, 'keys.json');
+  writePrivateJson(file, [key('kept')]);
+  await assert.rejects(
+    withFileLock(file, (guard) => {
+      // While this holder is inside its critical section, it is taken for dead and another process takes the lock.
+      writeFileSync(`${file}.lock`, `${process.pid}:someone-else`);
+      writePrivateJson(file, [key('stale-write')], guard);
+    }),
+    /lost the lock/,
+  );
+  assert.deepEqual((JSON.parse(readFileSync(file, 'utf8')) as Array<{ kid: string }>).map((k) => k.kid), ['kept'], 'nothing was written');
+  assert.equal(readFileSync(`${file}.lock`, 'utf8'), `${process.pid}:someone-else`, 'the new holder\'s lock is still there');
+});
+
+test('lock: a live holder that stopped refreshing its lock is taken over after the staleness threshold', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'al-stale-'));
+  const file = join(home, 'keys.json');
+  writeFileSync(`${file}.lock`, `${process.pid}:suspended`, { mode: 0o600 }); // this process is alive, so only age counts
+  await assert.rejects(Promise.race([new FileKeystore(file).put(key('early')), new Promise((_, reject) => setTimeout(() => reject(new Error('still waiting')), 600))]), /still waiting/, 'a fresh lock of a live holder is respected');
+  const old = new Date(Date.now() - 60_000);
+  utimesSync(`${file}.lock`, old, old);
+  await new FileKeystore(file).put(key('late'));
+  assert.ok((await new FileKeystore(file).list()).some((k) => k.kid === 'late'));
+});
+
+test('freshness follows the whole response: Age, Expires and malformed max-age', () => {
+  const now = new Date().toUTCString();
+  const cases: Array<[Record<string, string>, number]> = [
+    [{}, 300],
+    [{ 'cache-control': 'max-age=600' }, 600],
+    [{ 'cache-control': 'max-age=3600', age: '3600' }, 0],
+    [{ 'cache-control': 'max-age=3600', age: '3000' }, 600],
+    [{ 'cache-control': 'max-age="0"' }, 0],
+    [{ 'cache-control': 'max-age="120"' }, 120],
+    [{ 'cache-control': 'max-age=-1' }, 0],
+    [{ 'cache-control': 'max-age=abc' }, 0],
+    [{ 'cache-control': 'MAX-AGE=0' }, 0],
+    [{ 'cache-control': 'max-age=60, no-cache' }, 0],
+    [{ 'cache-control': 'private, must-revalidate, max-age=0' }, 0],
+    [{ 'cache-control': 'max-age=999999999' }, 86400],
+    [{ expires: '0' }, 0],
+    [{ expires: 'Thu, 01 Jan 1970 00:00:00 GMT' }, 0],
+    [{ expires: now, date: now }, 0],
+    [{ expires: new Date(Date.now() + 120_000).toUTCString(), date: now }, 120],
+    [{ 'cache-control': 'private', expires: '-1' }, 0],
+  ];
+  for (const [headers, want] of cases) assert.equal(freshness(headers, 300), want, JSON.stringify(headers));
+  assert.equal(freshness({ 'cache-control': ['max-age=600', 'no-store'] }, 300), 0, 'several header lines');
+});
+
+test('WebFinger delegation by redirect: the redirect\'s caching terms bound the result', async () => {
+  // The delegating host answers with a redirect; its target says "keep this for a day".
+  let redirectHeaders: Record<string, string> = {};
+  const second = http.createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'application/jrd+json', 'cache-control': 'max-age=86400' });
+    res.end(JSON.stringify({ links: [{ rel: 'http://openid.net/specs/connect/1.0/issuer', href: 'https://issuer.example' }] }));
+  });
+  await new Promise<void>((r) => second.listen(0, '127.0.0.1', r));
+  const target = `http://127.0.0.1:${(second.address() as AddressInfo).port}/.well-known/webfinger`;
+  const first = http.createServer((_req, res) => { res.writeHead(302, { location: target, ...redirectHeaders }); res.end(); });
+  await new Promise<void>((r) => first.listen(0, '127.0.0.1', r));
+  const start = `http://127.0.0.1:${(first.address() as AddressInfo).port}/.well-known/webfinger`;
+  try {
+    for (const [headers, want] of [[{}, 0], [{ 'cache-control': 'no-store' }, 0], [{ 'cache-control': 'max-age=0' }, 0], [{ 'cache-control': 'max-age=30' }, 30]] as Array<[Record<string, string>, number]>) {
+      redirectHeaders = headers;
+      const res = await safeFetch(start, { maxBytes: 65536, timeoutMs: 5000, allowPrivate: true, maxRedirects: 5 });
+      assert.equal(res.status, 200);
+      assert.equal(res.redirects.length, 1, 'the redirect hop is reported');
+      assert.equal(chainFreshness(res, 300), want, JSON.stringify(headers));
+    }
+    // without a redirect the target's own terms apply
+    assert.equal(chainFreshness(await safeFetch(target, { maxBytes: 65536, timeoutMs: 5000, allowPrivate: true }), 300), 86400);
+  } finally {
+    await new Promise<void>((r) => second.close(() => r()));
+    await new Promise<void>((r) => first.close(() => r()));
+  }
 });

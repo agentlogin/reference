@@ -6,14 +6,45 @@
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
-  "exports": { ".": "./dist/index.js" },
-  "bin": { "agentlogin": "bin/agentlogin.js" },
-  "files": ["dist", "bin", "README.md"],
-  "repository": { "type": "git", "url": "git+https://github.com/agentlogin/reference.git", "directory": "packages/agentlogin" },
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "bin": {
+    "agentlogin": "bin/agentlogin.js"
+  },
+  "files": [
+    "dist",
+    "bin",
+    "README.md"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/agentlogin/reference.git",
+    "directory": "packages/agentlogin"
+  },
   "homepage": "https://agentlogin.dev",
-  "bugs": { "url": "https://github.com/agentlogin/spec/issues" },
-  "keywords": ["agent", "login", "oidc", "openid-connect", "ai-agents", "identity", "webfinger"],
-  "dependencies": { "jose": "^6.1.0" },
-  "engines": { "node": ">=22.12" },
-  "publishConfig": { "access": "public" }
+  "bugs": {
+    "url": "https://github.com/agentlogin/spec/issues"
+  },
+  "keywords": [
+    "agent",
+    "login",
+    "oidc",
+    "openid-connect",
+    "ai-agents",
+    "identity",
+    "webfinger"
+  ],
+  "dependencies": {
+    "jose": "^6.1.0"
+  },
+  "engines": {
+    "node": ">=22.12"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "prepack": "tsc -b"
+  }
 }

@@ -190,9 +190,23 @@ async function writeConsent(ctx: IssuerContext, tx: Transaction, client: Client)
   });
 }
 
-function setReady(ctx: IssuerContext, tx: Transaction): void {
+const capKey = (ownerId: string, clientId: string) => `cap:${ownerId}\u0000${clientId}`;
+
+/**
+ * The one place where a transaction becomes `ready`. A Consent Record that let the sign-in through without a new
+ * acceptance is used at this moment, and only now is its last use renewed: a sign-in that ends denied, by
+ * prompt=none, by the Owner or by the Agent at a forced review, leaves the record's clock alone (Section 6.4).
+ */
+async function becomeReady(ctx: IssuerContext, tx: Transaction): Promise<void> {
   tx.status = 'ready';
   tx.continueSecret ??= randomSecret();
+  if (tx.consentRelied) {
+    const consent = await ctx.store.getConsent(tx.handle!, tx.clientId);
+    if (consent) {
+      consent.lastUsedAt = ctx.now();
+      await ctx.store.putConsent(consent);
+    }
+  }
 }
 
 /**
@@ -300,15 +314,20 @@ export async function assert(ctx: IssuerContext, tx: Transaction, client: Client
     // Checked and reserved under one lock per (Owner, client), so that concurrent first sign-ins cannot both take the
     // last place. A place is held by an Agent, not by a transaction: several transactions of one Agent hold one, and
     // a transaction that has expired holds none, whether or not anyone has read it since.
-    const admitted = await ctx.locks.run(`cap:${agent.ownerId}\u0000${tx.clientId}`, async () => {
+    // The same lock covers a completion (see `cont`), which turns a reservation into an Account: without it a
+    // completion could fall between the two reads below and both it and this Agent would be admitted.
+    const admitted = await ctx.locks.run(capKey(agent.ownerId, tx.clientId), async () => {
       const ever = await ctx.store.signupsEver(agent.ownerId, tx.clientId);
       const now = ctx.now();
-      const others = new Set(
+      const inFlight = new Set(
         (await ctx.store.listOpenTransactions({ ownerId: agent.ownerId, clientId: tx.clientId }))
-          .filter((t) => t.passedCap && t.id !== tx.id && now < t.expiresAt && t.handle !== agent.handle)
-          .map((t) => t.handle),
+          .filter((t) => t.passedCap && t.id !== tx.id && now < t.expiresAt && t.handle !== undefined && t.handle !== agent.handle)
+          .map((t) => t.handle!),
       );
-      if (ever + others.size >= max) return false;
+      // An Agent that has an Account by now is already in `ever`: its other open transactions hold no further place.
+      let others = 0;
+      for (const handle of inFlight) if (!(await ctx.store.getAccount(handle, tx.clientId))) others += 1;
+      if (ever + others >= max) return false;
       tx.passedCap = true;
       await ctx.store.putTransaction(tx); // the reservation is stored before the lock is released
       return true;
@@ -338,10 +357,7 @@ export async function assert(ctx: IssuerContext, tx: Transaction, client: Client
   const recordOutstanding = record !== null && !tx.acceptDisclosure;
   tx.reviewOutstanding = recordOutstanding || forced !== null;
   tx.consentReason = (recordOutstanding ? record : forced) ?? undefined;
-  if (consent && record === null) {
-    consent.lastUsedAt = ctx.now(); // the record is used by this sign-in: T_CONSENT runs from the last use (Section 1.5)
-    await ctx.store.putConsent(consent);
-  }
+  tx.consentRelied = consent !== undefined && record === null; // renewed when, and only if, the transaction becomes ready
   if (tx.prompt === 'none' && tx.reviewOutstanding) {
     setTerminal(ctx, tx, 'denied', 'consent_required');
   } else if (tx.prompt === 'none' && tx.ownerApprovalOutstanding) {
@@ -352,7 +368,7 @@ export async function assert(ctx: IssuerContext, tx: Transaction, client: Client
       tx.status = 'awaiting_owner';
       tx.expiresAt = Math.max(tx.expiresAt, tx.createdAt + ctx.constants.T_OWNER); // Section 6.6
     } else if (tx.reviewOutstanding) tx.status = 'awaiting_consent';
-    else setReady(ctx, tx);
+    else await becomeReady(ctx, tx);
   }
   await ctx.store.putTransaction(tx);
   return token;
@@ -370,7 +386,7 @@ export async function review(ctx: IssuerContext, tx: Transaction, client: Client
     await writeConsent(ctx, tx, client);
     tx.reviewOutstanding = false;
     if (tx.ownerApprovalOutstanding) tx.status = 'awaiting_owner';
-    else setReady(ctx, tx);
+    else await becomeReady(ctx, tx);
   }
   await ctx.store.putTransaction(tx);
 }
@@ -385,7 +401,7 @@ export async function ownerDecision(ctx: IssuerContext, tx: Transaction, ownerId
   else {
     tx.ownerApprovalOutstanding = false;
     if (tx.reviewOutstanding) tx.status = 'awaiting_consent';
-    else setReady(ctx, tx);
+    else await becomeReady(ctx, tx);
   }
   await ctx.store.putTransaction(tx);
 }
@@ -418,11 +434,15 @@ export async function cont(ctx: IssuerContext, tx: Transaction, secret: string, 
       voided: false,
     });
     tx.codeIssued = true;
-    setTerminal(ctx, tx, 'completed');
-    // Section 7.4: the Account is created or updated at the first completed transaction.
-    // One atomic store operation: concurrent first completions create one Account and count one sign-up (Section 7.6).
-    await ctx.store.recordSignIn({ handle: tx.handle!, clientId: tx.clientId, ownerId: tx.ownerId!, now: ctx.now() });
-    await ctx.store.putTransaction(tx);
+    // Section 7.4: the Account is created or updated at the first completed transaction. Under the cap lock: the
+    // completion ends this transaction's reservation and creates the Account in one step as far as any cap check is
+    // concerned (Section 7.6). recordSignIn is itself atomic, so concurrent first completions create one Account and
+    // count one sign-up.
+    await ctx.locks.run(capKey(tx.ownerId!, tx.clientId), async () => {
+      setTerminal(ctx, tx, 'completed');
+      await ctx.store.recordSignIn({ handle: tx.handle!, clientId: tx.clientId, ownerId: tx.ownerId!, now: ctx.now() });
+      await ctx.store.putTransaction(tx);
+    });
     u.searchParams.set('code', code);
     return { redirect: u.href };
   }

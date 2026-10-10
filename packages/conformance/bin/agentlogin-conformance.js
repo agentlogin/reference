@@ -1,12 +1,19 @@
 #!/usr/bin/env node
-// Prefers the compiled build; from a repository checkout without a build it runs the TypeScript source through tsx.
+// In a repository checkout the TypeScript source is present and is what runs (through tsx), so a build that is older
+// than the source is never used by mistake. An installed package ships no source and runs its compiled build.
+import { existsSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+
+const here = (p) => fileURLToPath(new URL(p, import.meta.url));
 let cli;
-try {
-  cli = await import('../dist/cli.js');
-} catch (e) {
-  if (e?.code !== 'ERR_MODULE_NOT_FOUND') throw e;
+if (existsSync(here('../src/cli.ts'))) {
   const { register } = await import('tsx/esm/api');
   register();
   cli = await import('../src/cli.ts');
+} else if (existsSync(here('../dist/cli.js'))) {
+  cli = await import('../dist/cli.js');
+} else {
+  console.error('agentlogin-conformance: no build found (dist/cli.js is missing); reinstall the package');
+  process.exit(1);
 }
 await cli.main(process.argv.slice(2));

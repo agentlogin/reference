@@ -38,7 +38,7 @@ export class FileKeystore implements Keystore {
   constructor(public readonly path: string = join(agentloginHome(), 'keys.json')) {}
   private read(): StoredKey[] { return readPrivateJson<StoredKey[]>(this.path, []); }
   private change(fn: (keys: StoredKey[]) => StoredKey[]): Promise<void> {
-    return withFileLock(this.path, () => writePrivateJson(this.path, fn(this.read())));
+    return withFileLock(this.path, (guard) => writePrivateJson(this.path, fn(this.read()), guard));
   }
   async list(handle?: string) { return this.read().filter((k) => !handle || k.handle === handle); }
   async get(kid: string) { return this.read().find((k) => k.kid === kid); }

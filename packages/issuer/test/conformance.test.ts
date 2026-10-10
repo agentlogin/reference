@@ -5,6 +5,7 @@ import { serve } from '@hono/node-server';
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { createIssuer, MemoryStore, type Store } from '../src/index.js';
+import { snapshotting } from './stores.js';
 import { runConformance } from '../../conformance/src/index.js';
 
 async function listen(handler: http.RequestListener): Promise<{ url: string; port: number; close: () => Promise<void> }> {
@@ -24,44 +25,6 @@ const json = (res: http.ServerResponse, body: unknown) => {
   res.writeHead(200, { 'content-type': 'application/json' });
   res.end(JSON.stringify(body));
 };
-
-/**
- * A store whose every operation completes on a later turn of the event loop, as one backed by a database does. The
- * in-memory store answers within the same turn, which hides races between concurrent requests: with it, a handler
- * is never interrupted between two store operations.
- */
-function yielding(store: Store): Store {
-  return new Proxy(store, {
-    get(target, prop, receiver) {
-      const v = Reflect.get(target, prop, receiver) as unknown;
-      if (typeof v !== 'function') return v;
-      return async (...args: unknown[]) => {
-        await new Promise((r) => setImmediate(r));
-        return (v as (...a: unknown[]) => unknown).apply(target, args);
-      };
-    },
-  });
-}
-
-/**
- * Database semantics in full: every read returns a copy taken at the time of the query, every write stores a copy,
- * and each operation completes on a later turn. Nothing is shared by reference between two requests, so a handler
- * that changes an object without writing it back, or that acts on a stale read, shows.
- */
-function snapshotting(store: Store): Store {
-  const copy = <T>(v: T): T => (v === undefined ? v : structuredClone(v));
-  return new Proxy(store, {
-    get(target, prop, receiver) {
-      const v = Reflect.get(target, prop, receiver) as unknown;
-      if (typeof v !== 'function') return v;
-      return async (...args: unknown[]) => {
-        const result = await (v as (...a: unknown[]) => unknown).apply(target, args.map(copy));
-        await new Promise((r) => setImmediate(r));
-        return copy(result);
-      };
-    },
-  });
-}
 
 async function conformanceRun(store?: Store): Promise<void> {
   // Open Client metadata documents hosted by the test (Section 4.2); dev mode permits loopback http. Besides the valid
@@ -138,5 +101,5 @@ async function conformanceRun(store?: Store): Promise<void> {
 }
 
 test('reference issuer passes the conformance harness', () => conformanceRun());
-test('reference issuer passes the conformance harness with a store that yields like a database', () => conformanceRun(yielding(new MemoryStore())));
-test('reference issuer passes the conformance harness with a store that returns copies, as a database does', () => conformanceRun(snapshotting(new MemoryStore())));
+// The same run against a store with the timing and copy semantics of a database: the in-memory store hides races.
+test('reference issuer passes the conformance harness with a store that behaves like a database', () => conformanceRun(snapshotting(new MemoryStore())));

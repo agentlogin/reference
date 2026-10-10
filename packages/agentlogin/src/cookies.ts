@@ -75,6 +75,6 @@ export class FileCookieJar extends MemoryCookieJar {
   }
   protected override async load(): Promise<Cookie[]> { return readPrivateJson<Cookie[]>(this.path, []); }
   protected override async update(fn: (all: Cookie[]) => Cookie[]): Promise<void> {
-    await withFileLock(this.path, () => writePrivateJson(this.path, fn(readPrivateJson<Cookie[]>(this.path, []))));
+    await withFileLock(this.path, (guard) => writePrivateJson(this.path, fn(readPrivateJson<Cookie[]>(this.path, [])), guard));
   }
 }

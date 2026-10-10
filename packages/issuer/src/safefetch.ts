@@ -28,6 +28,8 @@ export interface SafeFetchResult {
   status: number;
   headers: http.IncomingHttpHeaders;
   body: Buffer;
+  /** Status and headers of every redirect that was followed, in order. Their caching terms bound the result's too. */
+  redirects: Array<{ status: number; headers: http.IncomingHttpHeaders }>;
 }
 
 const V4_BLOCKED: Array<[number, number]> = [
@@ -122,7 +124,7 @@ function one(url: URL, o: SafeFetchOptions): Promise<SafeFetchResult> {
           }
           chunks.push(c);
         });
-        res.on('end', () => resolve({ url: url.href, status: res.statusCode ?? 0, headers: res.headers, body: Buffer.concat(chunks) }));
+        res.on('end', () => resolve({ url: url.href, status: res.statusCode ?? 0, headers: res.headers, body: Buffer.concat(chunks), redirects: [] }));
         res.on('error', reject);
       },
     );
@@ -139,6 +141,7 @@ export async function safeFetch(input: string | URL, o: SafeFetchOptions): Promi
   const deadline = Date.now() + o.timeoutMs;
   let url = new URL(input);
   let hops = 0;
+  const redirects: SafeFetchResult['redirects'] = [];
   for (;;) {
     const remaining = deadline - Date.now();
     if (remaining <= 0) throw new Error('fetch timed out');
@@ -146,9 +149,10 @@ export async function safeFetch(input: string | URL, o: SafeFetchOptions): Promi
     const isGet = (o.method ?? 'GET').toUpperCase() === 'GET';
     if (isGet && res.status >= 300 && res.status < 400 && (o.maxRedirects ?? 0) > hops && res.headers.location) {
       hops += 1;
+      redirects.push({ status: res.status, headers: res.headers });
       url = new URL(res.headers.location, url);
       continue;
     }
-    return res;
+    return { ...res, redirects };
   }
 }

@@ -32,12 +32,35 @@ const ENDPOINTS = ['authorization_endpoint', 'token_endpoint', 'userinfo_endpoin
 const T_CACHE = 86_400; // seconds, Section 1.5
 const cache = new Map<string, { value: IssuerMetadata; until: number }>();
 
-/** Freshness lifetime in seconds that a response allows: 0 for no-store or no-cache, max-age capped at T_CACHE, `fallback` when it states none. */
-export function freshness(cacheControl: string | string[] | undefined, fallback: number): number {
-  const cc = String(cacheControl ?? '');
+type Headers = Record<string, string | string[] | undefined>;
+const first = (v: string | string[] | undefined): string | undefined => (Array.isArray(v) ? v.join(', ') : v);
+
+/**
+ * Freshness lifetime in seconds that a response allows (RFC 9111 Section 4.2), capped at T_CACHE: 0 for no-store or
+ * no-cache; otherwise max-age less Age; otherwise Expires less Date; `fallback` only when the response states
+ * neither. A max-age or Expires that does not parse means the response is already stale.
+ */
+export function freshness(headers: Headers, fallback: number): number {
+  const cc = first(headers['cache-control']) ?? '';
   if (/(?:^|,)\s*(?:no-store|no-cache)\b/i.test(cc)) return 0;
-  const m = /(?:^|,)\s*max-age=(\d+)/i.exec(cc);
-  return Math.min(m ? Number(m[1]) : fallback, T_CACHE);
+  const age = Math.max(0, Number.parseInt(first(headers.age) ?? '0', 10) || 0);
+  const m = /(?:^|,)\s*max-age\s*=\s*("?)([^",]*)\1/i.exec(cc);
+  if (m) {
+    const value = m[2]!.trim();
+    return /^\d+$/.test(value) ? Math.max(0, Math.min(Number(value), T_CACHE) - age) : 0;
+  }
+  const expires = first(headers.expires);
+  if (expires !== undefined) {
+    const at = Date.parse(expires);
+    if (Number.isNaN(at)) return 0;
+    const date = Date.parse(first(headers.date) ?? '');
+    return Math.max(0, Math.min(Math.floor((at - (Number.isNaN(date) ? Date.now() : date)) / 1000), T_CACHE) - age);
+  }
+  return Math.min(fallback, T_CACHE);
+}
+/** Freshness of a result reached through redirects: the shortest of all hops. A redirect that states nothing is not reused. */
+export function chainFreshness(res: { headers: Headers; redirects: Array<{ headers: Headers }> }, fallback: number): number {
+  return Math.min(freshness(res.headers, fallback), ...res.redirects.map((r) => freshness(r.headers, 0)));
 }
 
 /** The WebFinger request for a handle (Section 2.2): the acct URI, itself percent-encoded, as the `resource` value. */
@@ -56,7 +79,7 @@ export async function discoverIssuer(handle: string, o: DiscoveryOptions = {}): 
 }
 
 /** As discoverIssuer, with the freshness lifetime the WebFinger response allows (seconds; undefined when it states none). */
-export async function lookupIssuer(handle: string, o: DiscoveryOptions = {}): Promise<{ issuer: string; maxAge?: number }> {
+export async function lookupIssuer(handle: string, o: DiscoveryOptions = {}): Promise<{ issuer: string; maxAge: number }> {
   const h = parseHandle(handle);
   if (!h) throw new Error(`not a handle: ${handle}`);
   const url = webfingerUrl(h.handle, o);
@@ -70,8 +93,9 @@ export async function lookupIssuer(handle: string, o: DiscoveryOptions = {}): Pr
   }
   const link = (jrd.links ?? []).find((l) => l.rel === REL);
   if (!link?.href) throw new Error(`no issuer link for ${h.handle}`);
-  const cc = res.headers['cache-control'];
-  return { issuer: checkIssuerIdentifier(link.href, o), maxAge: cc === undefined ? undefined : freshness(cc, 300) };
+  // The lifetime the whole exchange allows, delegating redirects included: a domain that withdraws or re-points its
+  // delegation must not stay bound to the old Issuer for as long as the old target said.
+  return { issuer: checkIssuerIdentifier(link.href, o), maxAge: chainFreshness(res, 300) };
 }
 
 /** An Issuer Identifier is an https URL without query or fragment; it is compared as a string, never normalised. */
@@ -108,7 +132,7 @@ export async function fetchMetadata(issuer: string, o: DiscoveryOptions = {}): P
   }
   if (!Array.isArray(m.handle_domains) || !Array.isArray(m.agent_key_algs_supported)) throw new Error('metadata lacks Agent Login members');
   cache.delete(key);
-  const ttl = freshness(res.headers['cache-control'], 300);
+  const ttl = freshness(res.headers, 300);
   if (ttl > 0) {
     if (cache.size >= 200) cache.delete(cache.keys().next().value!); // bounded: identifiers can be chosen by whoever presents a handle
     cache.set(key, { value: m, until: Date.now() + ttl * 1000 });
