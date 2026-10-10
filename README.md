@@ -17,3 +17,5 @@ Status: scaffold. The specification is at draft 0.1; code lands milestone by mil
 | `packages/issuer` | Reference issuer built on node-oidc-provider |
 | `packages/rp` | Relying-party helpers and the sign-in button |
 | `packages/conformance` | Conformance harness |
+
+Package names: npm `agentlogin` (reserved), PyPI `agent-login` (the name `agentlogin` is held by an unrelated 2019 project), crates.io `agentlogin` (free, not reserved).
