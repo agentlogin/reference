@@ -4,20 +4,28 @@
   "version": "0.1.0",
   "description": "Reference implementation of the Agent Login specification",
   "license": "Apache-2.0",
-  "workspaces": ["packages/*"],
+  "workspaces": [
+    "packages/*",
+    "examples/*"
+  ],
   "type": "module",
   "scripts": {
-    "build": "tsc -b packages/issuer packages/conformance packages/agentlogin",
-    "typecheck": "tsc -b packages/issuer packages/conformance packages/agentlogin --noEmit",
-    "test": "node --import tsx --test packages/issuer/test/*.test.ts packages/agentlogin/test/*.test.ts",
+    "build": "tsc -b packages/issuer packages/conformance packages/agentlogin packages/rp",
+    "typecheck": "npm run build",
+    "test": "npm run build && node --import tsx --test packages/issuer/test/*.test.ts packages/agentlogin/test/*.test.ts packages/rp/test/*.test.ts",
     "issuer": "node --import tsx packages/issuer/src/server.ts",
     "conformance": "node --import tsx packages/conformance/bin/agentlogin-conformance.ts",
-    "agentlogin": "node --import tsx packages/agentlogin/src/cli.ts"
+    "agentlogin": "node packages/agentlogin/bin/agentlogin.js",
+    "example": "node --import tsx examples/rp-hono/server.ts"
   },
   "devDependencies": {
     "@types/node": "^22.18.0",
     "tsx": "^4.20.0",
-    "typescript": "^5.9.0"
+    "typescript": "^5.9.0",
+    "@hono/node-server": "^1.19.0",
+    "hono": "^4.9.0"
   },
-  "engines": { "node": ">=22.12" }
+  "engines": {
+    "node": ">=22.12"
+  }
 }

@@ -9,7 +9,7 @@ JSON path and the wait-page path. The specification is at draft 0.1; code lands 
 
 1. Issuer core and conformance harness. Done except Ed25519 keys, `private_key_jwt`, rate limits and Owner
    authentication pages; see `packages/issuer/README.md`.
-2. Relying-party kit: Better Auth helper, Clerk/Supabase/Auth0 guides, example app.
+2. Relying-party kit. `@agentlogin/rp` done (10 Oct 2026): framework-agnostic core, web-standard handlers, sign-in form, example application (`examples/rp-hono`), tests against the issuer and the agent client. Better Auth, Auth.js, Clerk, Supabase and Auth0 guides are open and will be written against tested configurations.
 3. Agent CLI, SDKs and MCP server. CLI + TypeScript library done (10 Oct 2026, end-to-end test against the issuer and a stub relying party); Python SDK and MCP server open.
 4. Federation: WebFinger discovery, relay, Docker image and one-click templates.
 
@@ -17,16 +17,17 @@ JSON path and the wait-page path. The specification is at draft 0.1; code lands 
 | --- | --- |
 | `packages/agentlogin` | Agent CLI and client library (npm `agentlogin`): discovery, enrollment, sign-in, cookie jar |
 | `packages/issuer` | Reference issuer (Hono + jose, written to the spec section by section) |
-| `packages/rp` | Relying-party helpers and the sign-in button |
+| `packages/rp` | Relying-party kit (`@agentlogin/rp`): validation per Sections 5.7 and 2.5, handlers, sign-in form |
+| `examples/rp-hono` | A runnable application that accepts agent sign-ins |
 | `packages/conformance` | Conformance harness |
 
 Development:
 
 ```bash
 npm install
-npm test            # starts the issuer on a loopback port and runs the conformance harness against it
+npm test            # builds, then runs the conformance harness against the issuer and the client and kit end to end
 npm run issuer      # local issuer at http://localhost:3000 (development mode)
-npm run typecheck
+npm run example     # example application at http://localhost:4000 (see examples/rp-hono/README.md)
 ```
 
 The issuer is written from scratch rather than on node-oidc-provider: the Sign-in Transaction (status, next step,

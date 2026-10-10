@@ -28,9 +28,30 @@ export interface TransactionResource {
   [k: string]: unknown;
 }
 
+/** What an error may carry about a transaction: no challenge, tokens or URLs (Section 6 forbids those in logs and tool output). */
+export interface TransactionSummary {
+  transaction_id?: string;
+  status?: string;
+  reason?: string;
+  consent_reason?: string;
+  redirect_host?: string;
+  client_id?: string;
+  expires_at?: number;
+}
+function summarize(r: unknown): TransactionSummary | undefined {
+  if (typeof r !== 'object' || r === null) return undefined;
+  const t = r as Partial<TransactionResource>;
+  if (typeof t.transaction_id !== 'string' && typeof t.status !== 'string') return undefined;
+  return { transaction_id: t.transaction_id, status: t.status, reason: t.reason, consent_reason: t.consent_reason, redirect_host: t.client?.redirect_host, client_id: t.client?.client_id, expires_at: t.expires_at };
+}
+
 export class AgentLoginError extends Error {
-  constructor(message: string, public readonly code: string, public readonly status?: number, public readonly resource?: TransactionResource) {
+  /** A redacted view of the transaction, safe to log. */
+  public readonly resource?: TransactionSummary;
+  constructor(message: string, public readonly code: string, public readonly status?: number, resource?: unknown) {
     super(message);
+    this.name = 'AgentLoginError';
+    this.resource = summarize(resource);
   }
 }
 
@@ -42,6 +63,8 @@ export interface AgentLoginOptions {
   issuer?: string;
   /** Development only: http issuers, loopback addresses. */
   allowInsecure?: boolean;
+  /** Per-request timeout, default 10 s. */
+  timeoutMs?: number;
   log?: (message: string) => void;
 }
 export interface SignInOptions {
@@ -67,10 +90,23 @@ export interface SignInResult {
   issuer: string;
   client: TransactionResource['client'];
   scopes: string[];
-  /** The code-bearing redirect URL. Keep it out of prompts, tool output and logs (A-9); pass it to follow(). */
-  redirectUrl: string;
+  /**
+   * The code-bearing redirect URL. Keep it out of prompts, tool output and logs (A-9); pass the result to follow().
+   * The property is non-enumerable, so JSON.stringify and console.log of the result do not show it.
+   */
+  readonly redirectUrl: string;
 }
-export interface FollowResult { status: number; url: string; body: string; headers: Headers }
+export interface FollowResult {
+  status: number;
+  /** Final URL without its query string: the callback's query carries the code. */
+  url: string;
+  body: string;
+  headers: Headers;
+}
+export interface SignInAtOptions extends Omit<SignInOptions, 'authorizationUrl'> {
+  /** Append `iss` and `login_hint` as Section 5.8 defines for an `initiate_login_uri`. Default true. */
+  sendIssAndLoginHint?: boolean;
+}
 
 export class AgentLogin {
   readonly handle: string;
@@ -162,15 +198,25 @@ export class AgentLogin {
   // ---- sign-in (Sections 5, 6) -------------------------------------------------------------------------
   async signIn(o: SignInOptions): Promise<SignInResult> {
     const { issuer, metadata } = await this.discover();
-    const authUrl = new URL(o.authorizationUrl);
-    if (authUrl.origin !== new URL(metadata.authorization_endpoint).origin) {
-      throw new AgentLoginError(`authorization URL is not at this Agent's Issuer (${issuer})`, 'wrong_issuer');
+    let authUrl: URL;
+    try {
+      authUrl = new URL(o.authorizationUrl);
+    } catch {
+      throw new AgentLoginError('authorizationUrl is not a URL', 'invalid_request');
     }
-    // A transaction this client starts itself: the Authentication Request is sent by the client (Section 5.3 JSON path).
+    // A transaction this client starts itself (Section 6.3): its own Authentication Request, sent to the published
+    // authorization_endpoint and answered on the JSON path of Section 5.3. Any other URL at the Issuer, for example a
+    // Transaction Resource someone else started, is refused, and so is a response without a session_token.
+    const ae = new URL(metadata.authorization_endpoint);
+    if (authUrl.origin !== ae.origin || authUrl.pathname !== ae.pathname || authUrl.username || authUrl.password) {
+      throw new AgentLoginError(`not the authorization endpoint of this Agent's Issuer (${issuer})`, 'wrong_issuer');
+    }
     const start = await this.json(authUrl.href, { headers: { accept: 'application/json' } });
     if (start.status !== 200) throw this.error('the Issuer refused the Authentication Request', start);
     let tx = start.json as TransactionResource;
-    const sessionToken = tx.session_token;
+    if (typeof tx !== 'object' || tx === null || typeof tx.session_token !== 'string' || typeof tx.transaction_id !== 'string' || typeof tx.client !== 'object' || tx.client === null) {
+      throw new AgentLoginError('the Issuer did not answer with the Transaction Resource of Section 5.3; this client did not start this transaction', 'protocol_error', start.status);
+    }
     this.check(tx, issuer, metadata, o);
     const key = await this.activeKey();
     if (tx.status !== 'awaiting_agent' || tx.next.action !== 'assert' || !tx.challenge || !tx.next.url) throw new AgentLoginError(`unexpected initial status ${tx.status}`, 'unexpected_status', undefined, tx);
@@ -224,36 +270,89 @@ export class AgentLogin {
     const redirectUrl = (c.json as { redirect: string }).redirect;
     const rh = new URL(redirectUrl);
     if (rh.host !== tx.client.redirect_host) throw new AgentLoginError('redirect does not go to the client host', 'protocol_error');
-    void sessionToken;
-    return { handle: this.handle, issuer, client: tx.client, scopes: tx.requested_scopes, redirectUrl };
+    const result = { handle: this.handle, issuer, client: tx.client, scopes: tx.requested_scopes } as SignInResult;
+    Object.defineProperty(result, 'redirectUrl', { value: redirectUrl, enumerable: false });
+    return result;
   }
 
-  /** Fetches the code-bearing redirect with the cookie jar for that host, following same-host redirects. No Authorization header is sent (A-9). */
+  /**
+   * Section 5.8: start at the application. `loginUrl` is its `initiate_login_uri` (or any URL of the application that
+   * redirects to the Authentication Request); `iss` and `login_hint` are appended. The application's cookies are
+   * kept in the cookie jar, so an application that binds `state` to a cookie can complete the callback in follow().
+   */
+  async signInAt(loginUrl: string, o: SignInAtOptions = {}): Promise<SignInResult> {
+    const { issuer, metadata } = await this.discover();
+    let url: URL;
+    try {
+      url = new URL(loginUrl);
+    } catch {
+      throw new AgentLoginError('loginUrl is not a URL', 'invalid_request');
+    }
+    if (url.protocol !== 'https:' && !this.opts.allowInsecure) throw new AgentLoginError('loginUrl is not https', 'insecure_url');
+    const site = url.host;
+    if (o.sendIssAndLoginHint !== false) {
+      url.searchParams.set('iss', issuer);
+      url.searchParams.set('login_hint', this.handle);
+    }
+    const ae = new URL(metadata.authorization_endpoint);
+    for (let hop = 0; hop < 5; hop += 1) {
+      const res = await this.rpFetch(url);
+      await res.arrayBuffer();
+      const location = res.headers.get('location');
+      if (!(res.status >= 300 && res.status < 400) || !location) {
+        throw new AgentLoginError(`the application did not redirect to a sign-in (status ${res.status})`, 'no_authorization_request', res.status);
+      }
+      const next = new URL(location, url);
+      if (next.origin === ae.origin && next.pathname === ae.pathname) {
+        return this.signIn({ ...o, authorizationUrl: next.href, expectedHost: o.expectedHost ?? site });
+      }
+      if (next.host !== site) throw new AgentLoginError(`the application redirected to ${next.host}, which is not this Agent's Issuer`, 'wrong_issuer');
+      if (next.protocol !== 'https:' && !this.opts.allowInsecure) throw new AgentLoginError('redirect is not https', 'insecure_redirect');
+      url = next;
+    }
+    throw new AgentLoginError('too many redirects at the application', 'no_authorization_request');
+  }
+
+  /**
+   * Fetches the code-bearing redirect with the cookie jar for that host and follows redirects within that host.
+   * No Authorization header is sent (A-9). The returned URL never includes a query string.
+   */
   async follow(result: SignInResult, maxRedirects = 5): Promise<FollowResult> {
     let url = new URL(result.redirectUrl);
+    const host = url.host;
     if (url.protocol !== 'https:' && !this.opts.allowInsecure) throw new AgentLoginError('redirect is not https', 'insecure_redirect');
     for (let i = 0; ; i += 1) {
-      const cookie = await this.cookies.header(url);
-      const res = await fetch(url, { redirect: 'manual', headers: { accept: 'text/html, application/json;q=0.9, */*;q=0.1', ...(cookie ? { cookie } : {}) } });
-      await this.cookies.store(url, res.headers.getSetCookie());
+      const res = await this.rpFetch(url);
       const location = res.headers.get('location');
       if (res.status >= 300 && res.status < 400 && location && i < maxRedirects) {
         const next = new URL(location, url);
-        if (next.protocol !== url.protocol && next.protocol === 'http:') throw new AgentLoginError('redirect downgraded to http', 'insecure_redirect');
         await res.arrayBuffer();
+        if (next.protocol === 'http:' && url.protocol === 'https:') throw new AgentLoginError('redirect downgraded to http', 'insecure_redirect');
+        if (next.host !== host) return { status: res.status, url: `${url.origin}${url.pathname}`, body: '', headers: res.headers }; // do not leave the application
         url = next;
         continue;
       }
-      return { status: res.status, url: url.href, body: await res.text(), headers: res.headers };
+      return { status: res.status, url: `${url.origin}${url.pathname}`, body: await res.text(), headers: res.headers };
     }
   }
-  /** A request to the Relying Party with the stored session cookies. */
+  /** A request to the application with the stored session cookies. Redirects are not followed. */
   async fetch(url: string, init: RequestInit = {}): Promise<Response> {
-    const u = new URL(url);
+    return this.rpFetch(new URL(url), init);
+  }
+  /** One request to a Relying Party: jar cookies in, Set-Cookie stored, no redirect following, bounded in time. */
+  private async rpFetch(u: URL, init: RequestInit = {}): Promise<Response> {
+    if (u.protocol !== 'https:' && !this.opts.allowInsecure) throw new AgentLoginError('non-https URL', 'insecure_url');
     const cookie = await this.cookies.header(u);
     const headers = new Headers(init.headers);
+    if (!headers.has('accept')) headers.set('accept', 'text/html, application/json;q=0.9, */*;q=0.1');
     if (cookie) headers.set('cookie', cookie);
-    const res = await fetch(u, { ...init, headers });
+    headers.delete('authorization');
+    let res: Response;
+    try {
+      res = await fetch(u, { ...init, headers, redirect: 'manual', signal: AbortSignal.timeout(this.opts.timeoutMs ?? 10_000) });
+    } catch (e) {
+      throw new AgentLoginError(`request to ${u.host} failed: ${(e as Error).message}`, 'network_error');
+    }
     await this.cookies.store(u, res.headers.getSetCookie());
     return res;
   }
@@ -275,18 +374,27 @@ export class AgentLogin {
     const u = new URL(url);
     if (u.protocol !== 'https:' && !this.opts.allowInsecure) throw new AgentLoginError('non-https URL from the Issuer', 'insecure_url');
   }
+  /** One request to the Issuer: no cookies, no redirects, bounded in time and size. */
   private async json(url: string, init: { method?: string; headers?: Record<string, string>; body?: unknown } = {}): Promise<{ status: number; json: unknown; text: string; headers: Headers }> {
     const headers: Record<string, string> = { accept: 'application/json', ...init.headers };
     let body: string | undefined;
     if (init.body !== undefined) { headers['content-type'] = 'application/json'; body = JSON.stringify(init.body); }
-    const res = await fetch(url, { method: init.method ?? 'GET', headers, body, redirect: 'manual' }); // no cookies to the Issuer
-    const text = await res.text();
+    let res: Response;
+    let text: string;
+    try {
+      res = await fetch(url, { method: init.method ?? 'GET', headers, body, redirect: 'manual', signal: AbortSignal.timeout(this.opts.timeoutMs ?? 10_000) });
+      const buf = await res.arrayBuffer();
+      if (buf.byteLength > 64 * 1024) throw new Error('response larger than 64 KiB');
+      text = Buffer.from(buf).toString('utf8');
+    } catch (e) {
+      throw new AgentLoginError(`request to the Issuer failed: ${(e as Error).message}`, 'network_error');
+    }
     let json: unknown;
     try { json = text ? JSON.parse(text) : undefined; } catch { json = undefined; }
     return { status: res.status, json, text, headers: res.headers };
   }
   private error(what: string, r: { status: number; json: unknown; text: string }): AgentLoginError {
     const j = (r.json ?? {}) as { error?: string; error_description?: string; status?: string; reason?: string };
-    return new AgentLoginError(`${what}: ${r.status} ${j.error ?? ''}${j.error_description ? ` (${j.error_description})` : ''}`.trim(), j.error ?? `http_${r.status}`, r.status, r.json as TransactionResource | undefined);
+    return new AgentLoginError(`${what}: ${r.status} ${j.error ?? ''}${j.error_description ? ` (${j.error_description})` : ''}`.trim(), j.error ?? `http_${r.status}`, r.status, r.json);
   }
 }

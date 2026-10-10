@@ -14,8 +14,14 @@ export interface SafeFetchOptions {
   /** Development only: permit loopback and private addresses, and plain http. */
   allowPrivate?: boolean;
   accept?: string;
-  /** Maximum redirects to follow (each hop re-checked); 0 treats a 3xx as the final response. */
+  /** Maximum redirects to follow (each hop re-checked); 0 treats a 3xx as the final response. Only GET requests follow redirects. */
   maxRedirects?: number;
+  /** Request method, default GET. */
+  method?: string;
+  /** Extra request headers (for example Authorization for the Token or UserInfo Endpoint, Sections 3.3 and 5.6). */
+  headers?: Record<string, string>;
+  /** Request body for non-GET requests. */
+  body?: string;
 }
 export interface SafeFetchResult {
   url: string;
@@ -96,7 +102,17 @@ function one(url: URL, o: SafeFetchOptions): Promise<SafeFetchResult> {
     const mod = url.protocol === 'https:' ? https : http;
     const req = mod.request(
       url,
-      { method: 'GET', headers: { accept: o.accept ?? 'application/json', 'user-agent': 'agentlogin/0.1' }, lookup: filteredLookup(allowPrivate), timeout: o.timeoutMs },
+      {
+        method: o.method ?? 'GET',
+        headers: {
+          accept: o.accept ?? 'application/json',
+          'user-agent': 'agentlogin/0.1',
+          ...(o.body !== undefined ? { 'content-length': String(Buffer.byteLength(o.body)) } : {}),
+          ...o.headers,
+        },
+        lookup: filteredLookup(allowPrivate),
+        timeout: o.timeoutMs,
+      },
       (res) => {
         const chunks: Buffer[] = [];
         let size = 0;
@@ -114,7 +130,7 @@ function one(url: URL, o: SafeFetchOptions): Promise<SafeFetchResult> {
     );
     req.on('timeout', () => req.destroy(new Error('fetch timed out')));
     req.on('error', reject);
-    req.end();
+    req.end(o.body);
   });
 }
 
@@ -126,7 +142,8 @@ export async function safeFetch(input: string | URL, o: SafeFetchOptions): Promi
     const remaining = deadline - Date.now();
     if (remaining <= 0) throw new Error('fetch timed out');
     const res = await one(url, { ...o, timeoutMs: remaining });
-    if (res.status >= 300 && res.status < 400 && (o.maxRedirects ?? 0) > hops && res.headers.location) {
+    const isGet = (o.method ?? 'GET').toUpperCase() === 'GET';
+    if (isGet && res.status >= 300 && res.status < 400 && (o.maxRedirects ?? 0) > hops && res.headers.location) {
       hops += 1;
       url = new URL(res.headers.location, url);
       continue;

@@ -7,8 +7,11 @@ const USAGE = `agentlogin: sign a software agent in to web applications (Agent L
 
   agentlogin enroll  --handle H --credential C [--name N]        enroll a new key (Owner or Delegated Credential)
   agentlogin keygen  --handle H [--name N]                       generate a key without enrolling (prints the public JWK)
-  agentlogin login   <authorization-url> --handle H --site URL   complete a sign-in; stores the site's session cookies
-                     [--deny-review] [--no-follow] [--json]
+  agentlogin login   <login-url> --handle H                      sign in at an application, starting from its login URL
+                     [--site URL] [--no-hint] [--deny-review]    (iss and login_hint are appended unless --no-hint);
+                     [--no-follow] [--json]                      stores the application's session cookies
+  agentlogin login   <url> --authorization-url --handle H --site URL
+                                                                 the same, starting from an Authentication Request URL
   agentlogin fetch   <url> --handle H [--method M] [--data D]    request with the stored session cookies for that site
   agentlogin cookies --handle H --site URL [--clear]             show (as a Cookie header) or clear a site's cookies
   agentlogin keys    --handle H --credential C                   list keys enrolled at the Issuer
@@ -45,7 +48,7 @@ export async function main(argv: string[]): Promise<void> {
     cookies: new FileCookieJar(),
     issuer: str('issuer', 'AGENTLOGIN_ISSUER'),
     allowInsecure: process.env.AGENTLOGIN_INSECURE === '1' || flags.get('insecure') === true,
-    log: (m) => { if (!flags.has('json')) console.error(m); },
+    log: (m) => console.error(m),
   });
   const credential = () => { const c = str('credential', 'AGENTLOGIN_CREDENTIAL'); if (!c) throw new Error('--credential (or AGENTLOGIN_CREDENTIAL) is required'); return c; };
   const out = (v: unknown) => console.log(JSON.stringify(v, null, 2));
@@ -64,22 +67,26 @@ export async function main(argv: string[]): Promise<void> {
       }
       case 'login': {
         const url = positional[1];
-        if (!url) throw new Error('usage: agentlogin login <authorization-url> --handle H --site URL');
+        if (!url) throw new Error('usage: agentlogin login <url> --handle H [--site URL]');
         const site = str('site');
-        const result = await al.signIn({
-          authorizationUrl: url,
+        const common = {
           expectedHost: site ? new URL(site.includes('://') ? site : `https://${site}`).host : undefined,
           unsafeSkipHostCheck: flags.get('unsafe-skip-host-check') === true,
           acceptDisclosure: flags.get('deny-review') !== true,
-          onOwnerApproval: () => { if (!flags.has('json')) console.error("The agent's owner must approve this sign-in; waiting."); },
-        });
-        let followed: { status: number; url: string } | undefined;
-        if (flags.get('no-follow') !== true) {
-          const f = await al.follow(result);
-          followed = { status: f.status, url: f.url };
-        }
-        if (flags.has('json')) out({ handle: result.handle, issuer: result.issuer, client_id: result.client.client_id, redirect_host: result.client.redirect_host, scopes: result.scopes, followed });
-        else console.log(`Signed in to ${result.client.redirect_host} as ${result.handle}${followed ? ` (site answered ${followed.status})` : ''}`);
+          onOwnerApproval: () => console.error("The agent's owner must approve this sign-in; waiting."),
+        };
+        // The URL is either the application's login URL (Section 5.8; the default) or, with --authorization-url, the
+        // Authentication Request itself, in which case --site names the application.
+        const result = flags.get('authorization-url') === true
+          ? await al.signIn({ ...common, authorizationUrl: url })
+          : await al.signInAt(url, { ...common, sendIssAndLoginHint: flags.get('no-hint') !== true });
+        let answered: number | undefined;
+        if (flags.get('no-follow') !== true) answered = (await al.follow(result)).status;
+        const ok = answered === undefined || answered < 400;
+        if (flags.has('json')) out({ signed_in: ok, handle: result.handle, issuer: result.issuer, client_id: result.client.client_id, site: result.client.redirect_host, scopes: result.scopes, site_status: answered });
+        else if (answered === undefined) console.log(`Sign-in for ${result.client.redirect_host} approved as ${result.handle}; the redirect was not followed (--no-follow).`);
+        else if (ok) console.log(`Signed in to ${result.client.redirect_host} as ${result.handle}`);
+        if (!ok) throw new Error(`${result.client.redirect_host} answered ${answered} to the sign-in callback`);
         return;
       }
       case 'fetch': {

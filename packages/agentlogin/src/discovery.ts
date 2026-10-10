@@ -15,6 +15,9 @@ export interface IssuerMetadata {
   handle_domains: string[];
   agent_key_algs_supported: string[];
   agent_login_versions_supported: string[];
+  /** Present for a Relay (Section 2.4). */
+  home_issuers?: string[];
+  id_token_signing_alg_values_supported?: string[];
   [k: string]: unknown;
 }
 export interface DiscoveryOptions {

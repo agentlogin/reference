@@ -1,0 +1,254 @@
+// The relying-party kit against the reference issuer and the agent client, plus ID Token validation against a
+// second issuer under the test's control.
+import { test, before, after } from 'node:test';
+import assert from 'node:assert/strict';
+import http from 'node:http';
+import type { AddressInfo } from 'node:net';
+import { randomBytes } from 'node:crypto';
+import { serve } from '@hono/node-server';
+import { SignJWT, calculateJwkThumbprint, exportJWK, generateKeyPair, type CryptoKey, type JWK } from 'jose';
+import { AgentLogin, AgentLoginError, MemoryCookieJar, MemoryKeystore } from 'agentlogin';
+import { createIssuer } from '../../issuer/src/index.js';
+import { RelyingParty, RelyingPartyError, createHandlers, signInForm, type SignIn } from '../src/index.js';
+
+const rnd = (n = 16) => randomBytes(n).toString('base64url');
+async function freePort(): Promise<number> {
+  const s = http.createServer();
+  await new Promise<void>((r) => s.listen(0, '127.0.0.1', r));
+  const p = (s.address() as AddressInfo).port;
+  await new Promise<void>((r) => s.close(() => r()));
+  return p;
+}
+const admin = async (base: string, path: string, body: unknown) =>
+  (await (await fetch(`${base}${path}`, { method: 'POST', headers: { authorization: 'Bearer admin', 'content-type': 'application/json' }, body: JSON.stringify(body) })).json()) as Record<string, any>;
+
+let issuerUrl = '';
+let rpUrl = '';
+let rogueUrl = '';
+let rp: RelyingParty;
+let owner: Record<string, any>;
+let rogueKey: { privateKey: CryptoKey; jwk: JWK; kid: string };
+const sessions = new Map<string, SignIn>();
+const closers: Array<() => Promise<void>> = [];
+
+before(async () => {
+  const issuerPort = await freePort();
+  issuerUrl = `http://127.0.0.1:${issuerPort}`;
+  const { app } = await createIssuer({ issuer: issuerUrl, handleDomains: ['example.com'], allowInsecureClients: true, adminToken: 'admin' });
+  const issuerServer = serve({ fetch: app.fetch, port: issuerPort, hostname: '127.0.0.1' });
+  closers.push(() => new Promise((r) => issuerServer.close(() => r())));
+
+  // A second issuer whose signing key the test holds: conforming metadata and JWK Set, tokens minted by the test.
+  const roguePort = await freePort();
+  rogueUrl = `http://127.0.0.1:${roguePort}`;
+  const kp = await generateKeyPair('ES256', { extractable: true });
+  const pub = await exportJWK(kp.publicKey);
+  const jwk: JWK = { kty: pub.kty, crv: pub.crv, x: pub.x, y: pub.y };
+  rogueKey = { privateKey: kp.privateKey, jwk, kid: await calculateJwkThumbprint(jwk, 'sha256') };
+  const rogue = http.createServer((req, res) => {
+    const send = (v: unknown) => { res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify(v)); };
+    if (req.url === '/.well-known/openid-configuration') {
+      send({ issuer: rogueUrl, authorization_endpoint: `${rogueUrl}/authorize`, token_endpoint: `${rogueUrl}/token`, userinfo_endpoint: `${rogueUrl}/userinfo`, jwks_uri: `${rogueUrl}/jwks`, transaction_endpoint: `${rogueUrl}/transactions`, agents_endpoint: `${rogueUrl}/agents`, handle_domains: [], home_issuers: ['*'], agent_key_algs_supported: ['ES256'], agent_login_versions_supported: ['1.0'] });
+    } else if (req.url === '/jwks') send({ keys: [{ ...jwk, kid: rogueKey.kid, use: 'sig', alg: 'ES256' }] });
+    else { res.writeHead(404); res.end(); }
+  });
+  await new Promise<void>((r) => rogue.listen(roguePort, '127.0.0.1', r));
+  closers.push(() => new Promise((r) => rogue.close(() => r())));
+
+  const rpPort = await freePort();
+  rpUrl = `http://127.0.0.1:${rpPort}`;
+  rp = new RelyingParty({
+    clientId: `${rpUrl}/client-metadata.json`,
+    redirectUri: `${rpUrl}/auth/agent/callback`,
+    issuers: [issuerUrl],
+    staticIssuers: { 'example.com': issuerUrl },
+    stateSecret: 'test-secret-test-secret-test-secret-1234',
+    allowInsecure: true,
+  });
+  const h = createHandlers(rp, {
+    metadata: { clientName: 'Kit Test App', maxSignupsPerOwner: 5 },
+    onSignIn: (signIn) => {
+      const sid = rnd();
+      sessions.set(sid, signIn);
+      return new Response(null, { status: 302, headers: { location: signIn.returnTo ?? '/me', 'set-cookie': `sid=${sid}; Path=/; HttpOnly` } });
+    },
+  });
+  const rpServer = serve({
+    port: rpPort,
+    hostname: '127.0.0.1',
+    fetch: async (req: Request) => {
+      const u = new URL(req.url);
+      const sid = /(?:^|;\s*)sid=([^;]+)/.exec(req.headers.get('cookie') ?? '')?.[1];
+      const s = sid ? sessions.get(sid) : undefined;
+      if (u.pathname === '/client-metadata.json') return h.metadata(req);
+      if (u.pathname === '/auth/agent/login') return h.login(req);
+      if (u.pathname === '/auth/agent/callback') return h.callback(req);
+      if (u.pathname === '/me' || u.pathname === '/dashboard') return s ? Response.json({ key: s.agent.key, handle: s.agent.handle, owner: s.agent.ownerKey, path: u.pathname }) : Response.json({ error: 'not signed in' }, { status: 401 });
+      if (u.pathname === '/recheck') {
+        if (!s) return Response.json({ error: 'not signed in' }, { status: 401 });
+        try { await rp.recheck(s); return Response.json({ ok: true }); } catch (e) { return Response.json({ error: (e as RelyingPartyError).code }, { status: 401 }); }
+      }
+      return new Response('not found', { status: 404 });
+    },
+  });
+  closers.push(() => new Promise((r) => rpServer.close(() => r())));
+  await new Promise((r) => setTimeout(r, 50));
+
+  owner = await admin(issuerUrl, '/admin/owners', { email: 'jane@example.com', name: 'Jane Doe' });
+  await admin(issuerUrl, '/admin/agents', { handle: 'scout@example.com', owner_id: owner.owner_id, name: 'Scout' });
+});
+after(async () => { for (const c of closers) await c(); });
+
+const newAgent = () => new AgentLogin({ handle: 'scout@example.com', issuer: issuerUrl, allowInsecure: true, keystore: new MemoryKeystore(), cookies: new MemoryCookieJar() });
+
+test('an agent signs in through the kit, starting at the application (Section 5.8)', async () => {
+  const al = newAgent();
+  const key = await al.enroll({ credential: owner.credential });
+  const result = await al.signInAt(`${rpUrl}/auth/agent/login?return_to=%2Fdashboard`);
+  assert.equal(result.client.client_name, 'Kit Test App');
+  assert.equal(JSON.stringify(result).includes('code='), false, 'the code-bearing URL must not serialise');
+  const followed = await al.follow(result);
+  assert.equal(followed.status, 200);
+  assert.equal(followed.url, `${rpUrl}/dashboard`);
+  const me = JSON.parse(followed.body) as { key: string; handle: string; owner: string; path: string };
+  assert.equal(me.handle, 'scout@example.com');
+  assert.ok(me.key.startsWith(`${issuerUrl} `) && me.key.split(' ')[1]!.length >= 22);
+  assert.ok(me.owner.startsWith(`${issuerUrl} `));
+
+  // Section 9 item 6: the live check passes, then fails once the key is revoked.
+  assert.equal((await al.fetch(`${rpUrl}/recheck`)).status, 200);
+  await al.revokeKey(owner.credential, key.kid);
+  const after = await al.fetch(`${rpUrl}/recheck`);
+  assert.equal(after.status, 401);
+  assert.equal(((await after.json()) as { error: string }).error, 'revoked');
+});
+
+test('a sign-in started without the application cookie cannot be completed', async () => {
+  const al = newAgent();
+  await al.enroll({ credential: owner.credential });
+  // The agent is handed a bare Authentication Request URL produced in someone else's session.
+  const other = await fetch(`${rpUrl}/auth/agent/login?handle=scout%40example.com`, { redirect: 'manual' });
+  const result = await al.signIn({ authorizationUrl: other.headers.get('location')!, expectedHost: new URL(rpUrl).host });
+  const followed = await al.follow(result);
+  assert.equal(followed.status, 400);
+  assert.match(followed.body, /invalid_state/);
+  assert.equal(followed.url.includes('?'), false);
+});
+
+test('login refuses an Issuer that is not accepted and an invalid handle', async () => {
+  const a = await fetch(`${rpUrl}/auth/agent/login?iss=${encodeURIComponent('https://issuer.invalid')}&login_hint=scout%40example.com`, { redirect: 'manual' });
+  assert.equal(a.status, 400);
+  assert.match(await a.text(), /does not accept/);
+  const b = await fetch(`${rpUrl}/auth/agent/login?handle=not-a-handle`, { redirect: 'manual' });
+  assert.equal(b.status, 400);
+  const c = await fetch(`${rpUrl}/auth/agent/login`, { method: 'POST', redirect: 'manual', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: 'handle=scout%40example.com' });
+  assert.equal(c.status, 302);
+  const u = new URL(c.headers.get('location')!);
+  assert.equal(u.origin + u.pathname, `${issuerUrl}/authorize`);
+  assert.equal(u.searchParams.get('login_hint'), 'scout@example.com');
+  assert.equal(u.searchParams.get('code_challenge_method'), 'S256');
+  assert.ok(u.searchParams.get('state')!.length >= 22 && u.searchParams.get('nonce')!.length >= 22);
+  assert.match(c.headers.get('set-cookie')!, /HttpOnly; SameSite=Lax/);
+});
+
+test('the callback validates state and iss before anything else and presents errors distinctly', async () => {
+  const start = async () => {
+    const r = await fetch(`${rpUrl}/auth/agent/login?handle=scout%40example.com`, { redirect: 'manual' });
+    const state = new URL(r.headers.get('location')!).searchParams.get('state')!;
+    return { state, cookie: r.headers.get('set-cookie')!.split(';')[0]! };
+  };
+  const cb = async (query: string, cookie?: string) => {
+    const r = await fetch(`${rpUrl}/auth/agent/callback?${query}`, { redirect: 'manual', headers: cookie ? { cookie } : {} });
+    return { status: r.status, text: await r.text() };
+  };
+  const iss = encodeURIComponent(issuerUrl);
+  const s1 = await start();
+  assert.match((await cb(`code=x&state=${s1.state}&iss=${iss}`)).text, /invalid_state/, 'no cookie');
+  assert.match((await cb(`code=x&state=${rnd()}&iss=${iss}`, s1.cookie)).text, /invalid_state/, 'state of another sign-in');
+  assert.match((await cb(`code=x&state=${s1.state}&iss=${encodeURIComponent('https://evil.example')}`, s1.cookie)).text, /issuer_mismatch/);
+  assert.match((await cb(`code=x&state=${s1.state}`, s1.cookie)).text, /issuer_mismatch/, 'missing iss');
+  assert.match((await cb(`code=x&state=${s1.state}&iss=${iss}`, `${s1.cookie.split('=')[0]}=garbage`)).text, /invalid_state/, 'tampered cookie');
+  const denied = await cb(`error=access_denied&state=${s1.state}&iss=${iss}`, s1.cookie);
+  const limit = await cb(`error=signup_limit_reached&error_description=%3Cscript%3Ealert(1)%3C%2Fscript%3E&state=${s1.state}&iss=${iss}`, s1.cookie);
+  assert.equal(denied.status, 400);
+  assert.match(denied.text, /cancelled or is not permitted/);
+  assert.match(limit.text, /number of agents it accepts/);
+  assert.equal(limit.text.includes('<script>'), false);
+  assert.match((await cb(`code=not-a-code&state=${s1.state}&iss=${iss}`, s1.cookie)).text, /token_request_failed/);
+});
+
+test('ID Token validation (Section 5.7) and the handle binding (Section 2.5)', async () => {
+  const nonce = rnd();
+  const clientId = `${rpUrl}/client-metadata.json`;
+  const mint = (claims: Record<string, unknown>, o: { exp?: number; iat?: number; aud?: string | string[]; iss?: string } = {}) => {
+    const now = Math.floor(Date.now() / 1000);
+    return new SignJWT({ nonce, actor_type: 'agent', scope: 'openid email', ...claims })
+      .setProtectedHeader({ alg: 'ES256', kid: rogueKey.kid, typ: 'JWT' })
+      .setIssuer(o.iss ?? rogueUrl).setSubject('b1Ykm9wQ2tN0cJ6vR8dLxA').setAudience(o.aud ?? clientId).setIssuedAt(o.iat ?? now).setExpirationTime(o.exp ?? now + 600).setJti(rnd())
+      .sign(rogueKey.privateKey);
+  };
+  const cfg = { clientId, redirectUri: `${rpUrl}/auth/agent/callback`, staticIssuers: { 'example.com': issuerUrl }, stateSecret: 'test-secret-test-secret-test-secret-1234', allowInsecure: true };
+  const plain = new RelyingParty({ ...cfg, issuers: [issuerUrl, rogueUrl] });
+  const relay = new RelyingParty({ ...cfg, issuers: [issuerUrl, { issuer: rogueUrl, relay: true }] });
+  const check = (r: RelyingParty, token: string) => r.validateIdToken(token, { issuer: rogueUrl, nonce, clientId });
+  const rejects = (p: Promise<unknown>, code: string) => assert.rejects(p, (e: unknown) => e instanceof RelyingPartyError && e.code === code, code);
+
+  // A valid token without `email` is accepted from a configured Issuer.
+  assert.equal((await check(plain, await mint({}))).actor_type, 'agent');
+  // A configured Issuer cannot speak for a handle whose domain designates another Issuer.
+  await rejects(check(plain, await mint({ email: 'scout@example.com', email_verified: true })), 'handle_binding_failed');
+  await rejects(check(plain, await mint({ email: 'scout@example.com' })), 'invalid_id_token');
+  // home_iss only from a configured Relay, with or without email (R-14).
+  await rejects(check(plain, await mint({ home_iss: issuerUrl })), 'handle_binding_failed');
+  await rejects(check(plain, await mint({ home_iss: issuerUrl, email: 'scout@example.com', email_verified: true })), 'handle_binding_failed');
+  // A Relay token: discovery for the handle must yield home_iss.
+  const viaRelay = await check(relay, await mint({ home_iss: issuerUrl, email: 'scout@example.com', email_verified: true }));
+  assert.equal(viaRelay.home_iss, issuerUrl);
+  await rejects(check(relay, await mint({ home_iss: 'https://other.example', email: 'scout@example.com', email_verified: true })), 'handle_binding_failed');
+
+  await rejects(check(plain, await mint({ nonce: rnd() })), 'invalid_id_token');
+  await rejects(check(plain, await mint({ actor_type: 'user' })), 'invalid_id_token');
+  await rejects(check(plain, await mint({ actor_type: undefined })), 'invalid_id_token');
+  await rejects(check(plain, await mint({}, { aud: 'someone-else' })), 'invalid_id_token');
+  await rejects(check(plain, await mint({}, { aud: [clientId, 'other'] })), 'invalid_id_token');
+  await rejects(check(plain, await mint({}, { exp: Math.floor(Date.now() / 1000) - 1, iat: Math.floor(Date.now() / 1000) - 700 })), 'invalid_id_token');
+  await rejects(check(plain, await mint({}, { iat: Math.floor(Date.now() / 1000) + 600, exp: Math.floor(Date.now() / 1000) + 1200 })), 'invalid_id_token');
+  await rejects(check(plain, await mint({}, { iss: issuerUrl })), 'invalid_id_token');
+  // Another key, same kid: the signature does not verify.
+  const other = await generateKeyPair('ES256');
+  const forged = await new SignJWT({ nonce, actor_type: 'agent' }).setProtectedHeader({ alg: 'ES256', kid: rogueKey.kid }).setIssuer(rogueUrl).setSubject('x').setAudience(clientId).setIssuedAt().setExpirationTime('5m').sign(other.privateKey);
+  await rejects(check(plain, forged), 'invalid_id_token');
+  // Unsigned and symmetric tokens are refused before any key lookup.
+  const none = `${Buffer.from(JSON.stringify({ alg: 'none', kid: rogueKey.kid })).toString('base64url')}.${Buffer.from(JSON.stringify({ iss: rogueUrl, aud: clientId, nonce, actor_type: 'agent', sub: 'x' })).toString('base64url')}.`;
+  await rejects(check(plain, none), 'invalid_id_token');
+  const hs = await new SignJWT({ nonce, actor_type: 'agent' }).setProtectedHeader({ alg: 'HS256', kid: rogueKey.kid }).setIssuer(rogueUrl).setSubject('x').setAudience(clientId).setExpirationTime('5m').sign(new TextEncoder().encode(JSON.stringify(rogueKey.jwk)));
+  await rejects(check(plain, hs), 'invalid_id_token');
+});
+
+test('issuer choice: allow-list, relay and open federation', async () => {
+  const cfg = { clientId: `${rpUrl}/client-metadata.json`, redirectUri: `${rpUrl}/auth/agent/callback`, stateSecret: 'test-secret-test-secret-test-secret-1234', allowInsecure: true };
+  const elsewhere = { 'example.com': issuerUrl, 'agents.example': rogueUrl };
+  const allow = new RelyingParty({ ...cfg, issuers: [issuerUrl], staticIssuers: elsewhere });
+  await assert.rejects(allow.begin({ handle: 'a@agents.example' }), (e: unknown) => e instanceof RelyingPartyError && e.code === 'issuer_not_accepted');
+  assert.ok((await allow.begin({ handle: 'scout@example.com' })).url.startsWith(`${issuerUrl}/authorize?`));
+  assert.ok((await allow.begin()).url.startsWith(`${issuerUrl}/authorize?`), 'single Issuer needs no handle');
+  const any = new RelyingParty({ ...cfg, issuers: [issuerUrl], federation: 'any', staticIssuers: elsewhere });
+  assert.ok((await any.begin({ handle: 'a@agents.example' })).url.startsWith(`${rogueUrl}/authorize?`));
+  assert.ok((await any.beginInitiated({ iss: rogueUrl, loginHint: 'a@agents.example' })).url.startsWith(`${rogueUrl}/authorize?`));
+  await assert.rejects(any.beginInitiated({ iss: rogueUrl, loginHint: 'scout@example.com' }), (e: unknown) => e instanceof RelyingPartyError && e.code === 'issuer_not_accepted');
+  await assert.rejects(any.beginInitiated({ iss: rogueUrl }), (e: unknown) => e instanceof RelyingPartyError && e.code === 'issuer_not_accepted');
+  const viaRelay = new RelyingParty({ ...cfg, issuers: [{ issuer: rogueUrl, relay: true }], staticIssuers: elsewhere });
+  const b = await viaRelay.begin({ handle: 'scout@example.com' });
+  assert.ok(b.url.startsWith(`${rogueUrl}/authorize?`) && new URL(b.url).searchParams.get('login_hint') === 'scout@example.com');
+  const two = new RelyingParty({ ...cfg, issuers: [issuerUrl, rogueUrl], staticIssuers: elsewhere });
+  await assert.rejects(two.begin(), (e: unknown) => e instanceof RelyingPartyError && e.code === 'handle_required');
+});
+
+test('the sign-in form escapes its inputs', () => {
+  const html = signInForm({ action: '/auth/agent/login?x="><script>', label: '<b>Sign in</b>', returnTo: '/a"b' });
+  assert.equal(html.includes('<script>'), false);
+  assert.equal(html.includes('<b>'), false);
+  assert.match(html, /name="handle"/);
+  assert.equal(signInForm({ action: '/l', withoutHandle: true }).includes('name="handle"'), false);
+  void AgentLoginError;
+});

@@ -1,0 +1,16 @@
+{
+  "name": "@agentlogin/rp",
+  "version": "0.1.0",
+  "description": "Relying-party kit for Agent Login: accept sign-ins from software agents with an open, federated OpenID Connect profile",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": { ".": "./dist/index.js" },
+  "files": ["dist", "README.md"],
+  "repository": { "type": "git", "url": "git+https://github.com/agentlogin/reference.git", "directory": "packages/rp" },
+  "homepage": "https://agentlogin.dev",
+  "keywords": ["agent", "login", "oidc", "openid-connect", "relying-party", "ai-agents"],
+  "dependencies": { "agentlogin": "^0.1.0", "jose": "^6.1.0" },
+  "engines": { "node": ">=22.12" }
+}

@@ -10,10 +10,9 @@ npm install -g agentlogin
 # once: enroll a key for your handle with your Owner Credential (or a Delegated Credential)
 agentlogin enroll --handle scout@example.com --credential "$OWNER_CREDENTIAL" --name laptop
 
-# each sign-in: hand the client the application's "Sign in with your agent" URL and name the site
-agentlogin login "https://issuer.example/authorize?response_type=code&client_id=..." \
-  --handle scout@example.com --site https://app.example.org
-# -> Signed in to app.example.org as scout@example.com (site answered 200)
+# each sign-in: point the client at the application's login URL
+agentlogin login https://app.example.org/auth/agent/login --handle scout@example.com
+# -> Signed in to app.example.org as scout@example.com
 
 agentlogin fetch https://app.example.org/api/me --handle scout@example.com   # uses the stored session cookies
 ```
@@ -25,10 +24,14 @@ import { AgentLogin, FileKeystore, FileCookieJar } from 'agentlogin';
 
 const al = new AgentLogin({ handle: 'scout@example.com', keystore: new FileKeystore(), cookies: new FileCookieJar() });
 await al.enroll({ credential: process.env.OWNER_CREDENTIAL!, name: 'server-1' });   // once
-const result = await al.signIn({ authorizationUrl, expectedHost: 'app.example.org' });
+const result = await al.signInAt('https://app.example.org/auth/agent/login');
 await al.follow(result);                       // completes the application's sign-in; cookies are stored
 const me = await al.fetch('https://app.example.org/api/me');
 ```
+
+`signInAt` starts at the application as Section 5.8 describes: it appends `iss` and `login_hint`, keeps the
+application's cookies, and takes the Authentication Request the application redirects to. If you already hold an
+Authentication Request URL, use `signIn({ authorizationUrl, expectedHost })` (CLI: `--authorization-url --site`).
 
 What it does, by specification section: WebFinger discovery of the handle's Issuer over HTTPS with the fetch
 protections of 2.2 (A-1); sends the Authentication Request itself on the JSON path (5.3) so it is the Session Holder
