@@ -19,11 +19,12 @@
     "example": "node --import tsx examples/rp-hono/server.ts"
   },
   "devDependencies": {
-    "@types/node": "^22.18.0",
-    "tsx": "^4.20.0",
-    "typescript": "^5.9.0",
     "@hono/node-server": "^1.19.0",
-    "hono": "^4.9.0"
+    "@types/node": "^22.18.0",
+    "hono": "^4.9.0",
+    "openid-client": "^6.8.8",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0"
   },
   "engines": {
     "node": ">=22.12"
