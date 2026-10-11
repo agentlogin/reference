@@ -6,7 +6,7 @@ import http from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { serve } from '@hono/node-server';
 import { createIssuer } from '../../issuer/src/index.js';
-import { runConformance } from '../src/index.js';
+import { AgentClient, runConformance } from '../src/index.js';
 
 let issuerUrl = '';
 let rpUrl = '';
@@ -68,4 +68,47 @@ test('existing-agent mode without an admin token produces a report', async () =>
 test('a run that cannot work says why instead of crashing', async () => {
   await assert.rejects(runConformance({ issuer: issuerUrl }), /admin token, or an existing handle/);
   await assert.rejects(runConformance({ issuer: issuerUrl, handle: 'existing@example.com', ownerCredential: 'x' }), /needs a client|enroll/);
+});
+
+test('#12 a wrong client secret is a fixture error, not a list of issuer failures', async () => {
+  const owner = await admin('/admin/owners', { email: 'fixture@example.org', name: 'Fixture Owner', session_auth: 'passkey' });
+  await admin('/admin/agents', { handle: 'fixture@example.com', owner_id: owner.owner_id!, name: 'Fixture' });
+  const reg = (await (await fetch(`${issuerUrl}/register`, { method: 'POST', headers: { authorization: 'Bearer admin', 'content-type': 'application/json' }, body: JSON.stringify({ redirect_uris: ['https://fixture2.example/cb'], client_name: 'Fixture', token_endpoint_auth_method: 'client_secret_basic' }) })).json()) as Record<string, string>;
+  await assert.rejects(
+    runConformance({ issuer: issuerUrl, handle: 'fixture@example.com', ownerCredential: owner.credential!, client: { clientId: reg.client_id!, clientSecret: 'not-the-secret', redirectUri: 'https://fixture2.example/cb' } }),
+    /client fixture.*(secret|invalid_client)/s,
+  );
+});
+
+test('#4 cleanup revokes only the keys the run enrolled', async () => {
+  const owner = await admin('/admin/owners', { email: 'shared@example.org', name: 'Shared Owner', session_auth: 'passkey' });
+  await admin('/admin/agents', { handle: 'shared@example.com', owner_id: owner.owner_id!, name: 'Shared' });
+  const meta = (await (await fetch(`${issuerUrl}/.well-known/openid-configuration`)).json()) as { agents_endpoint: string };
+  // The operator enrolls a key of their own while the harness is running.
+  let theirs: AgentClient | undefined;
+  let enrolling: Promise<unknown> | undefined;
+  const report = await runConformance({
+    issuer: issuerUrl,
+    handle: 'shared@example.com',
+    ownerCredential: owner.credential!,
+    openClient: { clientId: `${rpUrl}/client-metadata.json`, redirectUri: `${rpUrl}/cb` },
+    log: () => {
+      if (enrolling) return;
+      enrolling = (async () => {
+        // With plain fetch, as another process would: nothing here goes through the harness's own HTTP helper.
+        theirs = await AgentClient.generate('shared@example.com');
+        const base = `${meta.agents_endpoint}/${encodeURIComponent('shared@example.com')}/keys`;
+        const json = { authorization: `Bearer ${owner.credential}`, 'content-type': 'application/json' };
+        const en = (await (await fetch(base, { method: 'POST', headers: json, body: JSON.stringify({ jwk: theirs.publicJwk, name: 'operator' }) })).json()) as { challenge: string; proof_url: string };
+        const proof = await theirs.assertion(issuerUrl, { transaction_id: 'x', challenge: en.challenge }, {}, { header: { typ: 'agent-login-enrollment+jwt' }, payload: { txn: undefined } });
+        const proved = await fetch(en.proof_url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ proof }) });
+        assert.equal(proved.status, 200);
+      })();
+    },
+  });
+  await enrolling;
+  assert.equal(report.failed, 0, failures(report));
+  const keys = ((await (await fetch(`${meta.agents_endpoint}/${encodeURIComponent('shared@example.com')}/keys`, { headers: { authorization: `Bearer ${owner.credential}` } })).json()) as { keys: Array<{ kid: string; status: string }> }).keys;
+  assert.equal(keys.find((k) => k.kid === theirs!.kid)?.status, 'active', "the operator's own key is untouched");
+  assert.equal(keys.filter((k) => k.kid !== theirs!.kid && (k.status === 'active' || k.status === 'pending')).length, 0, 'every key the run enrolled is revoked');
 });

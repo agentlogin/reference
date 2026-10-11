@@ -101,22 +101,6 @@ export function typMatches(typ: unknown, expected: string): boolean {
   return t === expected || t === `application/${expected}`;
 }
 
-/** Serialises operations per key so that concurrent requests on one transaction are processed one at a time. */
-export class Locks {
-  private chains = new Map<string, Promise<unknown>>();
-  async run<T>(key: string, fn: () => Promise<T>): Promise<T> {
-    const prev = this.chains.get(key) ?? Promise.resolve();
-    const next = prev.then(fn, fn);
-    const settled = next.then(() => undefined, () => undefined);
-    this.chains.set(key, settled);
-    try {
-      return await next;
-    } finally {
-      if (this.chains.get(key) === settled) this.chains.delete(key);
-    }
-  }
-}
-
 export function isPlainObject(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v);
 }

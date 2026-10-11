@@ -14,22 +14,31 @@ export interface CookieJar {
   clear(host?: string): Promise<void>;
 }
 
+/** RFC 6265 Section 5.1.4: the default path of a cookie is the directory of the URL that set it. */
+function defaultPath(pathname: string): string {
+  if (!pathname.startsWith('/')) return '/';
+  const last = pathname.lastIndexOf('/');
+  return last === 0 ? '/' : pathname.slice(0, last);
+}
+
 function parseSetCookie(url: URL, line: string): Cookie | null {
   const parts = line.split(';').map((p) => p.trim());
   const [nv, ...attrs] = parts;
   const eq = nv!.indexOf('=');
   if (eq <= 0) return null;
-  const c: Cookie = { name: nv!.slice(0, eq).trim(), value: nv!.slice(eq + 1).trim(), host: url.hostname, path: '/', secure: false };
+  // Without a usable Path attribute a cookie belongs to the directory that set it, not to the whole host: a cookie
+  // from /private/login is not sent to /public, and two applications on one host do not see each other's cookies.
+  const c: Cookie = { name: nv!.slice(0, eq).trim(), value: nv!.slice(eq + 1).trim(), host: url.hostname, path: defaultPath(url.pathname), secure: false };
   for (const a of attrs) {
-    const [k, v] = a.split('=');
-    const key = k!.trim().toLowerCase();
-    if (key === 'path' && v) c.path = v.trim();
+    const i = a.indexOf('=');
+    const key = (i < 0 ? a : a.slice(0, i)).trim().toLowerCase();
+    const v = i < 0 ? '' : a.slice(i + 1).trim();
+    if (key === 'path' && v.startsWith('/')) c.path = v; // Section 5.2.4: a value that does not start with "/" is ignored
     else if (key === 'secure') c.secure = true;
-    else if (key === 'max-age' && v) c.expires = Date.now() + Number(v) * 1000;
-    else if (key === 'expires' && v && c.expires === undefined) c.expires = Date.parse(v);
+    else if (key === 'max-age' && /^-?\d+$/.test(v)) c.expires = Date.now() + Number(v) * 1000;
+    else if (key === 'expires' && v && c.expires === undefined && !Number.isNaN(Date.parse(v))) c.expires = Date.parse(v);
     // Domain attributes are ignored: cookies stay host-only.
   }
-  if (c.path === '' || !c.path.startsWith('/')) c.path = '/';
   return c;
 }
 

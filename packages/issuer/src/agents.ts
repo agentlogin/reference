@@ -3,9 +3,9 @@ import { calculateJwkThumbprint, compactVerify, decodeProtectedHeader, importJWK
 import { ENROLLMENT_TYP } from './constants.js';
 import type { IssuerContext } from './context.js';
 import { OAuthError } from './errors.js';
-import type { Agent, AgentKey, Credential, P256Jwk, Transaction } from './store.js';
-import { TERMINAL } from './store.js';
-import { isPlainObject, parseBearer, randomSecret, sha256, typMatches } from './util.js';
+import type { Agent, AgentKey, Credential, P256Jwk } from './store.js';
+import { denyOpenTransactions } from './state.js';
+import { isPlainObject, parseBearer, randomId, randomSecret, sha256, typMatches } from './util.js';
 
 const B64U_32 = /^[A-Za-z0-9_-]{43}$/; // 32 octets
 /** The P-256 field prime; a coordinate encoding is canonical only when its value is below it. */
@@ -41,7 +41,7 @@ export async function validateP256Jwk(jwk: unknown): Promise<P256Jwk> {
 /** Section 7.2: a `pending` key not proved within T_ASSERT is deleted. Applied wherever a key is read, so it is never seen again. */
 async function dropIfUnproved(ctx: IssuerContext, key: AgentKey | undefined): Promise<AgentKey | undefined> {
   if (key && key.status === 'pending' && (!key.challenge || ctx.now() > key.challenge.expiresAt)) {
-    await ctx.store.deleteKey(key.kid);
+    await ctx.store.deleteKey(key.kid, key.enrollment); // only this enrollment: a newer one of the same key stays
     return undefined;
   }
   return key;
@@ -69,10 +69,6 @@ export async function enrollKey(ctx: IssuerContext, handle: string, body: unknow
   const jwk = await validateP256Jwk(body.jwk);
   // The thumbprint is taken over canonical coordinates, so equal identifiers mean equal decoded points (Section 7.2).
   const kid = await calculateJwkThumbprint(jwk, 'sha256');
-  if (await ctx.store.wasRevoked(handle, kid)) throw new OAuthError(400, 'invalid_request', 'this public key was revoked for this handle');
-  const existing = await getLiveKey(ctx, kid);
-  if (existing && existing.handle !== handle) throw new OAuthError(400, 'invalid_request', 'public key is enrolled for another handle');
-  if (existing && (existing.status === 'pending' || isActive(ctx, existing))) throw new OAuthError(400, 'invalid_request', 'key already enrolled');
   const now = ctx.now();
   let expiresAt = now + ctx.constants.T_KEY;
   if (body.expires_at !== undefined) {
@@ -83,6 +79,7 @@ export async function enrollKey(ctx: IssuerContext, handle: string, body: unknow
   const key: AgentKey = {
     kid,
     handle,
+    enrollment: randomId(), // credentials bind to this enrollment; an earlier, expired one of the same key stays dead
     status: 'pending',
     jwk,
     permissions: { share_owner: false },
@@ -91,7 +88,11 @@ export async function enrollKey(ctx: IssuerContext, handle: string, body: unknow
     expiresAt,
     challenge: { value: challenge, expiresAt: now + ctx.constants.T_ASSERT },
   };
-  await ctx.store.putKey(key);
+  // One atomic operation with its preconditions: not revoked for this handle, not enrolled now (Section 7.2).
+  const inserted = await ctx.store.insertKey(key, now);
+  if (inserted === 'revoked') throw new OAuthError(400, 'invalid_request', 'this public key was revoked for this handle');
+  if (inserted === 'other_handle') throw new OAuthError(400, 'invalid_request', 'public key is enrolled for another handle');
+  if (inserted === 'enrolled') throw new OAuthError(400, 'invalid_request', 'key already enrolled');
   return { record: keyRecord(ctx, key), challenge, proof_url: `${ctx.issuer}/agents/${encodeURIComponent(handle)}/keys/${encodeURIComponent(kid)}/proof` };
 }
 
@@ -134,55 +135,57 @@ export async function proveKey(ctx: IssuerContext, handle: string, kid: string, 
   if (typeof iat !== 'number' || typeof exp !== 'number') throw bad('iat and exp required');
   if (exp > iat + ctx.constants.T_ASSERT || now >= exp || iat < now - ctx.constants.T_ASSERT || iat > now + ctx.constants.T_SKEW) throw bad('iat/exp window');
   if (typeof payload.jti !== 'string') throw bad('jti required');
-  key.status = 'active';
-  key.challenge = undefined;
-  await ctx.store.putKey(key);
-  return keyRecord(ctx, key);
+  // Activation is one conditional write: it succeeds only if this enrollment is still pending with this challenge.
+  // A revocation that completed while the signature was being verified therefore wins (Section 7.3).
+  if (!(await ctx.store.activateKey(kid, key.enrollment, key.challenge.value, now))) {
+    const current = await ctx.store.getKey(kid);
+    if (current?.status === 'revoked') throw new OAuthError(401, 'key_revoked');
+    throw new OAuthError(current && current.handle === handle ? 400 : 401, current && current.handle === handle ? 'invalid_assertion' : 'unknown_key', 'the key has no unconsumed challenge');
+  }
+  return keyRecord(ctx, { ...key, status: 'active', challenge: undefined });
 }
 
-/** Section 7.3 and the table of Section 7.4: effects of revoking a key. */
-export async function revokeKeyEffects(ctx: IssuerContext, key: AgentKey): Promise<void> {
-  key.status = 'revoked';
-  key.revokedAt = ctx.now();
-  key.challenge = undefined;
-  await ctx.store.putKey(key);
-  await ctx.store.rememberRevoked(key.handle, key.kid);
-  for (const tx of await ctx.store.listOpenTransactions({ kid: key.kid })) await deny(ctx, tx, 'key_revoked');
-  await voidCodes(ctx, { kid: key.kid });
-  await revokeTokens(ctx, { kid: key.kid });
+/**
+ * Section 7.3 and the table of Section 7.4: revoke a key. The key is written first, by one atomic operation; then
+ * what it asserted is ended. Whatever a concurrent request does with that key, it either sees the key revoked when
+ * it reads it again after its own write, or its write is seen here (see state.ts).
+ */
+export async function revokeKeyEffects(ctx: IssuerContext, kid: string): Promise<void> {
+  const key = await ctx.store.revokeKey(kid, ctx.now());
+  if (!key) return;
+  const bound = { kid: key.kid, keyEnrollment: key.enrollment };
+  await denyOpenTransactions(ctx, bound, 'key_revoked');
+  await ctx.store.voidCodes(bound);
+  await ctx.store.revokeAccessTokens(bound);
 }
 
 /** Section 7.3: revoke every pending and active key of a handle; with an Owner Credential also every Delegated Credential for it. */
 export async function revokeAllKeys(ctx: IssuerContext, handle: string, cred: Credential): Promise<void> {
-  for (const k of await listLiveKeys(ctx, handle)) if (k.status === 'active' || k.status === 'pending') await revokeKeyEffects(ctx, k);
+  for (const k of await ctx.store.listKeys(handle)) if (k.status === 'active' || k.status === 'pending') await revokeKeyEffects(ctx, k.kid);
   if (cred.kind === 'owner') for (const d of await ctx.store.listCredentials({ handle, kind: 'delegated' })) await ctx.store.deleteCredential(d.hash);
 }
 
-/** Section 7.4: effects of disabling an Account. */
+/** Section 7.4: disable or enable an Account. The status is written first, then what depends on it is ended. */
 export async function setAccountStatus(ctx: IssuerContext, handle: string, clientId: string, status: 'enabled' | 'disabled'): Promise<Record<string, unknown>> {
-  const account = await ctx.store.getAccount(handle, clientId);
+  const account = await ctx.store.setAccountStatus(handle, clientId, status);
   if (!account) throw new OAuthError(404, 'not_found', 'no account for this client');
-  account.status = status;
-  await ctx.store.putAccount(account);
   if (status === 'disabled') {
-    for (const tx of await ctx.store.listOpenTransactions({ handle, clientId })) {
-      if (tx.assertedAt) await deny(ctx, tx, 'access_denied'); // only transactions past step 7
-    }
-    await voidCodes(ctx, { handle, clientId });
-    await revokeTokens(ctx, { handle, clientId });
+    await denyOpenTransactions(ctx, { handle, clientId }, 'access_denied', true); // only transactions past step 7
+    await ctx.store.voidCodes({ handle, clientId });
+    await ctx.store.revokeAccessTokens({ handle, clientId });
   }
   return accountRecord(account);
 }
 
 /** Section 7.4 table, "Agent disabled": open transactions it asserted are denied, codes voided, tokens invalidated. */
-export async function setAgentEnabled(ctx: IssuerContext, agent: Agent, enabled: boolean): Promise<void> {
-  agent.enabled = enabled;
-  await ctx.store.putAgent(agent);
-  if (!enabled) {
-    for (const tx of await ctx.store.listOpenTransactions({ handle: agent.handle })) await deny(ctx, tx, 'access_denied');
-    await voidCodes(ctx, { handle: agent.handle });
-    await revokeTokens(ctx, { handle: agent.handle });
+export async function setAgentEnabled(ctx: IssuerContext, handle: string, enabled: boolean): Promise<Agent | undefined> {
+  const agent = await ctx.store.setAgentEnabled(handle, enabled);
+  if (agent && !enabled) {
+    await denyOpenTransactions(ctx, { handle }, 'access_denied');
+    await ctx.store.voidCodes({ handle });
+    await ctx.store.revokeAccessTokens({ handle });
   }
+  return agent;
 }
 
 /**
@@ -190,9 +193,9 @@ export async function setAgentEnabled(ctx: IssuerContext, agent: Agent, enabled:
  * deleted; the per-owner count of Section 7.6 is retained. An Agent created later with the same handle starts with none.
  */
 export async function deleteAgent(ctx: IssuerContext, agent: Agent): Promise<void> {
-  await setAgentEnabled(ctx, agent, false);
+  await setAgentEnabled(ctx, agent.handle, false);
   for (const k of await ctx.store.listKeys(agent.handle)) {
-    if (k.status === 'active' || k.status === 'pending') await revokeKeyEffects(ctx, k);
+    await revokeKeyEffects(ctx, k.kid);
     await ctx.store.deleteKey(k.kid);
   }
   for (const c of await ctx.store.listConsents(agent.handle)) await ctx.store.deleteConsent(c.handle, c.clientId);
@@ -209,31 +212,6 @@ export async function deleteAgent(ctx: IssuerContext, agent: Agent): Promise<voi
 export const approvalSession = (cred: Credential): boolean =>
   cred.kind === 'owner' && (cred.sessionAuth === 'passkey' || cred.sessionAuth === 'oidc' || cred.sessionAuth === 'domain' || cred.sessionAuth === 'email_factor');
 
-async function deny(ctx: IssuerContext, tx: Transaction, reason: 'key_revoked' | 'access_denied'): Promise<void> {
-  tx.status = 'denied';
-  tx.reason = reason;
-  tx.terminalAt = ctx.now();
-  tx.challenge = undefined;
-  tx.continueSecret ??= randomSecret();
-  await ctx.store.putTransaction(tx);
-}
-async function voidCodes(ctx: IssuerContext, f: { kid?: string; handle?: string; clientId?: string }): Promise<void> {
-  for (const c of await ctx.store.listCodes(f)) {
-    if (!c.used && !c.voided) {
-      c.voided = true;
-      await ctx.store.putCode(c);
-    }
-  }
-}
-async function revokeTokens(ctx: IssuerContext, f: { kid?: string; handle?: string; clientId?: string }): Promise<void> {
-  for (const t of await ctx.store.listAccessTokens(f)) {
-    if (!t.revoked) {
-      t.revoked = true;
-      await ctx.store.putAccessToken(t);
-    }
-  }
-}
-
 export function accountRecord(a: { clientId: string; status: string; firstSignedInAt: number; lastSignedInAt: number; signInCount: number }): Record<string, unknown> {
   return { client_id: a.clientId, status: a.status, first_signed_in_at: a.firstSignedInAt, last_signed_in_at: a.lastSignedInAt, sign_in_count: a.signInCount };
 }
@@ -248,5 +226,3 @@ export async function authorizeManagement(ctx: IssuerContext, authorization: str
   if (cred.kind === 'delegated' && !delegable) throw new OAuthError(403, 'insufficient_permission', undefined, { 'WWW-Authenticate': 'Bearer error="insufficient_scope"' });
   return cred;
 }
-
-export const openTransactions = (txs: Transaction[]) => txs.filter((t) => !TERMINAL.has(t.status));

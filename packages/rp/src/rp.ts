@@ -83,7 +83,8 @@ export interface AgentIdentity {
 }
 /** The Owner's personal data, present when a Registered Client requested and was granted owner scopes. Store it apart from Agent data (Section 9 item 8). */
 export interface OwnerIdentity {
-  key: string;
+  /** `iss` and `owner_sub` joined by a space; present only when `profile` was granted as well, since `owner_sub` comes with that scope. */
+  key?: string;
   name?: string;
   email?: string;
   verifiedVia?: string;
@@ -126,7 +127,6 @@ export class RelyingParty {
   private readonly jwksCache = new Map<string, JwksEntry>();
   /** When a JWK Set was last refetched because of an unknown `kid`: a throttle, kept apart from the cache lifetime. */
   private readonly jwksMissAt = new Map<string, number>();
-  private relayChecked = false;
 
   constructor(private readonly o: RelyingPartyOptions) {
     if (typeof o.stateSecret !== 'string' || o.stateSecret.length < 32) throw new Error('stateSecret must be a string of at least 32 characters');
@@ -196,17 +196,19 @@ export class RelyingParty {
       throw new RelyingPartyError(configured && /does not equal|invalid issuer/.test((e as Error).message) ? 'configuration_error' : 'discovery_failed', configured ? 'metadata of a configured Issuer is unavailable or does not match its identifier' : 'Issuer metadata unavailable', undefined, { cause: e });
     }
   }
-  /** Section 9 item 10: a Relay and a Home Issuer it relays must not both be configured. Checked once, lazily. */
+  /**
+   * Section 9 item 10: a Relay and a Home Issuer it relays must not both be accepted, or an Owner's Agents could sign
+   * in by both routes and be counted twice. Checked against the Relay's metadata as it is now, every time: the list
+   * of Home Issuers a Relay accepts can grow after this application was configured.
+   */
   private async checkRelayConfiguration(): Promise<void> {
-    if (this.relayChecked || !this.relay) return;
+    if (!this.relay) return;
     const accepted = (await this.metadata(this.relay.issuer)).home_issuers;
     const all = Array.isArray(accepted) && accepted.length === 1 && accepted[0] === '*';
-    const others = [...this.issuers.keys()].filter((i) => i !== this.relay!.issuer);
-    const overlap = others.filter((i) => all || (Array.isArray(accepted) && accepted.includes(i)));
+    const overlap = [...this.issuers.keys()].filter((i) => i !== this.relay!.issuer && (all || (Array.isArray(accepted) && accepted.includes(i))));
     if (overlap.length) {
       throw new RelyingPartyError('configuration_error', 'a Relay is configured together with a Home Issuer it relays; per-owner caps would be counted twice (Section 9 item 10)');
     }
-    this.relayChecked = true;
   }
 
   /** Chooses the Issuer for a sign-in (Section 9 item 10). Nothing is fetched from an Issuer that is not accepted. */
@@ -297,6 +299,7 @@ export class RelyingParty {
     const code = one('code');
     if (!code) throw new RelyingPartyError('invalid_request', 'no code in the response');
 
+    await this.checkRelayConfiguration();
     // Token Request, only to the recorded Issuer's Token Endpoint (Section 5.6).
     const m = await this.metadata(pending.issuer);
     const { clientId, clientSecret } = this.clientFor(pending.issuer);
@@ -321,7 +324,7 @@ export class RelyingParty {
 
     const claims = await this.validateIdToken(tok.id_token, { issuer: pending.issuer, nonce: pending.nonce, clientId, metadata: m });
     const expiresIn = typeof tok.expires_in === 'number' && tok.expires_in > 0 ? Math.min(tok.expires_in, 3600) : 600;
-    return { ...identity(claims), claims, issuer: pending.issuer, accessToken: tok.access_token, accessTokenExpiresAt: Math.floor(Date.now() / 1000) + expiresIn, returnTo: pending.returnTo };
+    return { ...this.identityOf(claims), claims, issuer: pending.issuer, accessToken: tok.access_token, accessTokenExpiresAt: Math.floor(Date.now() / 1000) + expiresIn, returnTo: pending.returnTo };
   }
 
   /** Section 5.7 steps 2 to 7 (R-3, R-4, R-14). Nothing from a token that fails is returned. */
@@ -359,6 +362,7 @@ export class RelyingParty {
       const accepted = (x.metadata ?? (await this.metadata(x.issuer))).home_issuers;
       const ok = Array.isArray(accepted) && ((accepted.length === 1 && accepted[0] === '*') || accepted.includes(homeIss));
       if (!ok) throw new RelyingPartyError('handle_binding_failed', "home_iss is not among the Relay's home_issuers");
+      if (this.issuers.has(homeIss)) throw new RelyingPartyError('configuration_error', 'this Home Issuer is accepted directly and through the Relay; per-owner caps would be counted twice (Section 9 item 10)');
     }
     if (payload.email !== undefined) {
       if (typeof payload.email !== 'string' || payload.email_verified !== true) throw bad('email without email_verified true');
@@ -431,6 +435,10 @@ export class RelyingParty {
     if (body.sub !== sub) throw new RelyingPartyError('userinfo_failed', 'UserInfo sub does not match the ID Token');
     return body;
   }
+  /** The Agent, and the Owner data when an owner scope was granted, from validated ID Token Claims. */
+  identityOf(claims: JWTPayload): { agent: AgentIdentity; owner?: OwnerIdentity } {
+    return identity(claims);
+  }
   /** The part of a sign-in that `recheck` needs; discard it when `accessTokenExpiresAt` has passed. */
   liveCheckOf(s: SignIn): LiveCheck {
     return { issuer: s.issuer, accessToken: s.accessToken, accessTokenExpiresAt: s.accessTokenExpiresAt, sub: s.agent.sub };
@@ -458,6 +466,7 @@ function identity(c: JWTPayload): { agent: AgentIdentity; owner?: OwnerIdentity 
   const ownerKey = ownerSub ? `${iss} ${ownerSub}` : undefined;
   const agent: AgentIdentity = { iss, sub, key: `${iss} ${sub}`, handle: str('email'), name: str('name'), preferredUsername: str('preferred_username'), ownerKey, homeIss: str('home_iss'), scopes: typeof c.scope === 'string' ? c.scope.split(' ') : [] };
   const hasOwnerData = str('owner_name') !== undefined || str('owner_email') !== undefined;
-  const owner: OwnerIdentity | undefined = ownerKey && hasOwnerData ? { key: ownerKey, name: str('owner_name'), email: c.owner_email_verified === true ? str('owner_email') : undefined, verifiedVia: str('owner_verified_via') } : undefined;
+  // Owner data comes with `owner_profile` and `owner_email`; the identifier comes with `profile` and may be absent.
+  const owner: OwnerIdentity | undefined = hasOwnerData ? { key: ownerKey, name: str('owner_name'), email: c.owner_email_verified === true ? str('owner_email') : undefined, verifiedVia: str('owner_verified_via') } : undefined;
   return { agent, owner };
 }

@@ -5,8 +5,9 @@ import type { IssuerContext } from './context.js';
 import { OAuthError } from './errors.js';
 import { getLiveKey } from './agents.js';
 import { ownerClaimsAvailable } from './tokens.js';
+import { commit, denyTransaction, effective, ended, releasePlace, subjectState } from './state.js';
 import { TERMINAL, type Client, type Consent, type ConsentReason, type DenyReason, type Transaction, type TxStatus } from './store.js';
-import { domainServed, handlesEqual, isPlainObject, nowSeconds, parseHandle, randomId, randomSecret, sha256, typMatches } from './util.js';
+import { domainServed, handlesEqual, isPlainObject, parseHandle, randomId, randomSecret, sha256, typMatches } from './util.js';
 
 export type Viewer =
   | { kind: 'none' }
@@ -34,6 +35,8 @@ export async function createTransaction(ctx: IssuerContext, p: CreateParams): Pr
   const now = ctx.now();
   const tx: Transaction = {
     id: randomId(),
+    version: 0,
+    continueSecret: randomSecret(),
     clientId: p.client.clientId,
     redirectUri: p.redirectUri,
     scopes: p.scopes,
@@ -56,29 +59,23 @@ export async function createTransaction(ctx: IssuerContext, p: CreateParams): Pr
     sessionSecretHash: sha256(p.sessionSecret),
     codeIssued: false,
   };
-  await ctx.store.putTransaction(tx);
+  await ctx.store.insertTransaction(tx);
   return tx;
 }
 
-/** Applies expiry lazily (Section 6.2). */
-export function refresh(ctx: IssuerContext, tx: Transaction): Transaction {
-  if (!TERMINAL.has(tx.status) && ctx.now() >= tx.expiresAt) setTerminal(ctx, tx, 'expired');
-  return tx;
-}
-
-export function setTerminal(ctx: IssuerContext, tx: Transaction, status: 'completed' | 'denied' | 'expired', reason?: DenyReason): void {
-  tx.status = status;
-  if (reason) tx.reason = reason;
-  tx.terminalAt = ctx.now();
-  tx.challenge = undefined;
-  if (status !== 'completed') tx.continueSecret ??= randomSecret();
-}
-
-/** Loads a transaction or throws 404 `invalid_transaction` (Section 6.7); retains terminal ones for T_RETAIN. */
+/**
+ * Loads a transaction as it stands now, or throws 404 `invalid_transaction` (Section 6.7); terminal ones are retained
+ * for T_RETAIN. An open transaction whose asserting key has been revoked or has expired, or whose Agent or Account
+ * has been disabled, is ended here if nothing ended it before (Section 7.4 table): no later step can then proceed.
+ */
 export async function loadTransaction(ctx: IssuerContext, id: string): Promise<Transaction> {
-  const tx = await ctx.store.getTransaction(id);
-  if (!tx) throw new OAuthError(404, 'invalid_transaction');
-  refresh(ctx, tx);
+  const stored = await ctx.store.getTransaction(id);
+  if (!stored) throw new OAuthError(404, 'invalid_transaction');
+  let tx = effective(ctx, stored);
+  if (!TERMINAL.has(tx.status) && tx.kid && tx.handle && tx.keyEnrollment) {
+    const dead = await subjectState(ctx, { handle: tx.handle, kid: tx.kid, keyEnrollment: tx.keyEnrollment, clientId: tx.clientId });
+    if (dead) tx = (await denyTransaction(ctx, tx.id, dead)) ?? tx;
+  }
   if (TERMINAL.has(tx.status) && tx.terminalAt !== undefined && ctx.now() > tx.terminalAt + ctx.constants.T_RETAIN) {
     throw new OAuthError(404, 'invalid_transaction');
   }
@@ -133,7 +130,7 @@ function next(ctx: IssuerContext, tx: Transaction, viewer: Viewer): Record<strin
       // when the accepted assertion carried deliver_to_session.
       const release = viewer.kind === 'transaction_token' || (viewer.kind === 'session' && tx.deliverToSession);
       const n: Record<string, unknown> = { action: 'continue', method: 'GET' };
-      if (release && tx.continueSecret) n.url = `${base}/continue/${tx.continueSecret}`;
+      if (release) n.url = `${base}/continue/${tx.continueSecret}`;
       return n;
     }
   }
@@ -174,39 +171,17 @@ export function reviewReasons(ctx: IssuerContext, tx: Transaction, client: Clien
   return { record, forced };
 }
 
-async function writeConsent(ctx: IssuerContext, tx: Transaction, client: Client): Promise<void> {
-  const existing = await ctx.store.getConsent(tx.handle!, tx.clientId);
-  const now = ctx.now();
-  await ctx.store.putConsent({
-    handle: tx.handle!,
-    clientId: tx.clientId,
-    scopes: [...new Set([...(existing?.scopes ?? []), ...tx.scopes])],
-    redirectHost: new URL(tx.redirectUri).host,
-    clientName: client.clientName,
-    tosUri: client.tosUri,
-    policyUri: client.policyUri,
-    createdAt: existing?.createdAt ?? now,
-    lastUsedAt: now,
-  });
-}
-
-const capKey = (ownerId: string, clientId: string) => `cap:${ownerId}\u0000${clientId}`;
-
-/**
- * The one place where a transaction becomes `ready`. A Consent Record that let the sign-in through without a new
- * acceptance is used at this moment, and only now is its last use renewed: a sign-in that ends denied, by
- * prompt=none, by the Owner or by the Agent at a forced review, leaves the record's clock alone (Section 6.4).
- */
-async function becomeReady(ctx: IssuerContext, tx: Transaction): Promise<void> {
-  tx.status = 'ready';
-  tx.continueSecret ??= randomSecret();
-  if (tx.consentRelied) {
-    const consent = await ctx.store.getConsent(tx.handle!, tx.clientId);
-    if (consent) {
-      consent.lastUsedAt = ctx.now();
-      await ctx.store.putConsent(consent);
-    }
+/** What follows an accepted change: the effects that are not themselves the state transition. */
+async function afterCommit(ctx: IssuerContext, tx: Transaction, client: Client, o: { grantConsent?: boolean } = {}): Promise<void> {
+  if (o.grantConsent && tx.handle) {
+    await ctx.store.grantConsent({ handle: tx.handle, clientId: tx.clientId, scopes: tx.scopes, redirectHost: new URL(tx.redirectUri).host, clientName: client.clientName, tosUri: client.tosUri, policyUri: client.policyUri }, ctx.now());
+  } else if (tx.status === 'ready' && tx.consentRelied && tx.handle) {
+    // A Consent Record that let the sign-in through without a new acceptance is used at this moment, and only now is
+    // its last use renewed: a sign-in that ends denied leaves the record's clock alone (Section 6.4).
+    await ctx.store.touchConsent(tx.handle, tx.clientId, ctx.now());
   }
+  if (TERMINAL.has(tx.status)) await releasePlace(ctx, tx);
+  else if (tx.passedCap && tx.ownerId) await ctx.store.extendSignup({ ownerId: tx.ownerId, clientId: tx.clientId, txnId: tx.id, expiresAt: tx.expiresAt });
 }
 
 /**
@@ -220,8 +195,13 @@ export function requireOpen(tx: Transaction): void {
   if (TERMINAL.has(tx.status)) throw new OAuthError(410, 'transaction_expired');
 }
 
-/** Section 6.3: verify an assertion and advance the transaction. Returns the transaction_token. */
-export async function assert(ctx: IssuerContext, tx: Transaction, client: Client, body: unknown): Promise<string> {
+/**
+ * Section 6.3: verify an assertion and advance the transaction. Returns the transaction as accepted and its
+ * transaction_token. Steps 6 and 7 are one conditional write: of several assertions for one transaction, at whatever
+ * issuer process they arrive, one is accepted and the others are answered `assertion_replayed`.
+ */
+export async function assert(ctx: IssuerContext, loaded: Transaction, client: Client, body: unknown): Promise<{ tx: Transaction; token: string }> {
+  const tx = loaded;
   requireOpen(tx);
   if (!isPlainObject(body) || typeof body.assertion !== 'string') throw new OAuthError(400, 'invalid_request', 'assertion required');
   const jws = body.assertion;
@@ -255,8 +235,7 @@ export async function assert(ctx: IssuerContext, tx: Transaction, client: Client
   // Step 2: resolve the key.
   const key = await getLiveKey(ctx, header.kid);
   if (!key || !handlesEqual(key.handle, parsed.handle) || !domainServed(parsed.domain, ctx.handleDomains)) throw new OAuthError(401, 'unknown_key');
-  if (key.status === 'active' && ctx.now() >= key.expiresAt) key.status = 'expired';
-  if (key.status !== 'active') throw new OAuthError(401, 'key_revoked');
+  if (key.status !== 'active' || ctx.now() >= key.expiresAt) throw new OAuthError(401, 'key_revoked');
   if (header.alg !== 'ES256') throw bad('alg does not match the key'); // only P-256 keys are enrolled
 
   // Step 3: signature.
@@ -286,174 +265,183 @@ export async function assert(ctx: IssuerContext, tx: Transaction, client: Client
 
   // Step 5: login_hint.
   if (tx.loginHint && !handlesEqual(tx.loginHint, parsed.handle)) throw bad('login_hint mismatch');
-  // Step 6: replay (covered above by the status check).
   const agent = await ctx.store.getAgent(key.handle);
   if (!agent || !agent.enabled) throw new OAuthError(401, 'unknown_key');
-
-  // Step 7: consume the challenge and record the authentication event.
-  tx.challenge = undefined;
-  tx.handle = agent.handle;
-  tx.kid = key.kid;
-  tx.ownerId = agent.ownerId;
-  tx.assertedAt = now;
-  tx.acceptDisclosure = payload.accept_disclosure === true;
-  tx.deliverToSession = payload.deliver_to_session === true;
   const token = randomSecret();
-  tx.transactionTokenHash = sha256(token);
+  const subject = { handle: agent.handle, kid: key.kid, keyEnrollment: key.enrollment, clientId: tx.clientId };
 
-  // Step 8: disabled Account.
-  const account = await ctx.store.getAccount(agent.handle, tx.clientId);
-  if (account?.status === 'disabled') {
-    setTerminal(ctx, tx, 'denied', 'access_denied');
-    await ctx.store.putTransaction(tx);
-    return token;
-  }
-  // Step 9: per-owner cap (Section 7.6).
-  if (!account && client.maxSignupsPerOwner !== undefined) {
-    const max = client.maxSignupsPerOwner;
-    // Checked and reserved under one lock per (Owner, client), so that concurrent first sign-ins cannot both take the
-    // last place. A place is held by an Agent, not by a transaction: several transactions of one Agent hold one, and
-    // a transaction that has expired holds none, whether or not anyone has read it since.
-    // The same lock covers a completion (see `cont`), which turns a reservation into an Account: without it a
-    // completion could fall between the two reads below and both it and this Agent would be admitted.
-    const admitted = await ctx.locks.run(capKey(agent.ownerId, tx.clientId), async () => {
-      const ever = await ctx.store.signupsEver(agent.ownerId, tx.clientId);
-      const now = ctx.now();
-      const inFlight = new Set(
-        (await ctx.store.listOpenTransactions({ ownerId: agent.ownerId, clientId: tx.clientId }))
-          .filter((t) => t.passedCap && t.id !== tx.id && now < t.expiresAt && t.handle !== undefined && t.handle !== agent.handle)
-          .map((t) => t.handle!),
-      );
-      // An Agent that has an Account by now is already in `ever`: its other open transactions hold no further place.
-      let others = 0;
-      for (const handle of inFlight) if (!(await ctx.store.getAccount(handle, tx.clientId))) others += 1;
-      if (ever + others >= max) return false;
-      tx.passedCap = true;
-      await ctx.store.putTransaction(tx); // the reservation is stored before the lock is released
-      return true;
-    });
-    if (!admitted) {
-      setTerminal(ctx, tx, 'denied', 'signup_limit_reached');
-      await ctx.store.putTransaction(tx);
-      return token;
+  for (let current = tx; ; ) {
+    // Step 6: one assertion per transaction. Decided again on every attempt, against the transaction as it is now.
+    if (TERMINAL.has(current.status)) throw new OAuthError(410, 'transaction_expired');
+    if (current.status !== 'awaiting_agent') throw new OAuthError(409, 'assertion_replayed');
+    if (payload.nonce !== current.challenge) throw bad('nonce');
+
+    // Step 7: the challenge is consumed and the authentication event recorded.
+    let next: Transaction = {
+      ...current,
+      challenge: undefined,
+      handle: agent.handle,
+      kid: key.kid,
+      keyEnrollment: key.enrollment,
+      ownerId: agent.ownerId,
+      assertedAt: now,
+      acceptDisclosure: payload.accept_disclosure === true,
+      deliverToSession: payload.deliver_to_session === true,
+      transactionTokenHash: sha256(token),
+    };
+    let grantConsent = false;
+    let reserved = false;
+    // Step 8: disabled Account.
+    const account = await ctx.store.getAccount(agent.handle, next.clientId);
+    if (account?.status === 'disabled') next = ended(ctx, next, 'denied', 'access_denied');
+    else {
+      // Step 9: per-owner cap (Section 7.6). The check and the reservation are one atomic store operation.
+      if (!account && client.maxSignupsPerOwner !== undefined) {
+        reserved = await ctx.store.reserveSignup({ ownerId: agent.ownerId, clientId: next.clientId, handle: agent.handle, txnId: next.id, expiresAt: next.expiresAt, max: client.maxSignupsPerOwner, now: ctx.now() });
+        if (!reserved) next = ended(ctx, next, 'denied', 'signup_limit_reached');
+        else next.passedCap = true;
+      }
+      if (next.status !== 'denied') ({ next, grantConsent } = await gates(ctx, next, client, key.permissions.share_owner, agent.ownerId));
     }
-  }
-  // Step 10: gates.
-  const wantsOwner = tx.scopes.some((s) => OWNER_SCOPES.includes(s));
-  if (wantsOwner) {
-    // Section 6.6: a requested Owner Claim that cannot be issued for this Owner ends the sign-in; it is never omitted.
-    const owner = await ctx.store.getOwner(agent.ownerId);
-    if (!owner || !ownerClaimsAvailable(owner, tx.scopes)) {
-      setTerminal(ctx, tx, 'denied', 'access_denied');
-      await ctx.store.putTransaction(tx);
-      return token;
+
+    if (await commit(ctx, next, current.version)) {
+      await afterCommit(ctx, next, client, { grantConsent });
+      // The key, the Agent and the Account are read again now that the transaction names them: a revocation or a
+      // disable that happened meanwhile either saw this transaction and ended it, or is seen here.
+      const dead = TERMINAL.has(next.status) ? null : await subjectState(ctx, subject);
+      if (dead) next = (await denyTransaction(ctx, next.id, dead)) ?? next;
+      return { tx: next, token };
     }
+    // Another request changed the transaction first: give back the place and decide again.
+    if (reserved) await ctx.store.releaseSignup({ ownerId: agent.ownerId, clientId: next.clientId, txnId: next.id });
+    const stored = await ctx.store.getTransaction(tx.id);
+    if (!stored) throw new OAuthError(404, 'invalid_transaction');
+    current = effective(ctx, stored);
   }
-  tx.ownerApprovalOutstanding = wantsOwner && !key.permissions.share_owner;
-  const consent = await ctx.store.getConsent(agent.handle, tx.clientId);
-  const { record, forced } = reviewReasons(ctx, tx, client, consent);
-  if (record === 'expired') await ctx.store.deleteConsent(agent.handle, tx.clientId); // Section 6.4: unused for T_CONSENT
-  // accept_disclosure answers for the Consent Record only; a review that the request or the client demands stays due.
-  const recordOutstanding = record !== null && !tx.acceptDisclosure;
-  tx.reviewOutstanding = recordOutstanding || forced !== null;
-  tx.consentReason = (recordOutstanding ? record : forced) ?? undefined;
-  tx.consentRelied = consent !== undefined && record === null; // renewed when, and only if, the transaction becomes ready
-  if (tx.prompt === 'none' && tx.reviewOutstanding) {
-    setTerminal(ctx, tx, 'denied', 'consent_required');
-  } else if (tx.prompt === 'none' && tx.ownerApprovalOutstanding) {
-    setTerminal(ctx, tx, 'denied', 'interaction_required');
-  } else {
-    if (tx.acceptDisclosure && !tx.reviewOutstanding) await writeConsent(ctx, tx, client);
-    if (tx.ownerApprovalOutstanding) {
-      tx.status = 'awaiting_owner';
-      tx.expiresAt = Math.max(tx.expiresAt, tx.createdAt + ctx.constants.T_OWNER); // Section 6.6
-    } else if (tx.reviewOutstanding) tx.status = 'awaiting_consent';
-    else await becomeReady(ctx, tx);
-  }
-  await ctx.store.putTransaction(tx);
-  return token;
 }
 
-/** Section 6.4: the review decision, authorised by the transaction_token only. */
-export async function review(ctx: IssuerContext, tx: Transaction, client: Client, viewer: Viewer, body: unknown): Promise<void> {
-  requireTransactionToken(viewer); // the session binding does not authorise this step
-  requireOpen(tx);
-  if (tx.status !== 'awaiting_consent') throw new OAuthError(400, 'invalid_request', 'no review is outstanding');
-  if (!isPlainObject(body) || (body.decision !== 'allow' && body.decision !== 'deny')) throw new OAuthError(400, 'invalid_request', 'decision must be allow or deny');
-  if (body.decision === 'deny') {
-    setTerminal(ctx, tx, 'denied', 'cancelled');
-  } else {
-    await writeConsent(ctx, tx, client);
-    tx.reviewOutstanding = false;
-    if (tx.ownerApprovalOutstanding) tx.status = 'awaiting_owner';
-    else await becomeReady(ctx, tx);
+/** Step 10 of Section 6.3: the outstanding gates and the status they lead to. */
+async function gates(ctx: IssuerContext, tx: Transaction, client: Client, shareOwner: boolean, ownerId: string): Promise<{ next: Transaction; grantConsent: boolean }> {
+  const next = { ...tx };
+  const wantsOwner = next.scopes.some((s) => OWNER_SCOPES.includes(s));
+  if (wantsOwner) {
+    // Section 6.6: a requested Owner Claim that cannot be issued for this Owner ends the sign-in; it is never omitted.
+    const owner = await ctx.store.getOwner(ownerId);
+    if (!owner || !ownerClaimsAvailable(owner, next.scopes)) return { next: ended(ctx, next, 'denied', 'access_denied'), grantConsent: false };
   }
-  await ctx.store.putTransaction(tx);
+  next.ownerApprovalOutstanding = wantsOwner && !shareOwner;
+  const consent = await ctx.store.getConsent(next.handle!, next.clientId);
+  const { record, forced } = reviewReasons(ctx, next, client, consent);
+  if (record === 'expired') await ctx.store.deleteConsent(next.handle!, next.clientId); // Section 6.4: unused for T_CONSENT
+  // accept_disclosure answers for the Consent Record only; a review that the request or the client demands stays due.
+  const recordOutstanding = record !== null && !next.acceptDisclosure;
+  next.reviewOutstanding = recordOutstanding || forced !== null;
+  next.consentReason = (recordOutstanding ? record : forced) ?? undefined;
+  next.consentRelied = consent !== undefined && record === null;
+  if (next.prompt === 'none' && next.reviewOutstanding) return { next: ended(ctx, next, 'denied', 'consent_required'), grantConsent: false };
+  if (next.prompt === 'none' && next.ownerApprovalOutstanding) return { next: ended(ctx, next, 'denied', 'interaction_required'), grantConsent: false };
+  if (next.ownerApprovalOutstanding) {
+    next.status = 'awaiting_owner';
+    next.expiresAt = Math.max(next.expiresAt, next.createdAt + ctx.constants.T_OWNER); // Section 6.6
+  } else if (next.reviewOutstanding) next.status = 'awaiting_consent';
+  else next.status = 'ready';
+  return { next, grantConsent: next.acceptDisclosure && !next.reviewOutstanding };
+}
+
+/** Section 6.4: the review decision, authorised by the transaction_token only. Returns the transaction as changed. */
+export async function review(ctx: IssuerContext, loaded: Transaction, client: Client, viewer: Viewer, body: unknown): Promise<Transaction> {
+  requireTransactionToken(viewer); // the session binding does not authorise this step
+  for (let current = loaded; ; ) {
+    requireOpen(current);
+    if (current.status !== 'awaiting_consent') throw new OAuthError(400, 'invalid_request', 'no review is outstanding');
+    if (!isPlainObject(body) || (body.decision !== 'allow' && body.decision !== 'deny')) throw new OAuthError(400, 'invalid_request', 'decision must be allow or deny');
+    const allow = body.decision === 'allow';
+    const next: Transaction = allow
+      ? { ...current, reviewOutstanding: false, status: current.ownerApprovalOutstanding ? 'awaiting_owner' : 'ready' }
+      : ended(ctx, current, 'denied', 'cancelled');
+    if (await commit(ctx, next, current.version)) {
+      await afterCommit(ctx, next, client, { grantConsent: allow });
+      return next;
+    }
+    current = await reload(ctx, loaded.id);
+  }
 }
 
 /** Section 6.6: the Owner's decision, given with an Owner Credential of the asserting Agent's Owner. */
-export async function ownerDecision(ctx: IssuerContext, tx: Transaction, ownerId: string, decision: unknown): Promise<void> {
-  if (TERMINAL.has(tx.status)) throw new OAuthError(410, 'transaction_expired');
-  if (tx.status !== 'awaiting_owner') throw new OAuthError(400, 'invalid_request', 'no approval is outstanding');
-  if (tx.ownerId !== ownerId) throw new OAuthError(404, 'invalid_transaction');
-  if (decision !== 'approve' && decision !== 'refuse') throw new OAuthError(400, 'invalid_request', 'decision must be approve or refuse');
-  if (decision === 'refuse') setTerminal(ctx, tx, 'denied', 'owner_declined');
-  else {
-    tx.ownerApprovalOutstanding = false;
-    if (tx.reviewOutstanding) tx.status = 'awaiting_consent';
-    else await becomeReady(ctx, tx);
+export async function ownerDecision(ctx: IssuerContext, loaded: Transaction, client: Client, ownerId: string, decision: unknown): Promise<Transaction> {
+  for (let current = loaded; ; ) {
+    requireOpen(current);
+    if (current.status !== 'awaiting_owner') throw new OAuthError(400, 'invalid_request', 'no approval is outstanding');
+    if (current.ownerId !== ownerId) throw new OAuthError(404, 'invalid_transaction');
+    if (decision !== 'approve' && decision !== 'refuse') throw new OAuthError(400, 'invalid_request', 'decision must be approve or refuse');
+    const next: Transaction = decision === 'refuse'
+      ? ended(ctx, current, 'denied', 'owner_declined')
+      : { ...current, ownerApprovalOutstanding: false, status: current.reviewOutstanding ? 'awaiting_consent' : 'ready' };
+    if (await commit(ctx, next, current.version)) {
+      await afterCommit(ctx, next, client);
+      return next;
+    }
+    current = await reload(ctx, loaded.id);
   }
-  await ctx.store.putTransaction(tx);
+}
+
+async function reload(ctx: IssuerContext, id: string): Promise<Transaction> {
+  const stored = await ctx.store.getTransaction(id);
+  if (!stored) throw new OAuthError(404, 'invalid_transaction');
+  return effective(ctx, stored);
 }
 
 export interface ContinueResult { redirect: string }
 
-/** Section 6.5: follow the continue URL. Issues the code once for `ready`. */
-export async function cont(ctx: IssuerContext, tx: Transaction, secret: string, viewer: Viewer): Promise<ContinueResult> {
-  const release = viewer.kind === 'transaction_token' || (viewer.kind === 'session' && tx.deliverToSession);
-  if (!release) throw new OAuthError(401, 'invalid_token', undefined, { 'WWW-Authenticate': 'Bearer error="invalid_token"' });
-  if (!tx.continueSecret || secret !== tx.continueSecret) throw new OAuthError(404, 'invalid_transaction');
-  const u = new URL(tx.redirectUri);
-  u.searchParams.set('state', tx.state);
-  u.searchParams.set('iss', ctx.issuer);
-  if (tx.status === 'ready') {
+/**
+ * Section 6.5: follow the continue URL. For `ready`, the transaction becomes `completed` by one conditional write and
+ * only the request that made it issues the code: of several requests, at whatever issuer process, one receives a
+ * code and the others `transaction_expired`.
+ */
+export async function cont(ctx: IssuerContext, loaded: Transaction, secret: string, viewer: Viewer): Promise<ContinueResult> {
+  for (let tx = loaded; ; ) {
+    const release = viewer.kind === 'transaction_token' || (viewer.kind === 'session' && tx.deliverToSession);
+    if (!release) throw new OAuthError(401, 'invalid_token', undefined, { 'WWW-Authenticate': 'Bearer error="invalid_token"' });
+    if (secret !== tx.continueSecret) throw new OAuthError(404, 'invalid_transaction');
+    const u = new URL(tx.redirectUri);
+    u.searchParams.set('state', tx.state);
+    u.searchParams.set('iss', ctx.issuer);
+    if (tx.status === 'completed') throw new OAuthError(410, 'transaction_expired');
+    if (tx.status === 'denied' || tx.status === 'expired') {
+      const { error, description } = redirectError(tx);
+      u.searchParams.set('error', error);
+      if (description) u.searchParams.set('error_description', description);
+      return { redirect: u.href };
+    }
+    if (tx.status !== 'ready') throw new OAuthError(400, 'invalid_request', 'transaction is not ready');
+    const next = { ...ended(ctx, tx, 'completed'), codeIssued: true };
+    if (!(await commit(ctx, next, tx.version))) {
+      tx = await loadTransaction(ctx, tx.id);
+      continue;
+    }
+    // This request completed the transaction; it alone issues the code. Section 7.4: the Account is created or
+    // updated now, counted once however many transactions complete for it together (Section 7.6).
     const code = randomSecret();
-    await ctx.store.putCode({
+    await ctx.store.insertCode({
       hash: sha256(code),
-      txnId: tx.id,
-      clientId: tx.clientId,
-      redirectUri: tx.redirectUri,
-      codeChallenge: tx.codeChallenge,
-      nonce: tx.nonce,
-      scopes: tx.scopes,
-      handle: tx.handle!,
-      kid: tx.kid!,
-      authTime: tx.assertedAt!,
+      txnId: next.id,
+      clientId: next.clientId,
+      redirectUri: next.redirectUri,
+      codeChallenge: next.codeChallenge,
+      nonce: next.nonce,
+      scopes: next.scopes,
+      handle: next.handle!,
+      kid: next.kid!,
+      keyEnrollment: next.keyEnrollment!,
+      authTime: next.assertedAt!,
       expiresAt: ctx.now() + ctx.constants.T_CODE,
       used: false,
       voided: false,
     });
-    tx.codeIssued = true;
-    // Section 7.4: the Account is created or updated at the first completed transaction. Under the cap lock: the
-    // completion ends this transaction's reservation and creates the Account in one step as far as any cap check is
-    // concerned (Section 7.6). recordSignIn is itself atomic, so concurrent first completions create one Account and
-    // count one sign-up.
-    await ctx.locks.run(capKey(tx.ownerId!, tx.clientId), async () => {
-      setTerminal(ctx, tx, 'completed');
-      await ctx.store.recordSignIn({ handle: tx.handle!, clientId: tx.clientId, ownerId: tx.ownerId!, now: ctx.now() });
-      await ctx.store.putTransaction(tx);
-    });
+    await ctx.store.recordSignIn({ handle: next.handle!, clientId: next.clientId, ownerId: next.ownerId!, txnId: next.id, now: ctx.now() });
     u.searchParams.set('code', code);
     return { redirect: u.href };
   }
-  if (tx.status === 'completed') throw new OAuthError(410, 'transaction_expired');
-  if (tx.status === 'denied' || tx.status === 'expired') {
-    const { error, description } = redirectError(tx);
-    u.searchParams.set('error', error);
-    if (description) u.searchParams.set('error_description', description);
-    return { redirect: u.href };
-  }
-  throw new OAuthError(400, 'invalid_request', 'transaction is not ready');
 }
 
 /** Section 5.5 table. */

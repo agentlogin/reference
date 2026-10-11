@@ -156,3 +156,31 @@ export async function safeFetch(input: string | URL, o: SafeFetchOptions): Promi
     return { ...res, redirects };
   }
 }
+
+const T_CACHE = 86_400; // seconds, Section 1.5
+type HeaderMap = Record<string, string | string[] | undefined>;
+const first = (v: string | string[] | undefined): string | undefined => (Array.isArray(v) ? v.join(', ') : v);
+
+/**
+ * Freshness lifetime in seconds that a response allows (RFC 9111 Section 4.2), capped at T_CACHE: 0 for no-store or
+ * no-cache; otherwise max-age less Age; otherwise Expires less Date; `fallback` only when the response states
+ * neither. A max-age or Expires that does not parse means the response is already stale.
+ */
+export function freshness(headers: HeaderMap, fallback: number): number {
+  const cc = first(headers['cache-control']) ?? '';
+  if (/(?:^|,)\s*(?:no-store|no-cache)\b/i.test(cc)) return 0;
+  const age = Math.max(0, Number.parseInt(first(headers.age) ?? '0', 10) || 0);
+  const m = /(?:^|,)\s*max-age\s*=\s*("?)([^",]*)\1/i.exec(cc);
+  if (m) {
+    const value = m[2]!.trim();
+    return /^\d+$/.test(value) ? Math.max(0, Math.min(Number(value), T_CACHE) - age) : 0;
+  }
+  const expires = first(headers.expires);
+  if (expires !== undefined) {
+    const at = Date.parse(expires);
+    if (Number.isNaN(at)) return 0;
+    const date = Date.parse(first(headers.date) ?? '');
+    return Math.max(0, Math.min(Math.floor((at - (Number.isNaN(date) ? Date.now() : date)) / 1000), T_CACHE) - age);
+  }
+  return Math.min(fallback, T_CACHE);
+}

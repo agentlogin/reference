@@ -62,8 +62,14 @@ class Harness {
   /** Every exchange of the run, for the audit of I-49. */
   seen: Seen[] = [];
   current = 'bootstrap';
+  /** Keys this run itself enrolled on the operator's existing Agent: exactly these are revoked afterwards. */
+  private enrolledHere = new Set<string>();
   cx: CallContext = {
     seen: (x: Exchange) => {
+      if (this.o.handle && this.meta && x.method === 'POST' && x.res.status === 201 && x.url === `${this.meta.agents_endpoint}/${encodeURIComponent(this.o.handle)}/keys`) {
+        const kid = obj(x.res.json).kid;
+        if (typeof kid === 'string') this.enrolledHere.add(kid);
+      }
       this.seen.push({ check: this.current, method: x.method, url: x.url, status: x.res.status, cacheControl: x.res.headers.get('cache-control'), allowCredentials: x.res.headers.get('access-control-allow-credentials'), location: x.res.headers.get('location') });
     },
   };
@@ -259,8 +265,6 @@ class Harness {
   }
 
   // ---- bootstrap ---------------------------------------------------------------------------------
-  /** Existing-agent mode: the keys the Agent had before this run, so that only the run's own keys are revoked afterwards. */
-  private keysBefore?: Set<string>;
   /** Transactions this run left waiting for the Owner; refused at the end so that nobody is asked to approve a test. */
   private awaitingOwner = new Set<string>();
 
@@ -280,7 +284,6 @@ class Harness {
       this.credential = this.o.ownerCredential!;
       const listed = await call(`${this.meta.agents_endpoint}/${encodeURIComponent(this.o.handle!)}/keys`, { headers: { authorization: `Bearer ${this.credential}` } });
       if (listed.status !== 200) throw new Error(`the Owner Credential does not manage ${this.o.handle}: listing its keys answered ${listed.status}`);
-      this.keysBefore = new Set((obj(listed.json).keys as Array<{ kid: string }>).map((k) => k.kid));
       this.agent = await AgentClient.generate(this.o.handle!);
       const e = await this.agent.enroll(this.o.issuer, this.meta.agents_endpoint, this.credential);
       if (e.proof.status !== 200) throw new Error(`could not enroll a key for ${this.o.handle}: ${e.enroll.status}/${e.proof.status} ${e.proof.text.slice(0, 200)}`);
@@ -303,10 +306,16 @@ class Harness {
       if (probe.status !== 200 || obj(probe.json).status !== 'awaiting_agent') {
         throw new Error(`the client fixture does not work at this issuer: an unmodified Authentication Request answered ${probe.status} ${obj(probe.json).error ?? ''} ${obj(probe.json).error_description ?? ''}`.trim());
       }
+      let exchanged: Res;
       try {
-        await this.signIn();
+        exchanged = (await this.signIn()).tokenRes;
       } catch (e) {
-        throw new Error(`the client fixture cannot complete a sign-in (check the secret and the redirect URI): ${(e as Error).message}`);
+        throw new Error(`the client fixture cannot complete a sign-in (check the redirect URI): ${(e as Error).message}`);
+      }
+      // The sign-in is complete only when the code was exchanged: a wrong secret shows here, and is the fixture's fault.
+      if (exchanged.status !== 200 || typeof obj(exchanged.json).id_token !== 'string') {
+        const error = obj(exchanged.json).error;
+        throw new Error(`the client fixture cannot exchange a code${error === 'invalid_client' ? ' (the client secret is not accepted: invalid_client)' : ''}: the Token Endpoint answered ${exchanged.status} ${error ?? ''}`.trim());
       }
     }
   }
@@ -315,11 +324,12 @@ class Harness {
     for (const id of this.awaitingOwner) {
       await call(`${this.o.issuer}/owner/transactions/${id}/decision`, { method: 'POST', headers: { authorization: `Bearer ${this.credential}` }, json: { decision: 'refuse' } }).catch(() => undefined);
     }
-    if (!this.keysBefore || !this.o.handle || !this.meta) return;
+    if (!this.o.handle || !this.meta) return;
+    // Only the keys whose enrollment this run performed itself. A key that appeared on the Agent meanwhile, enrolled
+    // by its Owner or by anything else, is not this run's to revoke.
     const base = `${this.meta.agents_endpoint}/${encodeURIComponent(this.o.handle)}/keys`;
-    const listed = await call(base, { headers: { authorization: `Bearer ${this.o.ownerCredential}` } }).catch(() => undefined);
-    for (const k of (listed && listed.status === 200 ? (obj(listed.json).keys as Array<{ kid: string; status: string }>) : [])) {
-      if (!this.keysBefore.has(k.kid) && k.status !== 'revoked') await call(`${base}/${encodeURIComponent(k.kid)}`, { method: 'DELETE', headers: { authorization: `Bearer ${this.o.ownerCredential}` } }).catch(() => undefined);
+    for (const kid of this.enrolledHere) {
+      await call(`${base}/${encodeURIComponent(kid)}`, { method: 'DELETE', headers: { authorization: `Bearer ${this.o.ownerCredential}` } }).catch(() => undefined);
     }
   }
 

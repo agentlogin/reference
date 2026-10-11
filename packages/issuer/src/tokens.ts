@@ -5,6 +5,7 @@ import type { IssuerContext } from './context.js';
 import { OAuthError, invalidToken } from './errors.js';
 import type { Agent, Client, Owner } from './store.js';
 import { nowSeconds, randomSecret, safeEqual, sha256 } from './util.js';
+import { subjectState } from './state.js';
 import type { Scope } from './constants.js';
 
 export interface TokenRequest {
@@ -38,58 +39,47 @@ export async function authenticateClient(ctx: IssuerContext, r: TokenRequest): P
 export async function exchangeCode(ctx: IssuerContext, client: Client, r: TokenRequest): Promise<Record<string, unknown>> {
   if (r.grantType !== 'authorization_code') throw new OAuthError(400, 'unsupported_grant_type');
   if (!r.code || !r.redirectUri || !r.codeVerifier) throw new OAuthError(400, 'invalid_grant', 'code, redirect_uri and code_verifier are required');
-  // One exchange at a time per code, so that a replay is seen after the first redemption has finished (Section 5.4).
-  return ctx.locks.run(`code:${sha256(r.code)}`, () => exchangeLocked(ctx, client, r));
-}
-
-async function exchangeLocked(ctx: IssuerContext, client: Client, r: TokenRequest): Promise<Record<string, unknown>> {
-  const code = await ctx.store.getCode(sha256(r.code!));
   const fail = () => new OAuthError(400, 'invalid_grant');
+  const hash = sha256(r.code);
+  const code = await ctx.store.getCode(hash);
   if (!code) throw fail();
-  if (code.used) {
-    // Section 5.4: revoke tokens already issued for a code presented twice.
-    for (const t of await ctx.store.listAccessTokens({ handle: code.handle, clientId: code.clientId })) {
-      if (t.txnId === code.txnId) {
-        t.revoked = true;
-        await ctx.store.putAccessToken(t);
-      }
-    }
+  // What this request must prove, none of which changes any state: the client, the redirect URI, the verifier.
+  if (code.clientId !== client.clientId || code.redirectUri !== r.redirectUri) throw fail();
+  const challenge = createHash('sha256').update(r.codeVerifier, 'ascii').digest('base64url');
+  if (!safeEqual(challenge, code.codeChallenge)) throw fail();
+
+  // The redemption itself is one atomic operation with its preconditions: not used, not void, not expired. Of
+  // several Token Requests for one code, at whatever issuer process, one redeems it.
+  const redeemed = await ctx.store.redeemCode(hash, ctx.now());
+  if (redeemed === 'used') {
+    await ctx.store.revokeAccessTokens({ txnId: code.txnId }); // Section 5.4: a code presented twice
     throw fail();
   }
-  if (code.voided || ctx.now() >= code.expiresAt || code.clientId !== client.clientId || code.redirectUri !== r.redirectUri) throw fail();
-  const challenge = createHash('sha256').update(r.codeVerifier!, 'ascii').digest('base64url');
-  if (!safeEqual(challenge, code.codeChallenge)) throw fail();
-  const key = await ctx.store.getKey(code.kid);
-  if (!key || key.status !== 'active' || ctx.now() >= key.expiresAt) throw fail();
-  const account = await ctx.store.getAccount(code.handle, code.clientId);
-  if (account?.status === 'disabled') throw fail();
+  if (redeemed !== 'ok') throw fail();
+
+  // Read after the write (see state.ts): the asserting key in the same enrollment, the Agent and the Account must
+  // still stand. A revocation or a disable that ran meanwhile either voided the code before it was redeemed, or is
+  // seen here. On failure the code stays used.
+  const subject = { handle: code.handle, kid: code.kid, keyEnrollment: code.keyEnrollment, clientId: code.clientId };
+  if (await subjectState(ctx, subject)) throw fail();
   const agent = await ctx.store.getAgent(code.handle);
   const owner = agent && (await ctx.store.getOwner(agent.ownerId));
-  if (!agent || !agent.enabled || !owner) throw fail();
+  if (!agent || !owner) throw fail();
   if (!ownerClaimsAvailable(owner, code.scopes)) throw fail(); // Section 6.6: never a token that omits a requested Owner Claim
-  // The single conditional write that consumes the code: a second redemption, in this process or another, gets false.
-  if (!(await ctx.store.markCodeUsed(code.hash))) throw fail();
 
   const accessToken = randomSecret();
   const now = ctx.now();
-  await ctx.store.putAccessToken({
-    hash: sha256(accessToken),
-    txnId: code.txnId,
-    clientId: client.clientId,
-    handle: code.handle,
-    kid: code.kid,
-    scopes: code.scopes,
-    expiresAt: now + ctx.constants.T_TOKEN,
-    revoked: false,
-  });
+  await ctx.store.insertAccessToken({ hash: sha256(accessToken), txnId: code.txnId, ...subject, scopes: code.scopes, expiresAt: now + ctx.constants.T_TOKEN, revoked: false });
+  // Section 5.4: when the code was presented again meanwhile, the token just issued is revoked. The other request
+  // marks the code and revokes what exists; this one looks after its own insert. Whichever order, the token ends revoked.
+  if ((await ctx.store.getCode(hash))?.replayed) await ctx.store.revokeAccessTokens({ txnId: code.txnId });
   const idToken = await mintIdToken(ctx, { agent, owner, client, scopes: code.scopes, nonce: code.nonce, authTime: code.authTime });
-  return {
-    access_token: accessToken,
-    token_type: 'Bearer',
-    expires_in: ctx.constants.T_TOKEN,
-    id_token: idToken,
-    scope: code.scopes.join(' '),
-  };
+  // Signing takes time. If the key was revoked while the token was being made, it is not handed out.
+  if (await subjectState(ctx, subject)) {
+    await ctx.store.revokeAccessTokens({ txnId: code.txnId });
+    throw fail();
+  }
+  return { access_token: accessToken, token_type: 'Bearer', expires_in: ctx.constants.T_TOKEN, id_token: idToken, scope: code.scopes.join(' ') };
 }
 
 /** Section 6.6: whether every Owner Claim that the scopes request can be issued for this Owner. */
@@ -141,13 +131,12 @@ export async function userinfo(ctx: IssuerContext, bearer: string | null): Promi
   if (!bearer) throw invalidToken();
   const t = await ctx.store.getAccessToken(sha256(bearer));
   if (!t || t.revoked || ctx.now() >= t.expiresAt) throw invalidToken();
-  const key = await ctx.store.getKey(t.kid);
-  if (!key || key.status !== 'active' || ctx.now() >= key.expiresAt) throw invalidToken();
+  // The key that asserted the sign-in, in the enrollment that asserted it: a key that expired and was enrolled again
+  // is a new enrollment and does not bring this token back (Section 3.3).
+  if (await subjectState(ctx, t)) throw invalidToken();
   const agent = await ctx.store.getAgent(t.handle);
   const owner = agent && (await ctx.store.getOwner(agent.ownerId));
-  if (!agent || !agent.enabled || !owner) throw invalidToken();
-  const account = await ctx.store.getAccount(t.handle, t.clientId);
-  if (account?.status === 'disabled') throw invalidToken();
+  if (!agent || !owner) throw invalidToken();
   return { iss: ctx.issuer, ...claimsFor(agent, owner, t.scopes), scope: t.scopes.join(' ') };
 }
 

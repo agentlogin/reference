@@ -29,6 +29,7 @@ let rp: RelyingParty;
 let owner: Record<string, any>;
 let rogueKey: { privateKey: CryptoKey; jwk: JWK; kid: string };
 const rogueJwks = { cacheControl: undefined as string | undefined, published: true, hits: 0 };
+const rogueMeta = { homeIssuers: ['*'] as string[], cacheControl: 'no-store' as string | undefined }; // not cached: each test sees the metadata it sets
 const sessions = new Map<string, SignIn>();
 const closers: Array<() => Promise<void>> = [];
 
@@ -49,7 +50,7 @@ before(async () => {
   const rogue = http.createServer((req, res) => {
     const send = (v: unknown, headers: Record<string, string> = {}) => { res.writeHead(200, { 'content-type': 'application/json', ...headers }); res.end(JSON.stringify(v)); };
     if (req.url === '/.well-known/openid-configuration') {
-      send({ issuer: rogueUrl, authorization_endpoint: `${rogueUrl}/authorize`, token_endpoint: `${rogueUrl}/token`, userinfo_endpoint: `${rogueUrl}/userinfo`, jwks_uri: `${rogueUrl}/jwks`, transaction_endpoint: `${rogueUrl}/transactions`, agents_endpoint: `${rogueUrl}/agents`, handle_domains: [], home_issuers: ['*'], agent_key_algs_supported: ['ES256'], agent_login_versions_supported: ['1.0'] });
+      send({ issuer: rogueUrl, authorization_endpoint: `${rogueUrl}/authorize`, token_endpoint: `${rogueUrl}/token`, userinfo_endpoint: `${rogueUrl}/userinfo`, jwks_uri: `${rogueUrl}/jwks`, transaction_endpoint: `${rogueUrl}/transactions`, agents_endpoint: `${rogueUrl}/agents`, handle_domains: [], home_issuers: rogueMeta.homeIssuers, agent_key_algs_supported: ['ES256'], agent_login_versions_supported: ['1.0'] }, rogueMeta.cacheControl ? { 'cache-control': rogueMeta.cacheControl } : {});
     } else if (req.url === '/jwks') {
       rogueJwks.hits += 1;
       send({ keys: rogueJwks.published ? [{ ...jwk, kid: rogueKey.kid, use: 'sig', alg: 'ES256' }] : [] }, rogueJwks.cacheControl ? { 'cache-control': rogueJwks.cacheControl } : {});
@@ -207,7 +208,7 @@ test('ID Token validation (Section 5.7) and the handle binding (Section 2.5)', a
   };
   const cfg = { clientId, redirectUri: `${rpUrl}/auth/agent/callback`, staticIssuers: { 'example.com': issuerUrl }, stateSecret: 'test-secret-test-secret-test-secret-1234', allowInsecure: true };
   const plain = new RelyingParty({ ...cfg, issuers: [issuerUrl, rogueUrl] });
-  const relay = new RelyingParty({ ...cfg, issuers: [issuerUrl, { issuer: rogueUrl, relay: true }] });
+  const relay = new RelyingParty({ ...cfg, issuers: [{ issuer: rogueUrl, relay: true }] }); // the Relay only: accepting its Home Issuer as well is refused (Section 9 item 10)
   const check = (r: RelyingParty, token: string) => r.validateIdToken(token, { issuer: rogueUrl, nonce, clientId });
   const rejects = (p: Promise<unknown>, code: string) => assert.rejects(p, (e: unknown) => e instanceof RelyingPartyError && e.code === code, code);
 
@@ -285,6 +286,51 @@ test('#5 the JWK Set is cached only as long as the Issuer allows; a removed key 
     rogueJwks.cacheControl = undefined;
     rogueJwks.published = true;
   }
+});
+
+test('#8 the Relay overlap check follows the Relay\'s metadata as it changes', async () => {
+  const cfg = { clientId: `${rpUrl}/client-metadata.json`, redirectUri: `${rpUrl}/auth/agent/callback`, stateSecret: 'test-secret-test-secret-test-secret-1234', allowInsecure: true, staticIssuers: { 'example.com': issuerUrl } };
+  try {
+    // The test Relay's metadata is not cacheable, so the kit sees a change at once; otherwise at its next refresh.
+    rogueMeta.homeIssuers = ['https://elsewhere.example'];
+    const r = new RelyingParty({ ...cfg, issuers: [issuerUrl, { issuer: rogueUrl, relay: true }] });
+    assert.ok((await r.begin({ handle: 'scout@example.com' })).url.startsWith(`${issuerUrl}/authorize?`), 'no overlap: the Home Issuer is used directly');
+    // The Relay starts relaying an Issuer this application also accepts directly.
+    rogueMeta.homeIssuers = ['https://elsewhere.example', issuerUrl];
+    await assert.rejects(r.begin({ handle: 'scout@example.com' }), (e: unknown) => e instanceof RelyingPartyError && e.code === 'configuration_error');
+    // and a token through the Relay for that Issuer is not accepted either
+    const nonce = rnd();
+    const now = Math.floor(Date.now() / 1000);
+    const viaRelay = await new SignJWT({ nonce, actor_type: 'agent', home_iss: issuerUrl, email: 'scout@example.com', email_verified: true }).setProtectedHeader({ alg: 'ES256', kid: rogueKey.kid }).setIssuer(rogueUrl).setSubject('b1Ykm9wQ2tN0cJ6vR8dLxA').setAudience(cfg.clientId).setIssuedAt(now).setExpirationTime(now + 600).sign(rogueKey.privateKey);
+    await assert.rejects(r.validateIdToken(viaRelay, { issuer: rogueUrl, nonce, clientId: cfg.clientId }), (e: unknown) => e instanceof RelyingPartyError && e.code === 'configuration_error');
+    rogueMeta.homeIssuers = ['https://elsewhere.example'];
+    assert.ok((await r.begin({ handle: 'scout@example.com' })).url.startsWith(`${issuerUrl}/authorize?`), 'the overlap is gone again');
+  } finally {
+    rogueMeta.homeIssuers = ['*'];
+  }
+});
+
+test('#9 Owner data is reported for every owner scope, with or without profile', async () => {
+  const nonce = rnd();
+  const clientId = 's6BhdRkqt3';
+  const r = new RelyingParty({ clientId, redirectUri: `${rpUrl}/auth/agent/callback`, issuers: [rogueUrl], stateSecret: 'test-secret-test-secret-test-secret-1234', allowInsecure: true });
+  const mint = (claims: Record<string, unknown>) => {
+    const now = Math.floor(Date.now() / 1000);
+    return new SignJWT({ nonce, actor_type: 'agent', ...claims }).setProtectedHeader({ alg: 'ES256', kid: rogueKey.kid }).setIssuer(rogueUrl).setSubject('b1Ykm9wQ2tN0cJ6vR8dLxA').setAudience(clientId).setIssuedAt(now).setExpirationTime(now + 600).sign(rogueKey.privateKey);
+  };
+  const of = async (claims: Record<string, unknown>) => r.identityOf(await r.validateIdToken(await mint(claims), { issuer: rogueUrl, nonce, clientId }));
+  // `openid owner_email`: no owner_sub, since that comes with `profile`
+  const emailOnly = await of({ scope: 'openid owner_email', owner_email: 'jane@example.com', owner_email_verified: true, owner_verified_via: 'passkey' });
+  assert.deepEqual(emailOnly.owner, { key: undefined, name: undefined, email: 'jane@example.com', verifiedVia: 'passkey' });
+  assert.equal(emailOnly.agent.ownerKey, undefined);
+  const nameOnly = await of({ scope: 'openid owner_profile', owner_name: 'Jane Doe', owner_verified_via: 'email' });
+  assert.equal(nameOnly.owner?.name, 'Jane Doe');
+  const full = await of({ scope: 'openid profile owner_email', owner_sub: 'oV3nJ8dK1qT6xB2mZ9cL4r', owner_email: 'jane@example.com', owner_email_verified: true, owner_verified_via: 'oidc' });
+  assert.equal(full.owner?.key, `${rogueUrl} oV3nJ8dK1qT6xB2mZ9cL4r`);
+  assert.equal(full.agent.ownerKey, full.owner?.key);
+  // an address the Issuer does not vouch for is not reported as the Owner's
+  assert.equal((await of({ scope: 'openid owner_email', owner_email: 'jane@example.com' })).owner?.email, undefined);
+  assert.equal((await of({ scope: 'openid profile', owner_sub: 'oV3nJ8dK1qT6xB2mZ9cL4r' })).owner, undefined, 'no Owner data without an owner scope');
 });
 
 test('issuer choice: allow-list, relay and open federation', async () => {

@@ -42,6 +42,25 @@ are issued by the bootstrap API on the operator's word) and the HTML pages for O
 Relay profile (8), a database-backed `Store`, the `pairwise` subject type. Development mode (`INSECURE_DEV=1`, or an
 `http` issuer) permits loopback clients and private addresses in metadata fetches; never run it that way in production.
 
-Concurrency: the issuer serialises work per transaction, per authorization code and per (Owner, client) cap in
-process, and the `Store` interface has two operations that a shared store must make atomic (`markCodeUsed`,
-`recordSignIn`). Running several issuer processes on one database needs those two to be single conditional writes.
+Concurrency: the issuer holds no locks in process, so several issuer processes may share one store. Every rule that
+must hold when requests arrive together is one `Store` operation that carries its own preconditions, and a shared
+store has to make each of them atomic (one conditional write or one database transaction):
+
+| Operation | Precondition it enforces |
+| --- | --- |
+| `updateTransaction` | the transaction is still at the `version` that was read (compare and swap) |
+| `insertKey` | the key is not enrolled now, for this handle or another, and was not revoked for this handle (7.2) |
+| `activateKey`, `patchKey` | the key is still in the `enrollment` that was read; to activate, still pending with its unused challenge |
+| `revokeKey`, `setAgentEnabled`, `setAccountStatus` | none; the write is the point after which nothing new is issued |
+| `voidCodes`, `revokeAccessTokens` | none; each matching record changes in one write |
+| `redeemCode` | the code exists, is unexpired, not void and not yet used (5.6) |
+| `reserveSignup`, `recordSignIn` | the Agent is counted once and the Owner's cap is not exceeded (7.6) |
+| `grantConsent`, `touchConsent` | one record per (Agent, client): created or extended, never duplicated (6.4) |
+
+A rule that spans two records is kept by writing one and then reading the other again. A revocation writes the key
+first and then ends the transactions, codes and tokens that key asserted; an assertion and a token exchange read
+the key again after their own write and undo it when the key has gone, and UserInfo reads the key on every call. Each key has an
+`enrollment` generation, and transactions, codes and tokens are bound to it, so enrolling the same `kid` again after
+it expired revives nothing issued before. Expiry is computed when a record is read and is never a stored state.
+`MemoryStore` meets all of this within one process and returns copies; `test/lifecycle.test.ts` runs two issuer
+instances over one store.

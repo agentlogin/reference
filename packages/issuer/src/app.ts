@@ -219,6 +219,19 @@ export function createIssuerApp(ctx: IssuerContext): Hono {
     return { t, client, viewer };
   }
 
+  /**
+   * Runs a state change. When it fails, the error body reports the transaction as it stands now (Section 6.7), which
+   * may differ from what this request first read if another request changed it meanwhile.
+   */
+  async function current<T>(c: Context, change: () => Promise<T>): Promise<T> {
+    try {
+      return await change();
+    } catch (e) {
+      await loadTx(c).catch(() => undefined);
+      throw e;
+    }
+  }
+
   app.get('/transactions/:id', async (c) => {
     const { t, client, viewer } = await loadTx(c);
     return c.json(tx.resource(ctx, t, client, viewer), 200, { ...NO_STORE, Link: `<${tx.txUrl(ctx, t.id)}>; rel="agent-login-transaction"` });
@@ -242,34 +255,28 @@ export function createIssuerApp(ctx: IssuerContext): Hono {
   // transaction then carries `status` and `next`.
   app.post('/transactions/:id/assertion', async (c) => {
     const body = await deferredJsonBody(c);
-    return ctx.locks.run(c.req.param('id') ?? '', async () => {
-      const { t, client } = await loadTx(c);
-      tx.requireOpen(t);
-      const token = await tx.assert(ctx, t, client, body());
-      return c.json({ ...tx.resource(ctx, t, client, { kind: 'transaction_token' }), transaction_token: token }, 200, NO_STORE);
-    });
+    const { t, client } = await loadTx(c);
+    tx.requireOpen(t);
+    const accepted = await current(c, () => tx.assert(ctx, t, client, body()));
+    return c.json({ ...tx.resource(ctx, accepted.tx, client, { kind: 'transaction_token' }), transaction_token: accepted.token }, 200, NO_STORE);
   });
 
   app.post('/transactions/:id/review', async (c) => {
     const body = await deferredJsonBody(c);
-    return ctx.locks.run(c.req.param('id') ?? '', async () => {
-      const { t, client, viewer } = await loadTx(c);
-      tx.requireTransactionToken(viewer);
-      tx.requireOpen(t);
-      await tx.review(ctx, t, client, viewer, body());
-      return c.json(tx.resource(ctx, t, client, viewer), 200, NO_STORE);
-    });
+    const { t, client, viewer } = await loadTx(c);
+    tx.requireTransactionToken(viewer);
+    tx.requireOpen(t);
+    const reviewed = await current(c, () => tx.review(ctx, t, client, viewer, body()));
+    return c.json(tx.resource(ctx, reviewed, client, viewer), 200, NO_STORE);
   });
 
-  app.get('/transactions/:id/continue/:secret', async (c) =>
-    ctx.locks.run(c.req.param('id') ?? '', async () => {
-      const { t, viewer } = await loadTx(c);
-      const { redirect } = await tx.cont(ctx, t, c.req.param('secret') ?? '', viewer);
-      if (prefersJson(c.req.header('accept'))) return c.json({ redirect }, 200, NO_STORE);
-      c.header('Cache-Control', 'no-store');
-      return c.redirect(redirect, 303);
-    }),
-  );
+  app.get('/transactions/:id/continue/:secret', async (c) => {
+    const { t, viewer } = await loadTx(c);
+    const { redirect } = await current(c, () => tx.cont(ctx, t, c.req.param('secret') ?? '', viewer));
+    if (prefersJson(c.req.header('accept'))) return c.json({ redirect }, 200, NO_STORE);
+    c.header('Cache-Control', 'no-store');
+    return c.redirect(redirect, 303);
+  });
 
   // ---- Section 5.6, 3.3: tokens --------------------------------------------------------------------
   app.post('/token', async (c) => {
@@ -334,22 +341,25 @@ export function createIssuerApp(ctx: IssuerContext): Hono {
     const k = await agents.getLiveKey(ctx, (c.req.param('kid') ?? ''));
     if (!k || k.handle !== handle) throw new OAuthError(404, 'not_found');
     if (!isPlainObject(body)) throw new OAuthError(400, 'invalid_request');
+    const patch: { name?: string; shareOwner?: boolean } = {};
     if (wantsPermissions) {
       // Section 7.8: `share_owner` is granted only by an Owner Credential from a session that satisfies Section 6.6; nothing changes otherwise.
       if (!agents.approvalSession(cred)) throw new OAuthError(403, 'insufficient_permission', 'share_owner requires an Owner Credential from a session of Section 6.6', { 'WWW-Authenticate': 'Bearer error="insufficient_scope"' });
       if (!isPlainObject(body.permissions) || typeof body.permissions.share_owner !== 'boolean') throw new OAuthError(400, 'invalid_request', 'permissions.share_owner');
-      k.permissions.share_owner = body.permissions.share_owner;
+      patch.shareOwner = body.permissions.share_owner;
     }
-    if (typeof body.name === 'string') k.name = body.name.slice(0, 200);
-    await ctx.store.putKey(k);
-    return c.json(agents.keyRecord(ctx, k), 200, NO_STORE);
+    if (typeof body.name === 'string') patch.name = body.name.slice(0, 200);
+    // One atomic field update on this enrollment: it cannot bring back a key that is being revoked at the same time.
+    const patched = await ctx.store.patchKey(k.kid, k.enrollment, patch);
+    if (!patched) throw new OAuthError(404, 'not_found');
+    return c.json(agents.keyRecord(ctx, patched), 200, NO_STORE);
   });
   app.delete('/agents/:handle/keys/:kid', async (c) => {
     const handle = handleOf(c);
     await agents.authorizeManagement(ctx, c.req.header('authorization'), handle, true);
     const k = await agents.getLiveKey(ctx, (c.req.param('kid') ?? ''));
     if (!k || k.handle !== handle) throw new OAuthError(404, 'not_found');
-    if (k.status !== 'revoked') await agents.revokeKeyEffects(ctx, k);
+    await agents.revokeKeyEffects(ctx, k.kid);
     return c.body(null, 204, NO_STORE);
   });
   app.delete('/agents/:handle/keys', async (c) => {
@@ -414,9 +424,10 @@ export function createIssuerApp(ctx: IssuerContext): Hono {
     const cred = await ownerOf(c);
     // Section 6.6: a session established by a one-time code or link alone cannot approve or refuse.
     if (!agents.approvalSession(cred)) throw new OAuthError(403, 'insufficient_permission', 'Owner approval requires a session of Section 6.6', { 'WWW-Authenticate': 'Bearer error="insufficient_scope"' });
-    const t = await tx.loadTransaction(ctx, c.req.param('id') ?? '');
+    const loaded = await tx.loadTransaction(ctx, c.req.param('id') ?? '');
     const body = await jsonBody(c);
-    await ctx.locks.run(t.id, () => tx.ownerDecision(ctx, t, cred.ownerId, isPlainObject(body) ? body.decision : undefined));
+    const client = (await ctx.store.getClient(loaded.clientId))!;
+    const t = await tx.ownerDecision(ctx, loaded, client, cred.ownerId, isPlainObject(body) ? body.decision : undefined);
     return c.json({ transaction_id: t.id, status: t.status, reason: t.reason }, 200, NO_STORE);
   });
 
@@ -487,8 +498,8 @@ export function createIssuerApp(ctx: IssuerContext): Hono {
     const a = await ctx.store.getAgent(handle);
     const b = await jsonBody(c);
     if (!a || !isPlainObject(b) || typeof b.enabled !== 'boolean') throw new OAuthError(400, 'invalid_request');
-    await agents.setAgentEnabled(ctx, a, b.enabled);
-    return c.json({ handle, enabled: a.enabled }, 200, NO_STORE);
+    await agents.setAgentEnabled(ctx, a.handle, b.enabled);
+    return c.json({ handle, enabled: b.enabled }, 200, NO_STORE);
   });
   app.post('/admin/credentials', async (c) => {
     requireAdmin(c);

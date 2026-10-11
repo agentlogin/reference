@@ -57,6 +57,15 @@ suspended long enough to lose its lock refuses to write when it resumes. Set `AG
 credentials, keys, cookie values, tokens or the callback URL. `--json` gives machine-readable results and errors
 (`{"error": {"code", "message"}}`); the exit status is 0 only on success and 2 for usage errors.
 
+Enrollment never discards a key the Issuer may hold. When the answer to an enrollment request is lost (a timeout, a
+dropped connection, a `5xx`), the client asks the Issuer what it has: an active key is kept as active, a key the
+Issuer does not know is removed, and when the Issuer cannot be asked the key stays as `pending` and `enroll` fails
+with `enrollment_uncertain`. `agentlogin keys` (and `reconcileKeys`) settles pending keys later. Only a definite
+refusal (`enrollment_failed`) removes the key. Revoking a key at one Issuer changes the local record for that Issuer
+only. `--timeout` bounds the whole sign-in, each request and wait included, so nothing is asserted or continued after
+the deadline. A cookie without a `Path` gets the default path of RFC 6265 Section 5.1.4 (the directory of the URL
+that set it), not `/`.
+
 The DNS fallback of Section 2.3 needs DNSSEC validation that Node.js does not expose and is not implemented;
 `--issuer` / `AGENTLOGIN_ISSUER` pins an Issuer for development or a known deployment (`handle_domains` is still
 checked). An operating-system keystore backend is planned.

@@ -1,7 +1,6 @@
 import type { Constants } from './constants.js';
 import type { Store } from './store.js';
 import type { CryptoKey, JWK } from 'jose';
-import type { Locks } from './util.js';
 
 export interface SigningKey { privateKey: CryptoKey; publicJwk: JWK; kid: string; alg: 'ES256' }
 
@@ -18,7 +17,6 @@ export interface IssuerContext {
   /** Admin bearer token for the bootstrap API and as RFC 7591 initial access token. */
   adminToken: string;
   now: () => number;
-  locks: Locks;
   /**
    * Delivers the one-time code of the Owner email sign-in (Section 7.5 `email`) to the Owner's address. The sign-in is
    * unavailable when absent. The code is a credential: an implementation sends it to the mailbox and nowhere else.

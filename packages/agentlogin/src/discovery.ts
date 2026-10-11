@@ -2,7 +2,8 @@
 // redirect hops, fetch protections of Section 2.2. The DNS fallback (Section 2.3) requires DNSSEC validation that
 // Node.js does not expose; this client does not implement it and reports the WebFinger failure instead.
 import { acctUri, parseHandle } from './handle.js';
-import { safeFetch } from './safefetch.js';
+import { freshness, safeFetch } from './safefetch.js';
+export { freshness };
 
 export interface IssuerMetadata {
   issuer: string;
@@ -29,35 +30,9 @@ const REL = 'http://openid.net/specs/connect/1.0/issuer';
 const MAX_BYTES = 64 * 1024;
 const ENDPOINTS = ['authorization_endpoint', 'token_endpoint', 'userinfo_endpoint', 'jwks_uri', 'transaction_endpoint', 'agents_endpoint'] as const;
 
-const T_CACHE = 86_400; // seconds, Section 1.5
 const cache = new Map<string, { value: IssuerMetadata; until: number }>();
 
 type Headers = Record<string, string | string[] | undefined>;
-const first = (v: string | string[] | undefined): string | undefined => (Array.isArray(v) ? v.join(', ') : v);
-
-/**
- * Freshness lifetime in seconds that a response allows (RFC 9111 Section 4.2), capped at T_CACHE: 0 for no-store or
- * no-cache; otherwise max-age less Age; otherwise Expires less Date; `fallback` only when the response states
- * neither. A max-age or Expires that does not parse means the response is already stale.
- */
-export function freshness(headers: Headers, fallback: number): number {
-  const cc = first(headers['cache-control']) ?? '';
-  if (/(?:^|,)\s*(?:no-store|no-cache)\b/i.test(cc)) return 0;
-  const age = Math.max(0, Number.parseInt(first(headers.age) ?? '0', 10) || 0);
-  const m = /(?:^|,)\s*max-age\s*=\s*("?)([^",]*)\1/i.exec(cc);
-  if (m) {
-    const value = m[2]!.trim();
-    return /^\d+$/.test(value) ? Math.max(0, Math.min(Number(value), T_CACHE) - age) : 0;
-  }
-  const expires = first(headers.expires);
-  if (expires !== undefined) {
-    const at = Date.parse(expires);
-    if (Number.isNaN(at)) return 0;
-    const date = Date.parse(first(headers.date) ?? '');
-    return Math.max(0, Math.min(Math.floor((at - (Number.isNaN(date) ? Date.now() : date)) / 1000), T_CACHE) - age);
-  }
-  return Math.min(fallback, T_CACHE);
-}
 /** Freshness of a result reached through redirects: the shortest of all hops. A redirect that states nothing is not reused. */
 export function chainFreshness(res: { headers: Headers; redirects: Array<{ headers: Headers }> }, fallback: number): number {
   return Math.min(freshness(res.headers, fallback), ...res.redirects.map((r) => freshness(r.headers, 0)));

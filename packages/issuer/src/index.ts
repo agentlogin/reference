@@ -4,7 +4,7 @@ import { DEFAULT_CONSTANTS, type Constants } from './constants.js';
 import type { IssuerContext, SigningKey } from './context.js';
 import { MemoryStore, type Store } from './store.js';
 import { createIssuerApp } from './app.js';
-import { Locks, randomSecret, nowSeconds } from './util.js';
+import { randomSecret, nowSeconds } from './util.js';
 
 export interface IssuerOptions {
   /** Issuer Identifier, e.g. https://issuer.example (no trailing slash). */
@@ -46,7 +46,6 @@ export async function createIssuer(opts: IssuerOptions) {
     allowInsecureClients: opts.allowInsecureClients ?? false,
     adminToken: opts.adminToken ?? randomSecret(),
     now: opts.now ?? nowSeconds,
-    locks: new Locks(),
     sendOwnerCode: opts.sendOwnerCode,
   };
   return { app: createIssuerApp(ctx), ctx };

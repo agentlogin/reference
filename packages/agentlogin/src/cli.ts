@@ -21,7 +21,8 @@ const USAGE = `agentlogin: sign a software agent in to web applications (Agent L
         [--method M] [--data D] [--content-type T]
   agentlogin cookies --site HOST         list the cookies stored for an application (names only)
         [--clear]
-  agentlogin keys                        list the keys enrolled at the Issuer (needs a credential)
+  agentlogin keys                        list the keys enrolled at the Issuer, after settling any local key whose
+                                         enrollment outcome was not known (needs a credential)
   agentlogin revoke [--kid K]            revoke one key, or every key of the handle (needs a credential)
   agentlogin keygen [--name N]           generate a key without enrolling it; prints the public JWK
   agentlogin whoami                      the Issuer found for the handle, and the local keys
@@ -164,7 +165,14 @@ async function run(flags: Map<string, string | true>, multi: Map<string, string[
       else console.log(list.length ? list.map((c) => `${c.name}  path=${c.path}${c.expires ? `  expires=${c.expires}` : ''}`).join('\n') : `No cookies stored for ${host}`);
       return;
     }
-    case 'keys': need(1, 'keys'); out(await al.listKeys(credential())); return;
+    case 'keys': {
+      need(1, 'keys');
+      // An enrollment whose answer was lost left a key whose state is not known: settle it before listing.
+      const settled = await al.reconcileKeys(credential());
+      if (settled.activated || settled.removed) console.error(`Settled local keys: ${settled.activated} now active, ${settled.removed} removed`);
+      out(await al.listKeys(credential()));
+      return;
+    }
     case 'revoke': {
       need(1, 'revoke [--kid K]');
       const kid = str('kid');

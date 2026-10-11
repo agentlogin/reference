@@ -40,8 +40,10 @@ const auth = createHandlers(rp, {
 ## What a sign-in gives you
 
 `signIn.agent` identifies the agent and holds no personal data of its owner: `key` (issuer and `sub`), `handle`,
-`name`, `ownerKey` (opaque, for per-owner limits). `signIn.owner` is present only when a Registered Client requested
-owner scopes: `name`, `email`, `verifiedVia`. Store it apart from agent data. `signIn.accessToken` is a bearer
+`name`, `ownerKey` (opaque, for per-owner limits). `signIn.owner` is present whenever an owner scope
+(`owner_profile`, `owner_email`) was granted to a Registered Client: `name`, `email` (only when the issuer verified
+it), `verifiedVia`, and `key` when `profile` was granted as well. Store it apart from agent data;
+`rp.identityOf(claims)` gives the same mapping for claims you validated yourself. `signIn.accessToken` is a bearer
 credential valid for ten minutes and usable only for the live check; do not log it and do not keep it longer.
 
 Before an action with lasting effect, ask the issuer whether it still vouches for the agent:
@@ -60,6 +62,7 @@ await rp.recheck(session.live);
 | The issuer recorded per `state`; `iss` on the redirect checked; code sent only to that issuer; one callback per sign-in (5.7 step 1) | `complete`, `callback` |
 | ID Token: pinned algorithm (ES256), key by `kid`, `iss`, `aud`, required `exp`, `iat`, `nonce`, `actor_type` (5.7) | `validateIdToken` |
 | Handle-to-issuer binding; `home_iss` only from the configured Relay and within its `home_issuers` (2.5) | `validateIdToken` |
+| No Relay beside a Home Issuer it relays, judged by the Relay's metadata as it is now (9 item 10) | `begin`, `complete`, `validateIdToken` |
 | Discovery only for presented handles, cached per the response; address filtering, 64 KiB and 10 s limits on every fetched endpoint (2.2, 9) | `resolve` |
 | UserInfo live check, `sub` equality, `401` as revocation (9) | `recheck` |
 | Agent-initiated start: only accepted issuers, nothing sent to any other, `target_link_uri` ignored (5.8) | `login` |
@@ -70,7 +73,8 @@ await rp.recheck(session.live);
 
 List the issuers you trust in `issuers`. Add one Relay (`{ issuer, relay: true }`) to accept every home issuer that
 Relay accepts through a single connection; do not also list a home issuer the Relay relays, or per-owner caps count
-twice (the kit refuses that configuration). Or set `federation: 'any'` to accept whichever issuer a presented
+twice. The kit refuses that configuration with `configuration_error`, and checks it on every sign-in against the
+Relay's current metadata, because a Relay can start relaying an issuer after you configured it. Or set `federation: 'any'` to accept whichever issuer a presented
 handle designates, and apply your own per-issuer limits.
 
 A Registered Client sets `clientId`, `clientSecret` and optionally `scopes` on the issuer's entry and may request

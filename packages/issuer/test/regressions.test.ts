@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import { createHash, randomBytes } from 'node:crypto';
 import { SignJWT, calculateJwkThumbprint, exportJWK, generateKeyPair, decodeJwt, type CryptoKey, type JWK } from 'jose';
 import { createIssuer, MemoryStore, type Store } from '../src/index.js';
-import { snapshotting } from './stores.js';
+import { hookable, snapshotting } from './stores.js';
 
 const ISS = 'https://issuer.test';
 const rnd = (n = 16) => randomBytes(n).toString('base64url');
@@ -205,42 +205,36 @@ test('#9 a requested Owner Claim that the Issuer cannot supply ends the sign-in 
 });
 
 test('cap: a completion racing another Agent\'s first sign-in cannot admit both', async () => {
-  // The window is between the two reads of the cap check (sign-ups so far, then transactions in flight). A store
-  // with database semantics and a hook after the first read puts the other Agent's completion exactly there.
-  let between: (() => Promise<void>) | undefined;
-  const db = snapshotting(new MemoryStore());
-  const store = new Proxy(db, {
-    get(target, prop, receiver) {
-      const v = Reflect.get(target, prop, receiver) as unknown;
-      if (prop !== 'signupsEver' || typeof v !== 'function') return v;
-      return async (...args: unknown[]) => {
-        const result = await (v as (...a: unknown[]) => unknown).apply(target, args);
-        const hook = between;
-        between = undefined;
-        if (hook) await hook();
-        return result;
-      };
-    },
-  });
-  const w = await world({ store });
-  const a = await w.agent('one@example.com');
-  const b = await w.agent('two@example.com');
-  const c = await w.client({ max_signups_per_owner: 1 });
-  const first = (await w.assertOn((await w.start(c)).tx, a, { accept_disclosure: true })).json;
-  assert.equal(first.status, 'ready');
-  const second = await w.start(c);
-  const turns = (n: number) => new Promise<void>((r) => { let i = 0; const tick = () => (i++ >= n ? r() : setImmediate(tick)); tick(); });
-  let completion: Promise<{ status: number }> | undefined;
-  between = async () => {
-    completion = w.cont(first); // the first Agent completes while the second is inside its cap check
-    await turns(200); // time enough to finish, if nothing makes it wait
-  };
-  const raced = (await w.assertOn(second.tx, b, { accept_disclosure: true })).json;
-  assert.ok(completion, 'the hook ran');
-  assert.equal((await completion!).status, 200);
-  assert.equal(raced.status, 'denied', `second Agent: ${raced.status}`);
-  assert.equal(raced.reason, 'signup_limit_reached');
-  assert.equal(await w.ctx.store.signupsEver(w.owner.owner_id, c.client_id), 1);
+  // The check and the reservation are one store operation, and so is the completion that turns a reservation into an
+  // Account: wherever the completion falls relative to the other Agent's assertion, one place is one place.
+  for (const at of ['getAgent', 'getAccount', 'reserveSignup'] as const) {
+    const h = hookable(snapshotting(new MemoryStore()));
+    const w = await world({ store: h.store });
+    const a = await w.agent('one@example.com');
+    const b = await w.agent('two@example.com');
+    const c = await w.client({ max_signups_per_owner: 1 });
+    const first = (await w.assertOn((await w.start(c)).tx, a, { accept_disclosure: true })).json;
+    assert.equal(first.status, 'ready');
+    const second = await w.start(c);
+    let completed = 0;
+    h.after(at, async () => { completed = (await w.cont(first)).status; }); // the first Agent completes inside the second's assertion
+    const raced = (await w.assertOn(second.tx, b, { accept_disclosure: true })).json;
+    assert.equal(completed, 200, `${at}: the completion ran`);
+    assert.equal(raced.status, 'denied', `${at}: second Agent ${raced.status}`);
+    assert.equal(raced.reason, 'signup_limit_reached');
+    assert.equal(await w.ctx.store.signupsEver(w.owner.owner_id, c.client_id), 1);
+  }
+  // and without any placement, at full concurrency
+  for (let round = 0; round < 5; round += 1) {
+    const w = await world({ store: snapshotting(new MemoryStore()) });
+    const a = await w.agent('one@example.com');
+    const b = await w.agent('two@example.com');
+    const c = await w.client({ max_signups_per_owner: 1 });
+    const first = (await w.assertOn((await w.start(c)).tx, a, { accept_disclosure: true })).json;
+    const second = await w.start(c);
+    const [, raced] = await Promise.all([w.cont(first), w.assertOn(second.tx, b, { accept_disclosure: true })]);
+    assert.equal(raced.json.status, 'denied', `round ${round}`);
+  }
 });
 
 test('cap: an Agent that has an Account and another open transaction holds one place, not two', async () => {

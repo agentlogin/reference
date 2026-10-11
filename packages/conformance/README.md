@@ -16,9 +16,10 @@ against an issuer that keeps its state. With `--handle` and `--owner-credential`
 a client that already exists at the issuer: a Registered Client (`--client-id`, `--client-secret`, `--redirect-uri`)
 or an Open Client (`--open-client-id`, `--open-redirect-uri`). Checks that need more than that are reported as
 skipped, never as failed. Before any check the harness proves that the fixture works (one unmodified request and
-one complete sign-in) and stops with a message that names the fixture when it does not, so a wrong secret or redirect
-URI is not reported as the issuer's failure. Afterwards it revokes the keys it enrolled on your agent and refuses the
-approvals it left waiting.
+one complete sign-in, the token exchange included) and stops with a message that names the fixture when it does not,
+so a wrong secret or redirect URI is not reported as the issuer's failure. Afterwards it revokes exactly the keys
+this run enrolled, which it records as it enrolls them, and refuses the approvals it left waiting; a key that
+someone else adds to the agent while the harness runs is left alone.
 
 The reference issuer's own test runs the harness twice: against its in-memory store, and against the same store
 wrapped to behave like a database (copies on read and write, every operation on a later turn of the event loop). The

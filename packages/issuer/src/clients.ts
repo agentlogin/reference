@@ -1,5 +1,5 @@
 // Section 4: Open Clients (Client ID Metadata Documents) and Registered Clients.
-import { safeFetch } from './safefetch.js';
+import { freshness, safeFetch } from './safefetch.js';
 import type { Client, Store } from './store.js';
 import type { Constants } from './constants.js';
 import { OAuthError } from './errors.js';
@@ -109,9 +109,9 @@ export async function fetchOpenClient(ctx: ClientContext, url: URL): Promise<Cli
   if (doc.token_endpoint_auth_method !== 'none') throw new OAuthError(400, 'invalid_request', 'token_endpoint_auth_method must be none');
   const common = readCommonMetadata(doc, ctx.allowInsecureClients);
   const now = nowSeconds();
-  const cc = String(res.headers['cache-control'] ?? '');
-  const m = /max-age=(\d+)/.exec(cc);
-  const ttl = m ? Math.min(Number(m[1]), ctx.constants.T_CACHE) : 300;
+  // Reused only for as long as the response allows (RFC 9111): never for no-store or no-cache, five minutes when it
+  // states nothing. A client that withdraws a redirect URI or changes its terms is then seen on its next request.
+  const ttl = freshness(res.headers, 300);
   const client: Client = { clientId: url.href, type: 'open', tokenEndpointAuthMethod: 'none', ...common, fetchedAt: now, cacheUntil: now + ttl };
   await ctx.store.putClient(client);
   return client;
