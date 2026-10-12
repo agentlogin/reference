@@ -6,7 +6,7 @@
 //   SIGNING_JWK      private ES256 JWK as JSON (ephemeral when absent)
 //   INSECURE_DEV=1   permit http issuer and loopback clients; print Owner sign-in codes instead of mailing them
 import { serve } from '@hono/node-server';
-import { createIssuer } from './index.js';
+import { createIssuer, SQLiteStore } from './index.js';
 
 const insecure = process.env.INSECURE_DEV === '1' || !process.env.ISSUER;
 const issuer = process.env.ISSUER ?? 'http://localhost:3000';
@@ -14,9 +14,13 @@ const port = Number(process.env.PORT ?? new URL(issuer).port ?? 3000) || 3000;
 const handleDomains = (process.env.HANDLE_DOMAINS ?? new URL(issuer).hostname).split(',').map((s) => s.trim()).filter(Boolean);
 const adminToken = process.env.ADMIN_TOKEN;
 
+// Persistent instances must share the same configured signing key as well as the database.
+if (process.env.DATABASE_PATH && !process.env.SIGNING_JWK) throw new Error('DATABASE_PATH requires a persistent SIGNING_JWK');
+const store = process.env.DATABASE_PATH ? new SQLiteStore(process.env.DATABASE_PATH) : undefined;
 const { app, ctx } = await createIssuer({
   issuer,
   handleDomains,
+  store,
   allowInsecureClients: insecure,
   adminToken,
   signingJwk: process.env.SIGNING_JWK ? JSON.parse(process.env.SIGNING_JWK) : undefined,

@@ -316,21 +316,21 @@ export function createIssuerApp(ctx: IssuerContext): Hono {
   };
   app.post('/agents/:handle/keys', async (c) => {
     const handle = handleOf(c);
-    await agents.authorizeManagement(ctx, c.req.header('authorization'), handle, true);
-    const r = await agents.enrollKey(ctx, handle, await jsonBody(c));
+    const auth = await agents.authorizeManagement(ctx, c.req.header('authorization'), handle, true);
+    const r = await agents.enrollKey(ctx, handle, await jsonBody(c), auth);
     return c.json({ ...r.record, challenge: r.challenge, proof_url: r.proof_url }, 201, NO_STORE);
   });
   app.post('/agents/:handle/keys/:kid/proof', async (c) => c.json(await agents.proveKey(ctx, handleOf(c), (c.req.param('kid') ?? ''), await jsonBody(c)), 200, NO_STORE));
   app.get('/agents/:handle/keys', async (c) => {
     const handle = handleOf(c);
-    await agents.authorizeManagement(ctx, c.req.header('authorization'), handle, true);
-    return c.json({ keys: (await agents.listLiveKeys(ctx, handle)).map((k) => agents.keyRecord(ctx, k)) }, 200, NO_STORE);
+    const cred = await agents.authorizeManagement(ctx, c.req.header('authorization'), handle, true);
+    return c.json({ keys: (await agents.listLiveKeys(ctx, handle)).filter((k) => k.agentSub === cred.agentSub).map((k) => agents.keyRecord(ctx, k)) }, 200, NO_STORE);
   });
   app.get('/agents/:handle/keys/:kid', async (c) => {
     const handle = handleOf(c);
-    await agents.authorizeManagement(ctx, c.req.header('authorization'), handle, true);
+    const cred = await agents.authorizeManagement(ctx, c.req.header('authorization'), handle, true);
     const k = await agents.getLiveKey(ctx, (c.req.param('kid') ?? ''));
-    if (!k || k.handle !== handle) throw new OAuthError(404, 'not_found');
+    if (!k || k.handle !== handle || k.agentSub !== cred.agentSub) throw new OAuthError(404, 'not_found');
     return c.json(agents.keyRecord(ctx, k), 200, NO_STORE);
   });
   app.patch('/agents/:handle/keys/:kid', async (c) => {
@@ -339,7 +339,7 @@ export function createIssuerApp(ctx: IssuerContext): Hono {
     const wantsPermissions = isPlainObject(body) && body.permissions !== undefined;
     const cred = await agents.authorizeManagement(ctx, c.req.header('authorization'), handle, !wantsPermissions);
     const k = await agents.getLiveKey(ctx, (c.req.param('kid') ?? ''));
-    if (!k || k.handle !== handle) throw new OAuthError(404, 'not_found');
+    if (!k || k.handle !== handle || k.agentSub !== cred.agentSub) throw new OAuthError(404, 'not_found');
     if (!isPlainObject(body)) throw new OAuthError(400, 'invalid_request');
     const patch: { name?: string; shareOwner?: boolean } = {};
     if (wantsPermissions) {
@@ -356,10 +356,10 @@ export function createIssuerApp(ctx: IssuerContext): Hono {
   });
   app.delete('/agents/:handle/keys/:kid', async (c) => {
     const handle = handleOf(c);
-    await agents.authorizeManagement(ctx, c.req.header('authorization'), handle, true);
+    const cred = await agents.authorizeManagement(ctx, c.req.header('authorization'), handle, true);
     const k = await agents.getLiveKey(ctx, (c.req.param('kid') ?? ''));
-    if (!k || k.handle !== handle) throw new OAuthError(404, 'not_found');
-    await agents.revokeKeyEffects(ctx, k.kid);
+    if (!k || k.handle !== handle || k.agentSub !== cred.agentSub) throw new OAuthError(404, 'not_found');
+    await agents.revokeKeyEffects(ctx, k);
     return c.body(null, 204, NO_STORE);
   });
   app.delete('/agents/:handle/keys', async (c) => {
@@ -370,8 +370,13 @@ export function createIssuerApp(ctx: IssuerContext): Hono {
   });
   app.get('/agents/:handle/accounts', async (c) => {
     const handle = handleOf(c);
-    await agents.authorizeManagement(ctx, c.req.header('authorization'), handle, true);
-    return c.json({ accounts: (await ctx.store.listAccounts(handle)).map(agents.accountRecord) }, 200, NO_STORE);
+    const cred = await agents.authorizeManagement(ctx, c.req.header('authorization'), handle, true);
+    const accounts = await ctx.store.listAccounts(handle);
+    // Account records belong to the immutable Agent, so a handle replacement during the read cannot disclose
+    // its new Owner's accounts to a request authorized for the previous Agent.
+    const current = await ctx.store.getAgent(handle);
+    if (!current || current.sub !== cred.agentSub || current.ownerId !== cred.ownerId) throw new OAuthError(404, 'not_found');
+    return c.json({ accounts: accounts.map(agents.accountRecord) }, 200, NO_STORE);
   });
   app.patch('/agents/:handle/accounts/:client_id', async (c) => {
     const handle = handleOf(c);
@@ -380,12 +385,12 @@ export function createIssuerApp(ctx: IssuerContext): Hono {
     if (!isPlainObject(body) || (body.status !== 'enabled' && body.status !== 'disabled')) throw new OAuthError(400, 'invalid_request', 'status must be enabled or disabled');
     const cred = await agents.authorizeManagement(ctx, c.req.header('authorization'), handle, true);
     if (cred.kind === 'delegated' && body.status === 'enabled') throw new OAuthError(403, 'insufficient_permission', 'a Delegated Credential may only disable', { 'WWW-Authenticate': 'Bearer error="insufficient_scope"' });
-    return c.json(await agents.setAccountStatus(ctx, handle, (c.req.param('client_id') ?? ''), body.status), 200, NO_STORE);
+    return c.json(await agents.setAccountStatus(ctx, handle, (c.req.param('client_id') ?? ''), body.status, cred), 200, NO_STORE);
   });
   app.delete('/agents/:handle/consents/:client_id', async (c) => {
     const handle = handleOf(c);
-    await agents.authorizeManagement(ctx, c.req.header('authorization'), handle, true);
-    await ctx.store.deleteConsent(handle, (c.req.param('client_id') ?? ''));
+    const cred = await agents.authorizeManagement(ctx, c.req.header('authorization'), handle, true);
+    if (!(await ctx.store.deleteConsent(handle, (c.req.param('client_id') ?? ''), cred))) throw new OAuthError(404, 'not_found');
     return c.body(null, 204, NO_STORE);
   });
 
@@ -489,7 +494,7 @@ export function createIssuerApp(ctx: IssuerContext): Hono {
     if (!h || !domainServed(h.domain, ctx.handleDomains)) throw new OAuthError(400, 'invalid_request', 'handle not in a served domain');
     if (!(await ctx.store.getOwner(b.owner_id))) throw new OAuthError(404, 'not_found', 'owner');
     if (await ctx.store.getAgent(h.handle)) throw new OAuthError(409, 'invalid_request', 'handle exists');
-    await ctx.store.putAgent({ ...h, sub: randomSecret(), ownerId: b.owner_id, name: typeof b.name === 'string' ? b.name : undefined, preferredUsername: typeof b.preferred_username === 'string' ? b.preferred_username : h.local, enabled: true, createdAt: ctx.now() });
+    if (!(await ctx.store.putAgent({ ...h, sub: randomSecret(), ownerId: b.owner_id, name: typeof b.name === 'string' ? b.name : undefined, preferredUsername: typeof b.preferred_username === 'string' ? b.preferred_username : h.local, enabled: true, authorizationVersion: 0, createdAt: ctx.now() }))) throw new OAuthError(409, 'invalid_request', 'handle exists');
     return c.json({ handle: h.handle, owner_id: b.owner_id }, 201, NO_STORE);
   });
   app.patch('/admin/agents/:handle', async (c) => {
@@ -498,7 +503,7 @@ export function createIssuerApp(ctx: IssuerContext): Hono {
     const a = await ctx.store.getAgent(handle);
     const b = await jsonBody(c);
     if (!a || !isPlainObject(b) || typeof b.enabled !== 'boolean') throw new OAuthError(400, 'invalid_request');
-    await agents.setAgentEnabled(ctx, a.handle, b.enabled);
+    if (!(await agents.setAgentEnabled(ctx, a, b.enabled))) throw new OAuthError(404, 'not_found');
     return c.json({ handle, enabled: b.enabled }, 200, NO_STORE);
   });
   app.post('/admin/credentials', async (c) => {
@@ -571,4 +576,3 @@ async function deferredJsonBody(c: Context): Promise<() => unknown> {
 function page(title: string, body: string): string {
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escapeHtml(title)}</title><style>body{font:16px/1.5 system-ui,sans-serif;max-width:36rem;margin:4rem auto;padding:0 1rem;color:#222}.muted{color:#666;font-size:.9em}code{font-size:.9em}</style></head><body><h1>${escapeHtml(title)}</h1>${body}</body></html>`;
 }
-

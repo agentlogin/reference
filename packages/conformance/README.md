@@ -15,16 +15,21 @@ reference issuer's bootstrap API and runs every check; each run uses fresh handl
 against an issuer that keeps its state. With `--handle` and `--owner-credential` it uses an existing agent and needs
 a client that already exists at the issuer: a Registered Client (`--client-id`, `--client-secret`, `--redirect-uri`)
 or an Open Client (`--open-client-id`, `--open-redirect-uri`). Checks that need more than that are reported as
-skipped, never as failed. Before any check the harness proves that the fixture works (one unmodified request and
+skipped, never as failed. After discovery validation the harness proves that the fixture works (one unmodified request and
 one complete sign-in, the token exchange included) and stops with a message that names the fixture when it does not,
 so a wrong secret or redirect URI is not reported as the issuer's failure. Afterwards it revokes exactly the keys
 this run enrolled, which it records as it enrolls them, and refuses the approvals it left waiting; a key that
 someone else adds to the agent while the harness runs is left alone.
 
-The reference issuer's own test runs the harness twice: against its in-memory store, and against the same store
-wrapped to behave like a database (copies on read and write, every operation on a later turn of the event loop). The
-in-memory store alone hides races between concurrent requests; reintroducing an unsynchronised code redemption or cap
-check makes the second run fail. Some checks need something only the operator can supply
+Discovery is checked before any enrollment or other credential-bearing request. Invalid metadata produces an
+I-1/I-2 failure report and stops that run: checks cover JSON types, required and conditional members, URL syntax,
+and prohibited values. HTTPS is required; for the documented local development command, HTTP endpoints are allowed
+only on the exact origin of the explicitly configured HTTP loopback issuer. Callback checks retain the registered
+URI's application query parameters, including repeated parameters, while validating the authorization response.
+
+The reference issuer's own test runs the harness against its in-memory store, the same store wrapped to yield on
+every operation, and its durable SQLite adapter. The yielding wrapper exposes races between concurrent requests;
+the SQLite adapter also has independent-process tests for reservation caps and concurrent completions. Some checks need something only the operator can supply
 and report skip, naming what is missing, without it:
 
 | Option | Supplies | Used by |
@@ -39,6 +44,11 @@ of the reference issuer's own surface: M-1 (Delegated Credential binding) and M-
 I-49 runs last: it audits every response the whole run received from the authorization, transaction, token, UserInfo,
 registration and agents endpoints. Owner approval (I-13, I-45) is exercised through the reference issuer's
 `/owner/transactions/{id}` API, which the specification does not define.
+
+The concurrent code-redemption check requires a fresh sequential exchange to succeed and permits at most one
+successful concurrent response. Replay detection may invalidate the first request before it returns tokens, so
+zero concurrent successes is valid. The separate, labeled Section 5.4 SHOULD check inspects any returned token for
+revocation; it reports skip when no token was returned or when the issuer does not follow that recommendation.
 
 Not observable black-box, so not covered: within I-43 an `expired` transaction (T_TXN); within I-44 the deletion of a
 Consent Record unused for T_CONSENT; within I-45 the wording of the approval page and how the session behind

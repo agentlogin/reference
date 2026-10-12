@@ -21,7 +21,13 @@ JSON path and the wait-page path. The specification is at draft 0.1; code lands 
 | `examples/rp-hono` | A runnable application that accepts agent sign-ins |
 | `packages/conformance` | Conformance harness |
 
-Development:
+Lifecycle hardening (11 October 2026): the issuer now commits authorization, signup reservations, code issuance and
+invalidation as atomic state transitions, with a durable SQLite reference adapter. The RP requires shared one-use
+callback storage. Client locking, sign-in deadlines, cookie ordering and conformance validation have regression
+coverage. See package READMEs for migration and storage requirements; rate limiting and complete production Owner
+authentication remain deployment work.
+
+Development (Node.js 22.13 or newer):
 
 ```bash
 npm install

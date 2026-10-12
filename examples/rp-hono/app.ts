@@ -2,7 +2,7 @@
 import { Hono } from 'hono';
 import { getCookie, setCookie } from 'hono/cookie';
 import { randomBytes } from 'node:crypto';
-import { RelyingParty, RelyingPartyError, createHandlers, signInForm, signInFormCss, type AgentIdentity, type LiveCheck } from '@agentlogin/rp';
+import { RelyingParty, RelyingPartyError, createHandlers, signInForm, signInFormCss, type AgentIdentity, type LiveCheck, type CallbackStateStore } from '@agentlogin/rp';
 
 export interface ExampleOptions {
   /** This application's public URL. */
@@ -10,6 +10,7 @@ export interface ExampleOptions {
   /** Issuer to accept, exactly as the Issuer publishes it. */
   issuer: string;
   stateSecret: string;
+  callbackStore: CallbackStateStore;
   /** For local development: handle domains served by `issuer`, mapped without WebFinger. */
   handleDomains?: string[];
   now?: () => number;
@@ -60,6 +61,7 @@ export function createExample(o: ExampleOptions) {
   }
 
   const auth = createHandlers(rp, {
+    callbackStore: o.callbackStore,
     metadata: { clientName: 'Agent Login example', initiateLoginUri: `${base}/auth/agent/login`, maxSignupsPerOwner: 3 },
     onSignIn: (signIn) => {
       if (!accounts.has(signIn.agent.key)) accounts.set(signIn.agent.key, { firstSeen: new Date(now() * 1000).toISOString(), handle: signIn.agent.handle, ownerKey: signIn.agent.ownerKey });

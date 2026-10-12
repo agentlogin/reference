@@ -2,10 +2,14 @@
 // handlers on the Node.js runtime, or Node's http module through any fetch adapter. The kit itself needs Node.js
 // (node:crypto, and node:dns and node:http for the address-filtering fetch); it does not run on edge runtimes.
 import { RelyingPartyError } from './errors.js';
+import { createHmac } from 'node:crypto';
+import type { CallbackStateStore } from './callback-store.js';
 import type { ClientMetadataInput, RelyingParty, SignIn } from './rp.js';
 import { seal, unseal } from './seal.js';
 
 export interface HandlerOptions {
+  /** Shared by all replicas/handler instances. Atomic one-use records must survive restarts; memory is for development. */
+  callbackStore: CallbackStateStore;
   /**
    * Called after a validated sign-in. Create your own session here and return the response (usually a redirect).
    * Whatever it throws propagates to your framework unchanged.
@@ -82,6 +86,7 @@ async function readForm(request: Request): Promise<URLSearchParams> {
 }
 
 export function createHandlers(rp: RelyingParty, o: HandlerOptions): Handlers {
+  if (!o.callbackStore) throw new Error('callbackStore is required: share a durable store across all application replicas');
   const secure = rp.options.redirectUri.startsWith('https:');
   // `__Host-` binds the cookie to this exact host: a sibling subdomain or a plain-http attacker cannot plant one.
   const prefix = secure ? '__Host-al_' : 'al_';
@@ -90,7 +95,9 @@ export function createHandlers(rp: RelyingParty, o: HandlerOptions): Handlers {
   const clear = (name: string) => `${name}=; ${cookieAttrs}; Max-Age=0`;
   const ttl = Math.min(86_400, Math.max(60, Math.floor(o.pendingTtlSeconds ?? 900)));
   const log = o.log ?? ((e: RelyingPartyError) => { if (e.status >= 500) console.warn(`agentlogin: ${e.code}: ${e.message}`); });
-  const seen = new Map<string, number>(); // states whose callback is being or has been processed by this process
+  const stateKey = (state: string) => createHmac('sha256', rp.options.stateSecret)
+    .update(JSON.stringify([rp.options.clientId, rp.options.redirectUri, state])).digest('hex');
+  const storageFailure = (cause?: unknown) => new RelyingPartyError('state_store_failed', 'sign-in state storage is unavailable', undefined, { cause });
 
   const fail = async (e: RelyingPartyError, request: Request, clearName?: string): Promise<Response> => {
     log(e);
@@ -116,6 +123,11 @@ export function createHandlers(rp: RelyingParty, o: HandlerOptions): Handlers {
           ? await rp.beginInitiated({ iss, loginHint: q.get('login_hint') ?? undefined, returnTo })
           : await rp.begin({ handle: q.get('handle') ?? q.get('login_hint') ?? undefined, issuer: q.get('issuer') ?? undefined, returnTo });
         const sealed = await seal(rp.options.stateSecret, begun.pending, ttl);
+        try {
+          if (!await o.callbackStore.register(stateKey(begun.pending.state), Date.now() + ttl * 1000)) throw storageFailure();
+        } catch (e) {
+          throw storageFailure(e);
+        }
         // Keep the number of started sign-ins per browser small: drop the oldest ones this request carried.
         const existing = [...readCookies(request).keys()].filter((n) => n.startsWith(prefix));
         const cookies = existing.slice(0, Math.max(0, existing.length - (MAX_PENDING - 1))).map(clear);
@@ -140,13 +152,14 @@ export function createHandlers(rp: RelyingParty, o: HandlerOptions): Handlers {
       try {
         const cookie = state ? readCookies(request).get(name) : undefined;
         const pending = cookie ? await unseal(rp.options.stateSecret, cookie) : null;
-        // `state` is consumed: a second callback for it, for example a doubled request, is refused before the code is sent again.
-        if (pending) {
-          const now = Date.now();
-          for (const [k, t] of seen) if (now - t > ttl * 1000) seen.delete(k);
-          if (seen.has(pending.state)) throw new RelyingPartyError('duplicate_callback', 'this sign-in was already completed');
-          if (seen.size >= 10_000) seen.delete(seen.keys().next().value!);
-          seen.set(pending.state, now);
+        // Claim before any token exchange. A process crash, uncertain exchange or onSignIn failure must never
+        // release it: retrying a code can revoke the successful request's Access Token at the Issuer.
+        if (pending && state === pending.state) {
+          let claim;
+          try { claim = await o.callbackStore.claim(stateKey(pending.state)); }
+          catch (e) { throw storageFailure(e); }
+          if (claim === 'duplicate') throw new RelyingPartyError('duplicate_callback', 'this sign-in was already completed');
+          if (claim !== 'claimed') throw new RelyingPartyError('invalid_state', 'this sign-in was not started in this session, or it expired');
         }
         signIn = await rp.complete({ params: url.searchParams, pending });
       } catch (e) {
@@ -198,6 +211,7 @@ export function errorMessage(e: RelyingPartyError): string {
     case 'userinfo_failed':
       return "The agent's provider could not be reached. Try again shortly.";
     case 'configuration_error':
+    case 'state_store_failed':
       return 'Sign-in is not available right now.';
     default:
       return 'The sign-in could not be completed.';

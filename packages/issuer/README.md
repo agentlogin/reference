@@ -3,7 +3,7 @@
 Reference issuer for [Agent Login Core 1.0](https://github.com/agentlogin/spec) (draft 0.1): an OpenID Provider that
 signs software agents in with keys they hold. Written against the specification section by section so that the code
 reads as a second description of the protocol; Hono for HTTP, jose for JOSE, an in-memory store behind a small
-`Store` interface.
+`Store` interface, with memory and transactional SQLite adapters. Requires Node.js 22.13 or newer.
 
 ```bash
 npm run issuer            # http://localhost:3000, handle domain localhost, prints a generated ADMIN_TOKEN
@@ -39,28 +39,56 @@ credential with no recorded session does not qualify either. `owner_verified_via
 Status: passes every check of `@agentlogin/conformance` (`npm test`). Not yet implemented: Ed25519 agent keys,
 `private_key_jwt`, rate limits (6.7), Owner authentication by passkey, OIDC or domain (credentials from such sessions
 are issued by the bootstrap API on the operator's word) and the HTML pages for Owner sign-in and approval,
-Relay profile (8), a database-backed `Store`, the `pairwise` subject type. Development mode (`INSECURE_DEV=1`, or an
+Relay profile (8), the `pairwise` subject type. Development mode (`INSECURE_DEV=1`, or an
 `http` issuer) permits loopback clients and private addresses in metadata fetches; never run it that way in production.
 
-Concurrency: the issuer holds no locks in process, so several issuer processes may share one store. Every rule that
-must hold when requests arrive together is one `Store` operation that carries its own preconditions, and a shared
-store has to make each of them atomic (one conditional write or one database transaction):
+Concurrency and persistence: every guarantee spanning records is a single `Store` operation. A database adapter
+must commit the full transition, including its preconditions and effects, in one database transaction:
 
-| Operation | Precondition it enforces |
+| Operation | Atomic guarantee |
 | --- | --- |
-| `updateTransaction` | the transaction is still at the `version` that was read (compare and swap) |
-| `insertKey` | the key is not enrolled now, for this handle or another, and was not revoked for this handle (7.2) |
-| `activateKey`, `patchKey` | the key is still in the `enrollment` that was read; to activate, still pending with its unused challenge |
-| `revokeKey`, `setAgentEnabled`, `setAccountStatus` | none; the write is the point after which nothing new is issued |
-| `voidCodes`, `revokeAccessTokens` | none; each matching record changes in one write |
-| `redeemCode` | the code exists, is unexpired, not void and not yet used (5.6) |
-| `reserveSignup`, `recordSignIn` | the Agent is counted once and the Owner's cap is not exceeded (7.6) |
-| `grantConsent`, `touchConsent` | one record per (Agent, client): created or extended, never duplicated (6.4) |
+| `putAgent` | Insert only when the handle is absent; an existing identity is never overwritten |
+| `insertKey` | The credential, Owner and immutable Agent subject still match the authorization; enforce key uniqueness and revocation history |
+| `activateKey`, `patchKey`, `revokeKey` | Match the exact key enrollment; revocation also denies transactions and invalidates codes and tokens |
+| `updateTransaction` | Compare the open transaction version, check subject identity, disable versions and expiry, and commit cap admission, reservation and consent effects together |
+| `completeTransaction` | Check the ready version, subject, expiry and reservation; complete, issue the code, update the Account and signup count, and release the reservation together |
+| `setAgentEnabled`, `setAccountStatus` | Check the authorized Agent identity, increment the persistent disable version, and invalidate dependent records together |
+| `deleteAgent`, `revokeAllKeys` | Check the immutable identity and apply all cleanup in the same transaction |
+| `redeemCode`, `insertAccessToken` | Redeem once; validate lifecycle fences, and refuse token insertion for replayed codes |
 
-A rule that spans two records is kept by writing one and then reading the other again. A revocation writes the key
-first and then ends the transactions, codes and tokens that key asserted; an assertion and a token exchange read
-the key again after their own write and undo it when the key has gone, and UserInfo reads the key on every call. Each key has an
-`enrollment` generation, and transactions, codes and tokens are bound to it, so enrolling the same `kid` again after
-it expired revives nothing issued before. Expiry is computed when a record is read and is never a stored state.
-`MemoryStore` meets all of this within one process and returns copies; `test/lifecycle.test.ts` runs two issuer
-instances over one store.
+Agent subjects never change or transfer to a replacement at the same handle. Keys remember the authorizing subject;
+transactions, codes and access tokens retain that subject, their key enrollment, and Agent/Account disable versions.
+Disable versions increase even if an Agent or Account is subsequently enabled. Delayed work cannot become valid again
+simply because the current enabled flag is true. Reservation helpers are private to the state machine: a losing
+assertion cannot release the winning assertion's place. Consent changes commit with their transition, so delayed
+cleanup cannot write to a replacement Agent. Previously granted scopes carry forward only while the redirect host,
+client name, terms URI and policy URI remain unchanged; accepting changed terms replaces the scope set. Invalidation
+preserves an expired transaction's original terminal time and never restarts its retention window.
+
+`MemoryStore` implements these operations synchronously within one process. `SQLiteStore` runs that same state machine
+inside `BEGIN IMMEDIATE`/`COMMIT`, with WAL and `synchronous=FULL`. It uses Node’s built-in `node:sqlite` module
+(experimental in Node 22). Every operation loads fresh state and writes a
+versioned JSON snapshot; no cached state or JavaScript lock determines cross-process ownership. A failed commit rolls
+back the whole operation. Tests exercise separate database connections, independent writer processes, persistence
+across reopen, injected database write failures, and adversarial HTTP lifecycle schedules against both adapters.
+
+```ts
+import { createIssuer, SQLiteStore } from '@agentlogin/issuer';
+const store = new SQLiteStore('/private/app/issuer.sqlite');
+const { app } = await createIssuer({ issuer, handleDomains, adminToken, signingJwk, store });
+// Drain requests before calling store.close().
+```
+
+For the standalone server, set `DATABASE_PATH` and a persistent `SIGNING_JWK`. All issuer processes sharing the
+database must use the same issuer configuration and signing key. Keep the database and its WAL files in a private
+application directory on a local filesystem; the adapter is for processes on one host, not a network filesystem.
+Back up a live database using SQLite's backup facilities, not by copying only the main file while WAL is active.
+The adapter deliberately serializes operations and rewrites the full snapshot, including reads: it is a durable,
+auditable reference adapter, not a high-throughput database design. Large deployments need normalized/indexed storage,
+retention cleanup, capacity planning and operational testing while preserving this transaction contract.
+
+Migration: the `Store` API and stored records have changed. Custom adapters must implement the new atomic operations
+and identity/version fields; do not run old and new issuers against the same store. This adapter creates a new schema;
+there is no migration from third-party stores. The RP handler also now requires explicit shared callback storage
+(see `@agentlogin/rp`). These fixes do not implement rate limiting or a production Owner authentication system, so
+passing the tests is not a deployment approval.

@@ -1,5 +1,6 @@
 // The per-sign-in record (state, nonce, PKCE verifier, the Issuer the request was sent to) travels in an encrypted,
-// HttpOnly cookie so that the kit needs no server-side store. Encryption: direct A256GCM with a key derived from
+// HttpOnly cookie. A shared server-side store separately records whether the callback has been consumed.
+// Encryption: direct A256GCM with a key derived from
 // the application's secret.
 import { EncryptJWT, jwtDecrypt } from 'jose';
 import { createHash } from 'node:crypto';

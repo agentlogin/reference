@@ -3,6 +3,7 @@ import { calculateJwkThumbprint, createRemoteJWKSet, decodeProtectedHeader, jwtV
 import { createHash, randomBytes } from 'node:crypto';
 import { AgentClient, rnd } from './agent.js';
 import { call, callContext, obj, type CallContext, type Exchange, type Res } from './http.js';
+import { concurrentAccessTokens, redirectMatches, validateMetadata, validateForbiddenMetadata } from './validation.js';
 
 export interface HarnessOptions {
   issuer: string;
@@ -268,7 +269,7 @@ class Harness {
   /** Transactions this run left waiting for the Owner; refused at the end so that nobody is asked to approve a test. */
   private awaitingOwner = new Set<string>();
 
-  async bootstrap() {
+  async bootstrap(): Promise<boolean> {
     const existing = Boolean(this.o.handle && this.o.ownerCredential);
     if (!this.o.adminToken && !existing) throw new Error('the harness needs an admin token, or an existing handle with its Owner Credential');
     // Everything that can be decided from the options is decided before the issuer or the operator's Agent is touched.
@@ -280,6 +281,17 @@ class Harness {
     const m = await call(`${this.o.issuer}/.well-known/openid-configuration`);
     expect(m.status === 200, `metadata → ${m.status}`);
     this.meta = obj(m.json);
+    await this.check('I-1', 'Metadata contains the REQUIRED members and values of 2.4', async () => {
+      expect(m.json !== null && typeof m.json === 'object' && !Array.isArray(m.json), 'metadata must be a JSON object');
+      expect(m.headers.get('content-type')?.split(';')[0]?.trim().toLowerCase() === 'application/json', 'metadata must have Content-Type application/json');
+      validateMetadata(this.meta, this.o.issuer, Boolean(this.o.adminToken));
+    });
+    await this.check('I-2', 'Only authorization_code grants; no end_session_endpoint, plain PKCE, none or RS256 signing algorithms', async () => {
+      validateForbiddenMetadata(this.meta);
+    });
+    // Invalid endpoints must never receive the operator's credentials. Return the discovery failures as a report
+    // before enrollment, registration or transaction creation can run against malformed metadata.
+    if (this.results.some((r) => r.outcome === 'fail')) return false;
     if (existing) {
       this.credential = this.o.ownerCredential!;
       const listed = await call(`${this.meta.agents_endpoint}/${encodeURIComponent(this.o.handle!)}/keys`, { headers: { authorization: `Bearer ${this.credential}` } });
@@ -318,6 +330,7 @@ class Harness {
         throw new Error(`the client fixture cannot exchange a code${error === 'invalid_client' ? ' (the client secret is not accepted: invalid_client)' : ''}: the Token Endpoint answered ${exchanged.status} ${error ?? ''}`.trim());
       }
     }
+    return true;
   }
   /** Leaves an existing Agent as it was found: revokes the keys this run enrolled and refuses the approvals it left waiting. */
   async cleanup(): Promise<void> {
@@ -338,7 +351,7 @@ class Harness {
   run(): Promise<Report> {
     return callContext.run(this.cx, async () => {
       try {
-        await this.bootstrap();
+        if (!await this.bootstrap()) return this.report();
         return await this.checks();
       } finally {
         await this.cleanup();
@@ -349,25 +362,6 @@ class Harness {
     const m = this.meta;
     const iss = this.o.issuer;
 
-    await this.check('I-1', 'Metadata contains the REQUIRED members and values of 2.4', async () => {
-      for (const k of ['transaction_endpoint', 'agents_endpoint', 'handle_domains', 'agent_key_algs_supported', 'agent_login_versions_supported', 'jwks_uri', 'token_endpoint', 'userinfo_endpoint', 'authorization_endpoint']) expect(m[k] !== undefined, `missing ${k}`);
-      expect(m.issuer === iss, 'issuer mismatch');
-      expect(m.client_id_metadata_document_supported === true, 'client_id_metadata_document_supported');
-      expect(m.authorization_response_iss_parameter_supported === true, 'authorization_response_iss_parameter_supported');
-      expect(m.code_challenge_methods_supported?.includes('S256'), 'S256');
-      expect(m.id_token_signing_alg_values_supported?.includes('ES256'), 'ES256');
-      expect(m.agent_key_algs_supported?.includes('ES256'), 'agent_key_algs_supported ES256');
-      for (const s of ['openid', 'email', 'profile', 'owner_profile', 'owner_email']) expect(m.scopes_supported?.includes(s), `scope ${s}`);
-      expect(m.token_endpoint_auth_methods_supported?.includes('none') && m.token_endpoint_auth_methods_supported?.includes('client_secret_basic'), 'auth methods');
-      expect(m.agent_login_versions_supported?.includes('1.0'), 'versions');
-    });
-    await this.check('I-2', 'No end_session_endpoint, plain or none; grant_types_supported is authorization_code', async () => {
-      expect(m.end_session_endpoint === undefined, 'end_session_endpoint present');
-      expect(!m.code_challenge_methods_supported?.includes('plain'), 'plain');
-      expect(!m.id_token_signing_alg_values_supported?.includes('none'), 'none');
-      expect(JSON.stringify(m.grant_types_supported) === '["authorization_code"]', `grant_types ${JSON.stringify(m.grant_types_supported)}`);
-      expect(JSON.stringify(m.response_types_supported) === '["code"]', 'response_types');
-    });
     await this.check('I-3', 'Rejects requests without PKCE, with plain, without state/nonce, or with a repeated parameter', async () => {
       const cases: Array<[string, Record<string, string | undefined>, Array<[string, string]>]> = [
         ['no code_challenge', { code_challenge: undefined, code_challenge_method: undefined }, []],
@@ -383,7 +377,7 @@ class Harness {
         const redirect = typeof j.redirect === 'string' ? new URL(j.redirect) : null;
         const err = j.error ?? redirect?.searchParams.get('error');
         expect(r.status === 400 && err === 'invalid_request', `${name}: ${r.status} ${r.text.slice(0, 160)}`);
-        if (redirect) expect(redirect.origin + redirect.pathname === this.client.redirect_uri && redirect.searchParams.get('iss') === iss, `${name}: error redirect target`);
+        if (redirect) expect(redirectMatches(redirect, this.client.redirect_uri) && redirect.searchParams.get('iss') === iss, `${name}: error redirect target`);
       }
     });
     await this.check('I-4', 'Does not redirect on a mismatched redirect_uri; answers 400 directly', async () => {
@@ -602,7 +596,7 @@ class Harness {
       expect(none.status === 401, `anonymous continue → ${none.status}`);
       const c = await this.cont(a.next.url, a.transaction_token);
       const r = new URL(obj(c.json).redirect);
-      expect(c.status === 200 && r.searchParams.get('code') && r.searchParams.get('state') === s.params.state && r.searchParams.get('iss') === iss, `continue → ${c.status} ${c.text.slice(0, 160)}`);
+      expect(c.status === 200 && redirectMatches(r, this.client.redirect_uri) && r.searchParams.get('code') && r.searchParams.get('state') === s.params.state && r.searchParams.get('iss') === iss, `continue → ${c.status} ${c.text.slice(0, 160)}`);
       const twice = await this.cont(a.next.url, a.transaction_token);
       expect(twice.status === 410 && obj(twice.json).error === 'transaction_expired' && obj(twice.json).status === 'completed', `second continue → ${twice.status}`);
       // deliver_to_session path, HTML redirect
@@ -611,7 +605,7 @@ class Harness {
       const sess = obj((await this.get(s2.tx, s2.tx.session_token)).json);
       expect(typeof sess.next?.url === 'string', 'continue URL released to the Session Holder with deliver_to_session');
       const html = await call(sess.next.url, { headers: { accept: 'text/html', authorization: `Bearer ${s2.tx.session_token}` } });
-      expect(html.status === 303 && (html.headers.get('location') ?? '').startsWith(this.client.redirect_uri) && (html.headers.get('cache-control') ?? '').includes('no-store'), `html continue → ${html.status} ${html.headers.get('cache-control')}`);
+      expect(html.status === 303 && redirectMatches(new URL(html.headers.get('location') ?? 'https://invalid.example/'), this.client.redirect_uri) && (html.headers.get('cache-control') ?? '').includes('no-store'), `html continue → ${html.status} ${html.headers.get('cache-control')}`);
       expect(a2.transaction_token !== undefined, 'agent still receives a transaction_token');
       // denied path repeatable
       const s3 = await this.start(this.client, { prompt: 'none' });
@@ -622,14 +616,25 @@ class Harness {
       const d2 = await this.cont(a3.next.url, a3.transaction_token);
       expect(d1.status === 200 && d2.status === 200, 'denied continue repeatable');
     });
-    await this.check('I-19', 'A code is redeemed once under concurrent Token Requests', async () => {
+    const concurrentlyIssuedTokens: string[] = [];
+    await this.check('I-19', 'A fresh code succeeds sequentially; concurrent Token Requests redeem at most once', async () => {
+      const sequential = await this.signIn();
+      expect(sequential.tokenRes.status === 200 && typeof sequential.token.access_token === 'string' && typeof sequential.token.id_token === 'string', `sequential redemption → ${sequential.tokenRes.status}`);
       for (let round = 0; round < 3; round += 1) {
         const { code, verifier } = await this.codeFor();
         const results = await Promise.all(Array.from({ length: 6 }, () => this.exchange(this.client, code, verifier)));
-        const ok = results.filter((r) => r.status === 200);
-        expect(ok.length === 1, `round ${round}: concurrent redemptions answered ${results.map((r) => r.status).join(', ')}`);
-        expect(results.filter((r) => r.status !== 200).every((r) => r.status === 400 && obj(r.json).error === 'invalid_grant'), 'the other redemptions answer invalid_grant');
+        concurrentlyIssuedTokens.push(...concurrentAccessTokens(results));
       }
+    });
+    await this.check('I-19', 'Replay invalidates any token returned during concurrent redemption (SHOULD, Section 5.4)', async () => {
+      if (concurrentlyIssuedTokens.length === 0) throw new Skip('no token was returned before replay invalidated the concurrent redemptions; there is no issued token to test');
+      let stillUsable = 0;
+      for (const token of concurrentlyIssuedTokens) {
+        const ui = await call(m.userinfo_endpoint, { headers: { authorization: `Bearer ${token}` } });
+        if (ui.status === 200) stillUsable += 1;
+        else expect(ui.status === 401 && obj(ui.json).error === 'invalid_token', `UserInfo after replay → ${ui.status} ${obj(ui.json).error ?? ''}`);
+      }
+      if (stillUsable) throw new Skip(`${stillUsable} token(s) remain usable after replay: the Section 5.4 revocation recommendation (SHOULD) was not followed`);
     });
     await this.check('I-19', 'A Registered Client must authenticate: a wrong secret or none answers 401 invalid_client and no tokens', async () => {
       if (!this.client.client_secret) throw new Skip('needs a Registered Client');
@@ -1009,7 +1014,7 @@ class Harness {
       const errorAt = (name: string, target: unknown, error: string, state: string | undefined) => {
         expect(typeof target === 'string' && target.length > 0, `${name}: no redirect URL`);
         const l = new URL(target);
-        expect(l.origin + l.pathname === this.client.redirect_uri && l.searchParams.get('error') === error && l.searchParams.get('state') === state && l.searchParams.get('iss') === iss, `${name}: error redirect ${target}`);
+        expect(redirectMatches(l, this.client.redirect_uri) && l.searchParams.get('error') === error && l.searchParams.get('state') === state && l.searchParams.get('iss') === iss, `${name}: error redirect ${target}`);
       };
       for (const [name, over, error] of cases) {
         const u = this.authUrl(this.client, over);
@@ -1053,14 +1058,14 @@ class Harness {
       const loc = h.headers.get('location');
       expect(h.status === 303 && !!loc, `HTML step 3 failure → ${h.status} ${loc ?? h.text.slice(0, 120)}`);
       const l = new URL(loc!);
-      expect(l.origin + l.pathname === this.client.redirect_uri && l.searchParams.get('error') === 'invalid_request' && l.searchParams.get('state') === a.params.state && l.searchParams.get('iss') === iss, `HTML error redirect ${loc}`);
+      expect(redirectMatches(l, this.client.redirect_uri) && l.searchParams.get('error') === 'invalid_request' && l.searchParams.get('state') === a.params.state && l.searchParams.get('iss') === iss, `HTML error redirect ${loc}`);
       expect((h.headers.get('cache-control') ?? '').includes('no-store'), 'no-store on the error redirect');
       const scope = this.authUrl(this.client, { scope: 'email profile' });
       const j = await call(scope.url);
       const jb = obj(j.json);
       expect(j.status === 400 && jb.error === 'invalid_scope' && typeof jb.redirect === 'string', `JSON step 4 failure → ${j.status} ${j.text.slice(0, 160)}`);
       const r = new URL(jb.redirect);
-      expect(r.origin + r.pathname === this.client.redirect_uri && r.searchParams.get('error') === 'invalid_scope' && r.searchParams.get('state') === scope.params.state && r.searchParams.get('iss') === iss, `JSON redirect member ${jb.redirect}`);
+      expect(redirectMatches(r, this.client.redirect_uri) && r.searchParams.get('error') === 'invalid_scope' && r.searchParams.get('state') === scope.params.state && r.searchParams.get('iss') === iss, `JSON redirect member ${jb.redirect}`);
       const h4 = await call(scope.url, { headers: { accept: 'text/html' } });
       expect(h4.status === 303 && new URL(h4.headers.get('location') ?? 'http://invalid/').searchParams.get('error') === 'invalid_scope', `HTML step 4 failure → ${h4.status} ${h4.headers.get('location') ?? ''}`);
       const unknown = this.authUrl({ ...this.client, client_id: `unknown-${rnd(4)}` });
@@ -1735,10 +1740,13 @@ class Harness {
       expect(gap > least && gap < most, `auth_time must be the time the assertion was accepted: the token was issued ${((e0 - a1) / 1000).toFixed(1)} to ${((e1 - a0) / 1000).toFixed(1)} s after the assertion, but iat - auth_time is ${gap} s`);
     });
 
+    return this.report();
+  }
+  private report(): Report {
     const passed = this.results.filter((r) => r.outcome === 'pass').length;
     const failed = this.results.filter((r) => r.outcome === 'fail').length;
     const skipped = this.results.filter((r) => r.outcome === 'skip').length;
-    return { issuer: iss, results: this.results, passed, failed, skipped };
+    return { issuer: this.o.issuer, results: this.results, passed, failed, skipped };
   }
 }
 

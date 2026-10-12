@@ -42,3 +42,11 @@ Why the development switches: this demo runs over plain HTTP on localhost, where
 `example.com` to the issuer itself (its `HANDLE_DOMAINS` variable, default `example.com`; set it to the issuer's handle
 domains if you change them). In production none of these is set and the handle's domain names the issuer. Outside
 development the application refuses to start without `STATE_SECRET`.
+
+Callback replay protection uses a persistent SQLite database (`CALLBACK_DB_PATH`, default `./rp-callbacks.sqlite`).
+All application processes on the same host must use the same file and `STATE_SECRET`; put the file in a protected
+local directory. For replicas on different hosts, supply a shared database implementation of `CallbackStateStore`
+to `createExample`. An uncertain callback must be followed by a new sign-in, never by retrying its code.
+
+This remains a development example: its accounts and sessions are in memory. Replace those stores, configure
+application authentication and rate limits, and manage database backups and migrations before deploying it.

@@ -56,3 +56,5 @@ export type { Store, Constants, IssuerContext };
 export * from './store.js';
 export { safeFetch, isBlockedAddress } from './safefetch.js';
 export { parseHandle, handlesEqual, prefersJson } from './util.js';
+
+export { SQLiteStore } from './sqlite-store.js';

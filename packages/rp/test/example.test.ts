@@ -1,11 +1,12 @@
 // The example application's sessions end on the server (reported against commit 9b6dd09: only the cookie expired).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { MemoryCallbackStateStore } from '../src/index.js';
 import { createExample, SESSION_TTL } from '../../../examples/rp-hono/app.js';
 
 test('#12 example sessions and Access Tokens expire on the server', async () => {
   let clock = 1_800_000_000;
-  const { app, sessions, sweep } = createExample({ base: 'http://localhost:4000', issuer: 'http://localhost:3000', stateSecret: 'x'.repeat(40), now: () => clock });
+  const { app, sessions, sweep } = createExample({ base: 'http://localhost:4000', issuer: 'http://localhost:3000', stateSecret: 'x'.repeat(40), callbackStore: new MemoryCallbackStateStore(), now: () => clock });
   const agent = { iss: 'http://localhost:3000', sub: 'sub-1', key: 'http://localhost:3000 sub-1', handle: 'scout@example.com', scopes: ['openid'] };
   const live = { issuer: 'http://localhost:3000', accessToken: 'at', accessTokenExpiresAt: clock + 600, sub: 'sub-1' };
   sessions.set('sid-a', { agent, expiresAt: clock + SESSION_TTL, live: { ...live } });

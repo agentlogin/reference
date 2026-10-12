@@ -8,3 +8,5 @@ export { signInForm, signInFormCss } from './button.js';
 export type { SignInFormOptions } from './button.js';
 export { seal, unseal } from './seal.js';
 export type { PendingSignIn } from './seal.js';
+export { MemoryCallbackStateStore, SqliteCallbackStateStore } from './callback-store.js';
+export type { CallbackStateStore, CallbackClaim } from './callback-store.js';

@@ -60,19 +60,22 @@ export async function exchangeCode(ctx: IssuerContext, client: Client, r: TokenR
   // Read after the write (see state.ts): the asserting key in the same enrollment, the Agent and the Account must
   // still stand. A revocation or a disable that ran meanwhile either voided the code before it was redeemed, or is
   // seen here. On failure the code stays used.
-  const subject = { handle: code.handle, kid: code.kid, keyEnrollment: code.keyEnrollment, clientId: code.clientId };
+  const subject = { handle: code.handle, kid: code.kid, keyEnrollment: code.keyEnrollment, clientId: code.clientId, agentSub: code.agentSub, agentVersion: code.agentVersion, accountVersion: code.accountVersion };
   if (await subjectState(ctx, subject)) throw fail();
   const agent = await ctx.store.getAgent(code.handle);
   const owner = agent && (await ctx.store.getOwner(agent.ownerId));
-  if (!agent || !owner) throw fail();
+  if (!agent || !owner || agent.sub !== code.agentSub || agent.authorizationVersion !== code.agentVersion) throw fail();
   if (!ownerClaimsAvailable(owner, code.scopes)) throw fail(); // Section 6.6: never a token that omits a requested Owner Claim
 
   const accessToken = randomSecret();
   const now = ctx.now();
-  await ctx.store.insertAccessToken({ hash: sha256(accessToken), txnId: code.txnId, ...subject, scopes: code.scopes, expiresAt: now + ctx.constants.T_TOKEN, revoked: false });
+  if (!(await ctx.store.insertAccessToken({ hash: sha256(accessToken), txnId: code.txnId, ...subject, scopes: code.scopes, expiresAt: now + ctx.constants.T_TOKEN, revoked: false }, now))) throw fail();
   // Section 5.4: when the code was presented again meanwhile, the token just issued is revoked. The other request
   // marks the code and revokes what exists; this one looks after its own insert. Whichever order, the token ends revoked.
-  if ((await ctx.store.getCode(hash))?.replayed) await ctx.store.revokeAccessTokens({ txnId: code.txnId });
+  if ((await ctx.store.getCode(hash))?.replayed) {
+    await ctx.store.revokeAccessTokens({ txnId: code.txnId });
+    throw fail();
+  }
   const idToken = await mintIdToken(ctx, { agent, owner, client, scopes: code.scopes, nonce: code.nonce, authTime: code.authTime });
   // Signing takes time. If the key was revoked while the token was being made, it is not handed out.
   if (await subjectState(ctx, subject)) {
@@ -136,7 +139,7 @@ export async function userinfo(ctx: IssuerContext, bearer: string | null): Promi
   if (await subjectState(ctx, t)) throw invalidToken();
   const agent = await ctx.store.getAgent(t.handle);
   const owner = agent && (await ctx.store.getOwner(agent.ownerId));
-  if (!agent || !owner) throw invalidToken();
+  if (!agent || !owner || agent.sub !== t.agentSub || agent.authorizationVersion !== t.agentVersion || !agent.enabled) throw invalidToken();
   return { iss: ctx.issuer, ...claimsFor(agent, owner, t.scopes), scope: t.scopes.join(' ') };
 }
 

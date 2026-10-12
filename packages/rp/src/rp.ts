@@ -277,7 +277,10 @@ export class RelyingParty {
     return this.begin({ handle: p.loginHint, returnTo: p.returnTo });
   }
 
-  /** Sections 5.4 to 5.7: validate the redirect, exchange the code, validate the ID Token. */
+  /**
+   * Sections 5.4 to 5.7: validate the redirect, exchange the code, validate the ID Token. Low-level callers must
+   * atomically consume their server-side pending state before calling; createHandlers does this for you.
+   */
   async complete(p: { params: URLSearchParams; pending: PendingSignIn | null }): Promise<SignIn> {
     const { params, pending } = p;
     const one = (k: string) => {

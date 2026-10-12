@@ -8,7 +8,7 @@ export const ISSUER_ERROR_CODES = [
 export const LOCAL_ERROR_CODES = [
   'invalid_state', 'issuer_mismatch', 'issuer_not_accepted', 'issuer_error', 'invalid_id_token', 'handle_binding_failed',
   'token_request_failed', 'discovery_failed', 'userinfo_failed', 'revoked', 'reauthentication_required', 'invalid_handle',
-  'handle_required', 'configuration_error', 'duplicate_callback',
+  'handle_required', 'configuration_error', 'duplicate_callback', 'state_store_failed',
 ] as const;
 export type RelyingPartyErrorCode = (typeof ISSUER_ERROR_CODES)[number] | (typeof LOCAL_ERROR_CODES)[number];
 
@@ -22,10 +22,10 @@ export class RelyingPartyError extends Error {
     super(message, options);
     this.name = 'RelyingPartyError';
   }
-  /** HTTP status a handler should answer with: 502 for upstream failures, 500 for configuration, 400 otherwise. */
+  /** HTTP status a handler should answer with: 502 for upstream failures, 500 for configuration/storage, 400 otherwise. */
   get status(): number {
     if (this.code === 'discovery_failed' || this.code === 'token_request_failed' || this.code === 'userinfo_failed') return 502;
-    if (this.code === 'configuration_error') return 500;
+    if (this.code === 'configuration_error' || this.code === 'state_store_failed') return 500;
     return 400;
   }
 }

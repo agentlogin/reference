@@ -56,12 +56,12 @@ test('existing-agent mode without an admin token produces a report', async () =>
   assert.ok(open.passed >= 10, `passed ${open.passed}`);
   assert.ok(open.skipped > 0, 'checks that need the bootstrap API are skipped, not failed');
   // with a Registered Client fixture
-  const reg = (await (await fetch(`${issuerUrl}/register`, { method: 'POST', headers: { authorization: 'Bearer admin', 'content-type': 'application/json' }, body: JSON.stringify({ redirect_uris: ['https://fixture.example/cb'], client_name: 'Fixture', tos_uri: 'https://fixture.example/tos', policy_uri: 'https://fixture.example/privacy', token_endpoint_auth_method: 'client_secret_basic' }) })).json()) as Record<string, string>;
-  const registered = await runConformance({ ...base, client: { clientId: reg.client_id!, clientSecret: reg.client_secret!, redirectUri: 'https://fixture.example/cb' } });
+  const reg = (await (await fetch(`${issuerUrl}/register`, { method: 'POST', headers: { authorization: 'Bearer admin', 'content-type': 'application/json' }, body: JSON.stringify({ redirect_uris: ['https://fixture.example/cb?tenant=a%20b&tag=one&tag=two&return=%2Fhome'], client_name: 'Fixture', tos_uri: 'https://fixture.example/tos', policy_uri: 'https://fixture.example/privacy', token_endpoint_auth_method: 'client_secret_basic' }) })).json()) as Record<string, string>;
+  const registered = await runConformance({ ...base, client: { clientId: reg.client_id!, clientSecret: reg.client_secret!, redirectUri: 'https://fixture.example/cb?tenant=a%20b&tag=one&tag=two&return=%2Fhome' } });
   assert.equal(registered.failed, 0, failures(registered));
   assert.ok(registered.passed >= 15, `passed ${registered.passed}`);
   // and a second run with the same fixtures
-  const again = await runConformance({ ...base, client: { clientId: reg.client_id!, clientSecret: reg.client_secret!, redirectUri: 'https://fixture.example/cb' } });
+  const again = await runConformance({ ...base, client: { clientId: reg.client_id!, clientSecret: reg.client_secret!, redirectUri: 'https://fixture.example/cb?tenant=a%20b&tag=one&tag=two&return=%2Fhome' } });
   assert.equal(again.failed, 0, failures(again));
 });
 

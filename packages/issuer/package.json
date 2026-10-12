@@ -26,5 +26,8 @@
   },
   "scripts": {
     "prepack": "tsc -b"
+  },
+  "engines": {
+    "node": ">=22.13"
   }
 }

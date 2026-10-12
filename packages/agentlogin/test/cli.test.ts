@@ -10,7 +10,7 @@ import type { AddressInfo } from 'node:net';
 import { fileURLToPath } from 'node:url';
 import { serve } from '@hono/node-server';
 import { createIssuer } from '../../issuer/src/index.js';
-import { RelyingParty, createHandlers, type SignIn } from '../../rp/src/index.js';
+import { RelyingParty, createHandlers, MemoryCallbackStateStore, type SignIn } from '../../rp/src/index.js';
 
 const BIN = fileURLToPath(new URL('../bin/agentlogin.js', import.meta.url));
 let issuerUrl = '';
@@ -46,6 +46,7 @@ before(async () => {
   const sessions = new Map<string, SignIn>();
   const h = createHandlers(rp, {
     metadata: { clientName: 'CLI Test App' },
+    callbackStore: new MemoryCallbackStateStore(),
     onSignIn: (s) => { const sid = `s${sessions.size + 1}x${Math.floor(performance.now())}`; sessions.set(sid, s); return new Response(null, { status: 302, headers: { location: '/me', 'set-cookie': `sid=${sid}; Path=/; HttpOnly` } }); },
   });
   const as = serve({

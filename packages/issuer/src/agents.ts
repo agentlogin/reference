@@ -3,8 +3,7 @@ import { calculateJwkThumbprint, compactVerify, decodeProtectedHeader, importJWK
 import { ENROLLMENT_TYP } from './constants.js';
 import type { IssuerContext } from './context.js';
 import { OAuthError } from './errors.js';
-import type { Agent, AgentKey, Credential, P256Jwk } from './store.js';
-import { denyOpenTransactions } from './state.js';
+import type { Agent, AgentKey, Credential, ManagementAuthorization, P256Jwk } from './store.js';
 import { isPlainObject, parseBearer, randomId, randomSecret, sha256, typMatches } from './util.js';
 
 const B64U_32 = /^[A-Za-z0-9_-]{43}$/; // 32 octets
@@ -64,7 +63,7 @@ export function keyRecord(ctx: IssuerContext, k: AgentKey): Record<string, unkno
 }
 
 /** Section 7.2: create a pending key. */
-export async function enrollKey(ctx: IssuerContext, handle: string, body: unknown): Promise<{ record: Record<string, unknown>; challenge: string; proof_url: string }> {
+export async function enrollKey(ctx: IssuerContext, handle: string, body: unknown, authorization: ManagementAuthorization): Promise<{ record: Record<string, unknown>; challenge: string; proof_url: string }> {
   if (!isPlainObject(body)) throw new OAuthError(400, 'invalid_request', 'body must be an object');
   const jwk = await validateP256Jwk(body.jwk);
   // The thumbprint is taken over canonical coordinates, so equal identifiers mean equal decoded points (Section 7.2).
@@ -79,6 +78,7 @@ export async function enrollKey(ctx: IssuerContext, handle: string, body: unknow
   const key: AgentKey = {
     kid,
     handle,
+    agentSub: authorization.agentSub,
     enrollment: randomId(), // credentials bind to this enrollment; an earlier, expired one of the same key stays dead
     status: 'pending',
     jwk,
@@ -89,7 +89,8 @@ export async function enrollKey(ctx: IssuerContext, handle: string, body: unknow
     challenge: { value: challenge, expiresAt: now + ctx.constants.T_ASSERT },
   };
   // One atomic operation with its preconditions: not revoked for this handle, not enrolled now (Section 7.2).
-  const inserted = await ctx.store.insertKey(key, now);
+  const inserted = await ctx.store.insertKey(key, now, authorization);
+  if (inserted === 'unauthorized') throw new OAuthError(404, 'not_found', 'the Agent or credential changed during enrollment');
   if (inserted === 'revoked') throw new OAuthError(400, 'invalid_request', 'this public key was revoked for this handle');
   if (inserted === 'other_handle') throw new OAuthError(400, 'invalid_request', 'public key is enrolled for another handle');
   if (inserted === 'enrolled') throw new OAuthError(400, 'invalid_request', 'key already enrolled');
@@ -145,63 +146,30 @@ export async function proveKey(ctx: IssuerContext, handle: string, kid: string, 
   return keyRecord(ctx, { ...key, status: 'active', challenge: undefined });
 }
 
-/**
- * Section 7.3 and the table of Section 7.4: revoke a key. The key is written first, by one atomic operation; then
- * what it asserted is ended. Whatever a concurrent request does with that key, it either sees the key revoked when
- * it reads it again after its own write, or its write is seen here (see state.ts).
- */
-export async function revokeKeyEffects(ctx: IssuerContext, kid: string): Promise<void> {
-  const key = await ctx.store.revokeKey(kid, ctx.now());
-  if (!key) return;
-  const bound = { kid: key.kid, keyEnrollment: key.enrollment };
-  await denyOpenTransactions(ctx, bound, 'key_revoked');
-  await ctx.store.voidCodes(bound);
-  await ctx.store.revokeAccessTokens(bound);
+/** Section 7.3: revocation and all its effects are one enrollment-conditional store transaction. */
+export async function revokeKeyEffects(ctx: IssuerContext, key: Pick<AgentKey, 'kid' | 'enrollment'>): Promise<void> {
+  await ctx.store.revokeKey(key.kid, key.enrollment, ctx.now());
 }
 
-/** Section 7.3: revoke every pending and active key of a handle; with an Owner Credential also every Delegated Credential for it. */
-export async function revokeAllKeys(ctx: IssuerContext, handle: string, cred: Credential): Promise<void> {
-  for (const k of await ctx.store.listKeys(handle)) if (k.status === 'active' || k.status === 'pending') await revokeKeyEffects(ctx, k.kid);
-  if (cred.kind === 'owner') for (const d of await ctx.store.listCredentials({ handle, kind: 'delegated' })) await ctx.store.deleteCredential(d.hash);
+/** Section 7.3: a stale bulk request can affect only the immutable Agent identity it authorized. */
+export async function revokeAllKeys(ctx: IssuerContext, handle: string, cred: ManagementAuthorization): Promise<void> {
+  if (!(await ctx.store.revokeAllKeys(handle, cred, ctx.now()))) throw new OAuthError(404, 'not_found');
 }
 
-/** Section 7.4: disable or enable an Account. The status is written first, then what depends on it is ended. */
-export async function setAccountStatus(ctx: IssuerContext, handle: string, clientId: string, status: 'enabled' | 'disabled'): Promise<Record<string, unknown>> {
-  const account = await ctx.store.setAccountStatus(handle, clientId, status);
+/** Section 7.4: status, invalidation fence and dependent records change in one store transaction. */
+export async function setAccountStatus(ctx: IssuerContext, handle: string, clientId: string, status: 'enabled' | 'disabled', authorization: ManagementAuthorization): Promise<Record<string, unknown>> {
+  const account = await ctx.store.setAccountStatus(handle, clientId, status, authorization, ctx.now());
   if (!account) throw new OAuthError(404, 'not_found', 'no account for this client');
-  if (status === 'disabled') {
-    await denyOpenTransactions(ctx, { handle, clientId }, 'access_denied', true); // only transactions past step 7
-    await ctx.store.voidCodes({ handle, clientId });
-    await ctx.store.revokeAccessTokens({ handle, clientId });
-  }
   return accountRecord(account);
 }
 
-/** Section 7.4 table, "Agent disabled": open transactions it asserted are denied, codes voided, tokens invalidated. */
-export async function setAgentEnabled(ctx: IssuerContext, handle: string, enabled: boolean): Promise<Agent | undefined> {
-  const agent = await ctx.store.setAgentEnabled(handle, enabled);
-  if (agent && !enabled) {
-    await denyOpenTransactions(ctx, { handle }, 'access_denied');
-    await ctx.store.voidCodes({ handle });
-    await ctx.store.revokeAccessTokens({ handle });
-  }
-  return agent;
+export async function setAgentEnabled(ctx: IssuerContext, agent: Agent, enabled: boolean): Promise<Agent | undefined> {
+  return ctx.store.setAgentEnabled(agent.handle, enabled, agent.sub, ctx.now());
 }
 
-/**
- * Section 7.4 table, "Agent deleted": as disabled, then keys, Consent Records, Accounts and Delegated Credentials are
- * deleted; the per-owner count of Section 7.6 is retained. An Agent created later with the same handle starts with none.
- */
+/** Deletion and the removal of dependent records are atomic; a replacement cannot be swept by stale cleanup. */
 export async function deleteAgent(ctx: IssuerContext, agent: Agent): Promise<void> {
-  await setAgentEnabled(ctx, agent.handle, false);
-  for (const k of await ctx.store.listKeys(agent.handle)) {
-    await revokeKeyEffects(ctx, k.kid);
-    await ctx.store.deleteKey(k.kid);
-  }
-  for (const c of await ctx.store.listConsents(agent.handle)) await ctx.store.deleteConsent(c.handle, c.clientId);
-  for (const a of await ctx.store.listAccounts(agent.handle)) await ctx.store.deleteAccount(a.handle, a.clientId);
-  for (const d of await ctx.store.listCredentials({ handle: agent.handle, kind: 'delegated' })) await ctx.store.deleteCredential(d.hash);
-  await ctx.store.deleteAgent(agent.handle);
+  if (!(await ctx.store.deleteAgent(agent.handle, agent.sub, ctx.now()))) throw new OAuthError(404, 'not_found');
 }
 
 /**
@@ -217,12 +185,12 @@ export function accountRecord(a: { clientId: string; status: string; firstSigned
 }
 
 /** Section 7.8: resolves the credential and checks that the handle belongs to its Owner. */
-export async function authorizeManagement(ctx: IssuerContext, authorization: string | undefined, handle: string, delegable: boolean): Promise<Credential> {
+export async function authorizeManagement(ctx: IssuerContext, authorization: string | undefined, handle: string, delegable: boolean): Promise<ManagementAuthorization> {
   const bearer = parseBearer(authorization);
   const cred = bearer ? await ctx.store.getCredential(sha256(bearer)) : undefined;
   if (!cred) throw new OAuthError(401, 'invalid_token', undefined, { 'WWW-Authenticate': 'Bearer error="invalid_token"' });
   const agent = await ctx.store.getAgent(handle);
   if (!agent || agent.ownerId !== cred.ownerId || (cred.kind === 'delegated' && cred.handle !== handle)) throw new OAuthError(404, 'not_found');
   if (cred.kind === 'delegated' && !delegable) throw new OAuthError(403, 'insufficient_permission', undefined, { 'WWW-Authenticate': 'Bearer error="insufficient_scope"' });
-  return cred;
+  return { ...cred, agentSub: agent.sub };
 }
