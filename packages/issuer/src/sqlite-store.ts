@@ -1,6 +1,6 @@
-// Durable reference adapter. Each Store operation reads and writes under one SQLite write transaction.
+// Durable reference adapter. Mutations use one write transaction; reads never acquire the writer lock.
 import { DatabaseSync, type StatementSync } from 'node:sqlite';
-import { STORE_METHODS, StoreState, type Store } from './store.js';
+import { READ_METHODS, STORE_METHODS, StoreState, type Store } from './store.js';
 
 export interface SQLiteStoreOptions {
   /** How long a competing process may hold the write lock before this operation fails (default: 5000 ms). */
@@ -10,7 +10,8 @@ export interface SQLiteStoreOptions {
 export interface SQLiteStore extends Store {}
 /**
  * A deliberately coarse reference adapter: the complete state is one versioned JSON row, and every method executes
- * under BEGIN IMMEDIATE. No state survives between calls, and no await occurs while a transaction owns the lock.
+ * under BEGIN IMMEDIATE for mutations or a read transaction for queries. No state survives between calls, and no
+ * await occurs while a transaction owns the lock. Reads still parse the complete snapshot.
  * Separate connections and processes therefore see every preceding committed change. Use a local filesystem;
  * WAL databases must not be shared over a network filesystem. This design favors auditable guarantees over scale.
  */
@@ -42,7 +43,7 @@ export class SQLiteStore {
       get: (target, property) => {
         const method = Object.getOwnPropertyDescriptor(StoreState.prototype, property)?.value as unknown;
         if (typeof method === 'function' && STORE_METHODS.includes(property as keyof Store)) {
-          return async (...args: unknown[]) => target.perform(method as (...args: unknown[]) => unknown, args);
+          return async (...args: unknown[]) => target.perform(method as (...args: unknown[]) => unknown, args, READ_METHODS.has(property as keyof Store));
         }
         const value = Reflect.get(target, property, target) as unknown;
         return typeof value === 'function' ? value.bind(target) : value;
@@ -50,9 +51,9 @@ export class SQLiteStore {
     });
   }
 
-  private perform(method: (...args: unknown[]) => unknown, args: unknown[]): unknown {
+  private perform(method: (...args: unknown[]) => unknown, args: unknown[], readOnly: boolean): unknown {
     if (this.closed) throw new Error('SQLiteStore is closed');
-    this.database.exec('BEGIN IMMEDIATE');
+    this.database.exec(readOnly ? 'BEGIN' : 'BEGIN IMMEDIATE');
     try {
       const snapshot = this.read.get()?.snapshot;
       if (typeof snapshot !== 'string') throw new Error('Missing issuer store snapshot');
@@ -60,7 +61,7 @@ export class SQLiteStore {
       const result = Reflect.apply(method, state, args);
       // Enforce the adapter contract if a future StoreState change accidentally introduces an asynchronous method.
       if (result && typeof (result as { then?: unknown }).then === 'function') throw new Error('StoreState operations must be synchronous');
-      this.write.run(state.exportSnapshot());
+      if (!readOnly) this.write.run(state.exportSnapshot());
       this.database.exec('COMMIT');
       return result;
     } catch (error) {

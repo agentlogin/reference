@@ -72,6 +72,28 @@ test('a failed SQLite write rolls back the complete operation and releases the l
   } finally { inspection.close(); store.close(); await f.cleanup(); }
 });
 
+test('SQLite reads and effective polling neither write nor wait for an existing WAL writer', async () => {
+  const f = await fixture();
+  const store = new SQLiteStore(f.path, { busyTimeoutMs: 0 });
+  const writer = new DatabaseSync(f.path);
+  try {
+    await prepareAgent(store, 'reader');
+    const ready = await beginSignIn(store, 'reader', 'read-tx', 'read-client', 1);
+    // The trigger catches an accidental unchanged-snapshot UPDATE; the held writer catches BEGIN IMMEDIATE.
+    writer.exec("CREATE TRIGGER refuse_read_write BEFORE UPDATE ON agentlogin_state BEGIN SELECT RAISE(ABORT, 'read attempted write'); END");
+    writer.exec('BEGIN IMMEDIATE');
+    assert.equal((await store.getTransaction(ready.id))?.status, 'ready');
+    const effective = await store.readTransaction(ready.id, { now: ready.expiresAt + 1, retainFor: 30 });
+    assert.equal(effective?.status, 'expired');
+    assert.equal((await store.getTransaction(ready.id))?.status, 'ready');
+    writer.exec('ROLLBACK');
+    writer.exec('DROP TRIGGER refuse_read_write');
+  } finally {
+    try { writer.exec('ROLLBACK'); } catch { /* no active transaction */ }
+    writer.close(); store.close(); await f.cleanup();
+  }
+});
+
 test('independent SQLite writer processes lose no successful writes and cannot exceed a signup cap', { timeout: 30_000 }, async () => {
   const f = await fixture();
   const store = new SQLiteStore(f.path);

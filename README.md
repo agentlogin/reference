@@ -16,6 +16,7 @@ JSON path and the wait-page path. The specification is at draft 0.1; code lands 
 | Package | Purpose |
 | --- | --- |
 | `packages/agentlogin` | Agent CLI and client library (npm `agentlogin`): discovery, enrollment, sign-in, cookie jar |
+| `packages/store-postgres` | PostgreSQL issuer adapter: indexed records, serializable mutations, shared contracts and database concurrency tests |
 | `packages/issuer` | Reference issuer (Hono + jose, written to the spec section by section) |
 | `packages/rp` | Relying-party kit (`@agentlogin/rp`): validation per Sections 5.7 and 2.5, handlers, sign-in form |
 | `examples/rp-hono` | A runnable application that accepts agent sign-ins |
@@ -42,3 +43,9 @@ assertion, session binding without cookies) does not fit a cookie-based interact
 implementation that follows the specification section by section is the more useful reference.
 
 Package names: npm `agentlogin` (reserved), PyPI `agent-login` (the name `agentlogin` is held by an unrelated 2019 project), crates.io `agentlogin` (free, not reserved).
+
+PostgreSQL storage is a separate optional package, `@agentlogin/store-postgres`. See
+[its contracts and operations guide](packages/store-postgres/README.md). Set `DATABASE_URL`, run
+`npm run issuer:migrate`, and supply a persistent `SIGNING_JWK` when starting the issuer. RP callback storage is
+separate. `npm test` reports PostgreSQL integration tests as skipped when `AGENTLOGIN_TEST_POSTGRES_URL` is absent;
+`REQUIRE_POSTGRES_TESTS=1 npm run test:postgres` requires a configured database, as the dedicated CI job does.

@@ -3,7 +3,7 @@ import { calculateJwkThumbprint, compactVerify, decodeProtectedHeader, importJWK
 import { ENROLLMENT_TYP } from './constants.js';
 import type { IssuerContext } from './context.js';
 import { OAuthError } from './errors.js';
-import type { Agent, AgentKey, Credential, ManagementAuthorization, P256Jwk } from './store.js';
+import { isAssertionWindowError, type Agent, type AgentKey, type Credential, type ManagementAuthorization, type P256Jwk } from './store.js';
 import { isPlainObject, parseBearer, randomId, randomSecret, sha256, typMatches } from './util.js';
 
 const B64U_32 = /^[A-Za-z0-9_-]{43}$/; // 32 octets
@@ -39,7 +39,7 @@ export async function validateP256Jwk(jwk: unknown): Promise<P256Jwk> {
 
 /** Section 7.2: a `pending` key not proved within T_ASSERT is deleted. Applied wherever a key is read, so it is never seen again. */
 async function dropIfUnproved(ctx: IssuerContext, key: AgentKey | undefined): Promise<AgentKey | undefined> {
-  if (key && key.status === 'pending' && (!key.challenge || ctx.now() > key.challenge.expiresAt)) {
+  if (key && key.status === 'pending' && (!key.challenge || (await ctx.store.currentTime(ctx.now())) > key.challenge.expiresAt)) {
     await ctx.store.deleteKey(key.kid, key.enrollment); // only this enrollment: a newer one of the same key stays
     return undefined;
   }
@@ -68,7 +68,7 @@ export async function enrollKey(ctx: IssuerContext, handle: string, body: unknow
   const jwk = await validateP256Jwk(body.jwk);
   // The thumbprint is taken over canonical coordinates, so equal identifiers mean equal decoded points (Section 7.2).
   const kid = await calculateJwkThumbprint(jwk, 'sha256');
-  const now = ctx.now();
+  const now = await ctx.store.currentTime(ctx.now());
   let expiresAt = now + ctx.constants.T_KEY;
   if (body.expires_at !== undefined) {
     if (typeof body.expires_at !== 'number' || !Number.isInteger(body.expires_at) || body.expires_at <= now) throw new OAuthError(400, 'invalid_request', 'expires_at');
@@ -100,7 +100,7 @@ export async function enrollKey(ctx: IssuerContext, handle: string, body: unknow
 /** Section 7.2: verify the enrollment proof and activate the key. */
 export async function proveKey(ctx: IssuerContext, handle: string, kid: string, body: unknown): Promise<Record<string, unknown>> {
   const key = await getLiveKey(ctx, kid);
-  const now = ctx.now();
+  const now = await ctx.store.currentTime(ctx.now());
   // Section 6.7: `unknown_key` (401) when `kid` names no enrolled key of the handle; a pending key that timed out is gone (Section 7.2).
   if (!key || key.handle !== handle) throw new OAuthError(401, 'unknown_key');
   // Section 7.4 table: proofs with a revoked or expired key are refused with `key_revoked`.
@@ -133,12 +133,20 @@ export async function proveKey(ctx: IssuerContext, handle: string, kid: string, 
   if (payload.aud !== ctx.issuer) throw bad('aud');
   if (payload.nonce !== key.challenge.value) throw bad('nonce');
   const { iat, exp } = payload;
+  const verifiedAt = await ctx.store.currentTime(ctx.now());
   if (typeof iat !== 'number' || typeof exp !== 'number') throw bad('iat and exp required');
-  if (exp > iat + ctx.constants.T_ASSERT || now >= exp || iat < now - ctx.constants.T_ASSERT || iat > now + ctx.constants.T_SKEW) throw bad('iat/exp window');
+  if (exp > iat + ctx.constants.T_ASSERT || verifiedAt >= exp || iat < verifiedAt - ctx.constants.T_ASSERT || iat > verifiedAt + ctx.constants.T_SKEW) throw bad('iat/exp window');
   if (typeof payload.jti !== 'string') throw bad('jti required');
   // Activation is one conditional write: it succeeds only if this enrollment is still pending with this challenge.
   // A revocation that completed while the signature was being verified therefore wins (Section 7.3).
-  if (!(await ctx.store.activateKey(kid, key.enrollment, key.challenge.value, now))) {
+  let activated;
+  try {
+    activated = await ctx.store.activateKey(kid, key.enrollment, key.challenge.value, verifiedAt, { notBefore: iat - ctx.constants.T_SKEW, expiresAt: exp });
+  } catch (error) {
+    if (isAssertionWindowError(error)) throw bad('proof expired while awaiting activation');
+    throw error;
+  }
+  if (!activated) {
     const current = await ctx.store.getKey(kid);
     if (current?.status === 'revoked') throw new OAuthError(401, 'key_revoked');
     throw new OAuthError(current && current.handle === handle ? 400 : 401, current && current.handle === handle ? 'invalid_assertion' : 'unknown_key', 'the key has no unconsumed challenge');

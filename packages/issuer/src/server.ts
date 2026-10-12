@@ -4,9 +4,12 @@
 //   PORT             listen port (default 3000)
 //   ADMIN_TOKEN      bootstrap/registration token (generated and printed when absent)
 //   SIGNING_JWK      private ES256 JWK as JSON (ephemeral when absent)
+//   DATABASE_URL    PostgreSQL connection URL (requires @agentlogin/store-postgres and prior migration)
+//   DATABASE_SCHEMA PostgreSQL schema (default agentlogin)
+//   DATABASE_PATH   SQLite database path; mutually exclusive with DATABASE_URL
 //   INSECURE_DEV=1   permit http issuer and loopback clients; print Owner sign-in codes instead of mailing them
 import { serve } from '@hono/node-server';
-import { createIssuer, SQLiteStore } from './index.js';
+import { createIssuer, SQLiteStore, type Store } from './index.js';
 
 const insecure = process.env.INSECURE_DEV === '1' || !process.env.ISSUER;
 const issuer = process.env.ISSUER ?? 'http://localhost:3000';
@@ -15,8 +18,24 @@ const handleDomains = (process.env.HANDLE_DOMAINS ?? new URL(issuer).hostname).s
 const adminToken = process.env.ADMIN_TOKEN;
 
 // Persistent instances must share the same configured signing key as well as the database.
-if (process.env.DATABASE_PATH && !process.env.SIGNING_JWK) throw new Error('DATABASE_PATH requires a persistent SIGNING_JWK');
-const store = process.env.DATABASE_PATH ? new SQLiteStore(process.env.DATABASE_PATH) : undefined;
+if (process.env.DATABASE_PATH && process.env.DATABASE_URL) throw new Error('Choose DATABASE_PATH or DATABASE_URL');
+if ((process.env.DATABASE_PATH || process.env.DATABASE_URL) && !process.env.SIGNING_JWK) throw new Error('Persistent storage requires SIGNING_JWK');
+let store: Store | undefined;
+let closeStore: (() => void | Promise<void>) | undefined;
+if (process.env.DATABASE_URL) {
+  // Optional adapter dependency: the issuer package remains usable without PostgreSQL installed.
+  const adapterPackage = '@agentlogin/store-postgres';
+  const { PostgresStore } = await import(adapterPackage);
+  const postgres = new PostgresStore({ connectionString: process.env.DATABASE_URL,
+    schema: process.env.DATABASE_SCHEMA ?? 'agentlogin', maxConnections: Number(process.env.DATABASE_POOL_SIZE ?? 10) });
+  try { await postgres.db.verifySchema(); } catch (error) { await postgres.close(); throw error; }
+  store = postgres;
+  closeStore = () => postgres.close();
+} else if (process.env.DATABASE_PATH) {
+  const sqlite = new SQLiteStore(process.env.DATABASE_PATH);
+  store = sqlite;
+  closeStore = () => sqlite.close();
+}
 const { app, ctx } = await createIssuer({
   issuer,
   handleDomains,
@@ -27,8 +46,13 @@ const { app, ctx } = await createIssuer({
   // Development only: the one-time code of the Owner email sign-in is printed instead of mailed. A deployment passes a mailer.
   sendOwnerCode: insecure ? ({ email, code }) => console.log(`INSECURE_DEV: one-time code for ${email}: ${code}`) : undefined,
 });
-serve({ fetch: app.fetch, port }, () => {
+const server = serve({ fetch: app.fetch, port }, () => {
   console.log(`Agent Login issuer ${issuer} listening on :${port}; handle domains ${handleDomains.join(', ')}`);
   if (!adminToken) console.log(`ADMIN_TOKEN (generated): ${ctx.adminToken}`);
   if (insecure) console.log('INSECURE_DEV: http and loopback clients are permitted');
+});
+
+// Stop accepting requests, drain active handlers, then release pooled database connections.
+for (const signal of ['SIGINT', 'SIGTERM'] as const) process.once(signal, () => {
+  server.close(() => { void Promise.resolve(closeStore?.()).catch(() => { process.exitCode = 1; }); });
 });

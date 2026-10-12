@@ -68,21 +68,28 @@ export async function exchangeCode(ctx: IssuerContext, client: Client, r: TokenR
   if (!ownerClaimsAvailable(owner, code.scopes)) throw fail(); // Section 6.6: never a token that omits a requested Owner Claim
 
   const accessToken = randomSecret();
-  const now = ctx.now();
+  const now = await ctx.store.currentTime(ctx.now());
   if (!(await ctx.store.insertAccessToken({ hash: sha256(accessToken), txnId: code.txnId, ...subject, scopes: code.scopes, expiresAt: now + ctx.constants.T_TOKEN, revoked: false }, now))) throw fail();
+  // PostgreSQL rebases issuance onto its fresh transaction clock after lock waits. Token claims use those exact
+  // persisted bounds, rather than the application clock or a timestamp captured before contention.
+  const persistedToken = await ctx.store.getAccessToken(sha256(accessToken));
+  if (!persistedToken || persistedToken.revoked) throw fail();
   // Section 5.4: when the code was presented again meanwhile, the token just issued is revoked. The other request
   // marks the code and revokes what exists; this one looks after its own insert. Whichever order, the token ends revoked.
   if ((await ctx.store.getCode(hash))?.replayed) {
     await ctx.store.revokeAccessTokens({ txnId: code.txnId });
     throw fail();
   }
-  const idToken = await mintIdToken(ctx, { agent, owner, client, scopes: code.scopes, nonce: code.nonce, authTime: code.authTime });
+  const idToken = await mintIdToken(ctx, { agent, owner, client, scopes: code.scopes, nonce: code.nonce, authTime: code.authTime,
+    issuedAt: persistedToken.issuedAt ?? persistedToken.expiresAt - ctx.constants.T_TOKEN, expiresAt: persistedToken.expiresAt });
   // Signing takes time. If the key was revoked while the token was being made, it is not handed out.
   if (await subjectState(ctx, subject)) {
     await ctx.store.revokeAccessTokens({ txnId: code.txnId });
     throw fail();
   }
-  return { access_token: accessToken, token_type: 'Bearer', expires_in: ctx.constants.T_TOKEN, id_token: idToken, scope: code.scopes.join(' ') };
+  const remaining = persistedToken.expiresAt - await ctx.store.currentTime(ctx.now());
+  if (remaining <= 0) throw fail();
+  return { access_token: accessToken, token_type: 'Bearer', expires_in: remaining, id_token: idToken, scope: code.scopes.join(' ') };
 }
 
 /** Section 6.6: whether every Owner Claim that the scopes request can be issued for this Owner. */
@@ -116,15 +123,15 @@ export function claimsFor(agent: Agent, owner: Owner, scopes: Scope[]): Record<s
   return c;
 }
 
-export async function mintIdToken(ctx: IssuerContext, p: { agent: Agent; owner: Owner; client: Client; scopes: Scope[]; nonce: string; authTime: number }): Promise<string> {
-  const now = ctx.now();
+export async function mintIdToken(ctx: IssuerContext, p: { agent: Agent; owner: Owner; client: Client; scopes: Scope[]; nonce: string; authTime: number; issuedAt?: number; expiresAt?: number }): Promise<string> {
+  const now = p.issuedAt ?? await ctx.store.currentTime(ctx.now());
   const claims = claimsFor(p.agent, p.owner, p.scopes);
   return new SignJWT({ ...claims, nonce: p.nonce, scope: p.scopes.join(' '), auth_time: p.authTime })
     .setProtectedHeader({ alg: ctx.signingKey.alg, kid: ctx.signingKey.kid, typ: 'JWT' })
     .setIssuer(ctx.issuer)
     .setAudience(p.client.clientId)
     .setIssuedAt(now)
-    .setExpirationTime(now + ctx.constants.T_TOKEN)
+    .setExpirationTime(p.expiresAt ?? now + ctx.constants.T_TOKEN)
     .setJti(randomSecret())
     .sign(ctx.signingKey.privateKey);
 }
@@ -133,7 +140,7 @@ export async function mintIdToken(ctx: IssuerContext, p: { agent: Agent; owner: 
 export async function userinfo(ctx: IssuerContext, bearer: string | null): Promise<Record<string, unknown>> {
   if (!bearer) throw invalidToken();
   const t = await ctx.store.getAccessToken(sha256(bearer));
-  if (!t || t.revoked || ctx.now() >= t.expiresAt) throw invalidToken();
+  if (!t || t.revoked || (await ctx.store.currentTime(ctx.now())) >= t.expiresAt) throw invalidToken();
   // The key that asserted the sign-in, in the enrollment that asserted it: a key that expired and was enrolled again
   // is a new enrollment and does not bring this token back (Section 3.3).
   if (await subjectState(ctx, t)) throw invalidToken();

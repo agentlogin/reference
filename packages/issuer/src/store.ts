@@ -174,6 +174,8 @@ export interface AccessToken {
   agentVersion: number;
   accountVersion: number;
   scopes: Scope[];
+  /** The store's clock when issuance was accepted. Older persisted snapshots may omit this field. */
+  issuedAt?: number;
   expiresAt: number;
   revoked: boolean;
 }
@@ -193,6 +195,14 @@ type ConsentMetadata = Pick<Consent, 'redirectHost' | 'clientName' | 'tosUri' | 
 export function sameConsentMetadata(a: ConsentMetadata, b: ConsentMetadata): boolean {
   return a.redirectHost === b.redirectHost && a.clientName === b.clientName && a.tosUri === b.tosUri && a.policyUri === b.policyUri;
 }
+/** The material consent preconditions, shared by gate planning and atomic acceptance. */
+export function consentRecordReason(record: Consent | undefined,
+  expected: ConsentMetadata & Pick<Consent, 'scopes'>, expireBefore?: number): 'first_visit' | 'material_change' | 'expired' | undefined {
+  if (!record) return 'first_visit';
+  if (!expected.scopes.every((scope) => record.scopes.includes(scope)) || !sameConsentMetadata(record, expected)) return 'material_change';
+  if (expireBefore !== undefined && record.lastUsedAt < expireBefore) return 'expired';
+  return undefined;
+}
 export interface Account {
   handle: string;
   clientId: string;
@@ -211,12 +221,26 @@ export type RedeemResult = 'ok' | 'used' | 'void' | 'expired' | 'unknown';
 export interface ManagementAuthorization extends Credential { agentSub: string }
 export interface TransitionEffects {
   now: number;
+  /** Already verified signed assertion window, rechecked by the store at its atomic acceptance point. */
+  assertionWindow?: { notBefore: number; expiresAt: number };
   maxSignups?: number;
   consent?: Omit<Consent, 'createdAt' | 'lastUsedAt'>;
+  /** The disclosure whose existing consent a transition relies on; revalidated atomically before acceptance. */
+  consentContext?: Omit<Consent, 'createdAt' | 'lastUsedAt'>;
   touchConsent?: boolean;
   expireConsentBefore?: number;
 }
+export class AssertionWindowError extends Error {
+  readonly code = 'ASSERTION_WINDOW';
+  constructor() { super('The signed assertion is outside its validity window'); this.name = 'AssertionWindowError'; }
+}
+/** Stable across separate copies of this package loaded by an external adapter. */
+export function isAssertionWindowError(error: unknown): error is AssertionWindowError {
+  return error instanceof Error && 'code' in error && error.code === 'ASSERTION_WINDOW';
+}
 export interface Store {
+  /** Authoritative clock for protocol timestamps; local adapters use the supplied application/test clock. */
+  currentTime(fallbackNow: number): Promise<number>;
   // ---- owners, agents, credentials ----
   putOwner(o: Owner): Promise<void>;
   getOwner(id: string): Promise<Owner | undefined>;
@@ -250,9 +274,10 @@ export interface Store {
   insertKey(k: AgentKey, now: number, authorization: ManagementAuthorization): Promise<InsertKeyResult>;
   /**
    * ATOMIC. `pending` becomes `active`, only if this enrollment is still pending and `challenge` is its unconsumed,
-   * unexpired challenge. False otherwise: in particular when the key was revoked while the proof was verified.
+   * unexpired challenge and the verified proof window still holds. False otherwise, or AssertionWindowError when
+   * the signed proof expired: in particular a revocation while the proof was verified cannot be overwritten.
    */
-  activateKey(kid: string, enrollment: string, challenge: string, now: number): Promise<boolean>;
+  activateKey(kid: string, enrollment: string, challenge: string, now: number, assertionWindow?: { notBefore: number; expiresAt: number }): Promise<boolean>;
   /**
    * ATOMIC. A `pending` or `active` key becomes `revoked` and is remembered as revoked for its handle. Returns the
    * key when this call revoked it, nothing when there was nothing to revoke. Requires the same enrollment and
@@ -274,10 +299,13 @@ export interface Store {
   // ---- transactions (Section 6) ----
   insertTransaction(t: Transaction): Promise<void>;
   getTransaction(id: string): Promise<Transaction | undefined>;
+  /** Read-only effective state, including lifecycle expiry and terminal retention. Never persists a transition. */
+  readTransaction(id: string, options: { now: number; retainFor: number }): Promise<Transaction | undefined>;
   /**
    * ATOMIC. Compare-and-swap against the open transaction version; return undefined on conflict. Validate subject
    * identity/lifecycle and expiry, admit the signup cap on the FIRST assertion, and commit the transaction,
-   * reservation, and consent effects together. Return the actual state (which may be denied/expired). Completion
+   * reservation, and consent effects together. Existing consent relied on must still cover the supplied context;
+   * otherwise return a review state (or denial for prompt=none). Return the actual state (which may be denied/expired). Completion
    * must use completeTransaction. A losing caller never creates or releases a reservation.
    */
   updateTransaction(t: Transaction, expectedVersion: number, effects: TransitionEffects): Promise<Transaction | undefined>;
@@ -320,6 +348,7 @@ export interface Store {
 
 /** Public operations only: internal reservation/count helpers cannot be called outside their atomic transition. */
 export const STORE_METHODS: readonly (keyof Store)[] = Object.freeze(Object.keys({
+  currentTime: true,
   putOwner: true,
   getOwner: true,
   getOwnerByEmail: true,
@@ -347,6 +376,7 @@ export const STORE_METHODS: readonly (keyof Store)[] = Object.freeze(Object.keys
   getClient: true,
   insertTransaction: true,
   getTransaction: true,
+  readTransaction: true,
   updateTransaction: true,
   listOpenTransactions: true,
   completeTransaction: true,
@@ -365,6 +395,14 @@ export const STORE_METHODS: readonly (keyof Store)[] = Object.freeze(Object.keys
   deleteAccount: true,
   signupsEver: true,
 } satisfies Record<keyof Store, true>) as (keyof Store)[]);
+
+/** Reads never rewrite state, including polling an effectively expired transaction. */
+export const READ_METHODS: ReadonlySet<keyof Store> = new Set<keyof Store>([
+  'currentTime', 'getOwner', 'getOwnerByEmail', 'getAgent', 'listAgentsByOwner', 'getCredential',
+  'listCredentials', 'getKey', 'listKeys', 'wasRevoked', 'getClient', 'getTransaction', 'readTransaction',
+  'listOpenTransactions', 'getCode', 'getAccessToken', 'getConsent', 'listConsents', 'getAccount',
+  'listAccounts', 'signupsEver',
+]);
 
 
 const copy = <T>(v: T): T => (v === undefined ? v : structuredClone(v));
@@ -415,7 +453,14 @@ export class StoreState implements SyncStore {
     return JSON.stringify({ version: 1, maps, revoked: [...this.revoked], reservations: [...this.reservations].map(([key, entries]) => [key, [...entries]]) });
   }
 
-  putOwner(o: Owner) { this.owners.set(o.id, copy(o)); }
+  currentTime(fallbackNow: number) { return fallbackNow; }
+
+  putOwner(o: Owner) {
+    const previous = this.owners.get(o.id);
+    if (previous && previous.ownerSub !== o.ownerSub) throw new Error('Owner subject is immutable');
+    if ([...this.owners.values()].some((owner) => owner.id !== o.id && owner.ownerSub === o.ownerSub)) throw new Error('Owner subject already exists');
+    this.owners.set(o.id, copy(o));
+  }
   getOwner(id: string) { return copy(this.owners.get(id)); }
   getOwnerByEmail(email: string) {
     const wanted = email.toLowerCase();
@@ -428,7 +473,7 @@ export class StoreState implements SyncStore {
     return c;
   }
   putAgent(a: Agent) {
-    if (this.agents.has(a.handle)) return false;
+    if (this.agents.has(a.handle) || [...this.agents.values()].some((agent) => agent.sub === a.sub)) return false;
     this.agents.set(a.handle, copy(a));
     return true;
   }
@@ -465,17 +510,28 @@ export class StoreState implements SyncStore {
   }
   private invalidate(filter: SubjectFilter, reason: DenyReason, now: number) {
     for (const t of this.transactions.values()) if (!TERMINAL.has(t.status) && matches({ ...t, txnId: t.id }, filter)) {
-      // Expiry may not have been materialized yet. A later lifecycle event must not restart its retention window.
-      const expired = now >= t.expiresAt;
-      t.status = expired ? 'expired' : 'denied';
-      t.reason = expired ? undefined : reason;
-      t.terminalAt = expired ? t.expiresAt : now;
+      // Expiry may not have been materialized yet. A later lifecycle event must not restart its retention window,
+      // including when the asserting key expired before the transaction's own deadline.
+      const expired = this.expiredTransaction(t, now);
+      t.status = expired?.status ?? 'denied';
+      t.reason = expired ? expired.reason : reason;
+      t.terminalAt = expired?.terminalAt ?? now;
       t.challenge = undefined;
       t.version += 1;
       if (t.ownerId) this.releaseSignup({ ownerId: t.ownerId, clientId: t.clientId, txnId: t.id });
     }
     this.voidCodes(filter);
     this.revokeAccessTokens(filter);
+  }
+  private expiredTransaction(t: Transaction, now: number): Transaction | undefined {
+    const key = t.kid ? this.keys.get(t.kid) : undefined;
+    const keyExpiry = key && key.enrollment === t.keyEnrollment && key.agentSub === t.agentSub && key.status !== 'pending'
+      ? key.expiresAt : Infinity;
+    if (now >= t.expiresAt && t.expiresAt <= keyExpiry) {
+      return { ...t, status: 'expired', terminalAt: t.expiresAt, reason: undefined, challenge: undefined };
+    }
+    if (now >= keyExpiry) return { ...t, status: 'denied', reason: 'key_revoked', terminalAt: keyExpiry, challenge: undefined };
+    return undefined;
   }
   private subjectReason(s: { handle?: string; kid?: string; keyEnrollment?: string; agentSub?: string; agentVersion?: number; accountVersion?: number; clientId: string }, now: number): 'key_revoked' | 'access_denied' | undefined {
     const key = s.kid && this.keys.get(s.kid);
@@ -502,12 +558,17 @@ export class StoreState implements SyncStore {
     const cur = this.keys.get(k.kid);
     const enrolled = cur !== undefined && ((cur.status === 'pending' && cur.challenge !== undefined && now <= cur.challenge.expiresAt) || (cur.status === 'active' && now < cur.expiresAt));
     if (enrolled) return cur.handle === k.handle ? 'enrolled' : 'other_handle';
+    if (k.expiresAt <= now || !k.challenge || k.challenge.expiresAt < now) return 'unauthorized';
+    if ([...this.keys.values()].some((key) => key.kid !== k.kid && key.enrollment === k.enrollment)) throw new Error('Key enrollment already exists');
+    // Preserve the original expiry outcome before the current-key index starts pointing at a new enrollment.
+    if (cur?.status === 'active' && now >= cur.expiresAt) this.invalidate({ kid: cur.kid, keyEnrollment: cur.enrollment }, 'key_revoked', cur.expiresAt);
     this.keys.set(k.kid, copy(k));
     return 'ok';
   }
-  activateKey(kid: string, enrollment: string, challenge: string, now: number) {
+  activateKey(kid: string, enrollment: string, challenge: string, now: number, assertionWindow?: { notBefore: number; expiresAt: number }) {
     const k = this.keys.get(kid);
-    if (!k || this.agents.get(k.handle)?.sub !== k.agentSub || k.enrollment !== enrollment || k.status !== 'pending' || !k.challenge || k.challenge.value !== challenge || now > k.challenge.expiresAt) return false;
+    if (!k || this.agents.get(k.handle)?.sub !== k.agentSub || k.enrollment !== enrollment || k.status !== 'pending' || !k.challenge || k.challenge.value !== challenge || now > k.challenge.expiresAt || now >= k.expiresAt) return false;
+    if (assertionWindow && (now < assertionWindow.notBefore || now >= assertionWindow.expiresAt)) throw new AssertionWindowError();
     k.status = 'active';
     k.challenge = undefined;
     return true;
@@ -544,14 +605,33 @@ export class StoreState implements SyncStore {
   putClient(c: Client) { this.clients.set(c.clientId, copy(c)); }
   getClient(clientId: string) { return copy(this.clients.get(clientId)); }
 
-  insertTransaction(t: Transaction) { this.transactions.set(t.id, copy(t)); }
+  insertTransaction(t: Transaction) {
+    if (this.transactions.has(t.id)) throw new Error('Transaction already exists');
+    this.transactions.set(t.id, copy(t));
+  }
   getTransaction(id: string) { return copy(this.transactions.get(id)); }
+  readTransaction(id: string, { now, retainFor }: { now: number; retainFor: number }) {
+    const stored = this.transactions.get(id);
+    if (!stored) return undefined;
+    let tx = copy(stored);
+    if (!TERMINAL.has(tx.status)) {
+      const expired = this.expiredTransaction(tx, now);
+      if (expired) tx = expired;
+      else if (tx.kid) {
+        const reason = this.subjectReason(tx, now);
+        if (reason) tx = { ...tx, status: 'denied', reason, terminalAt: now, challenge: undefined };
+      }
+    }
+    return TERMINAL.has(tx.status) && tx.terminalAt !== undefined && now > tx.terminalAt + retainFor ? undefined : tx;
+  }
   updateTransaction(t: Transaction, expectedVersion: number, effects: TransitionEffects) {
     const cur = this.transactions.get(t.id);
     if (!cur || cur.version !== expectedVersion || TERMINAL.has(cur.status) || t.status === 'completed') return undefined;
+    if (effects.assertionWindow && (effects.now < effects.assertionWindow.notBefore || effects.now >= effects.assertionWindow.expiresAt)) throw new AssertionWindowError();
     const next = copy(t);
     const deny = (reason: DenyReason) => { next.status = 'denied'; next.reason = reason; next.terminalAt = effects.now; next.challenge = undefined; };
-    if (effects.now >= cur.expiresAt) { next.status = 'expired'; next.terminalAt = cur.expiresAt; next.challenge = undefined; }
+    const expired = this.expiredTransaction(cur, effects.now);
+    if (expired) { next.status = expired.status; next.reason = expired.reason; next.terminalAt = expired.terminalAt; next.challenge = undefined; }
     else if (next.kid) {
       const reason = this.subjectReason(next, effects.now);
       if (reason) deny(reason);
@@ -561,17 +641,30 @@ export class StoreState implements SyncStore {
         if (!reserved) deny('signup_limit_reached');
         else next.passedCap = true;
       }
+      if (cur.status === 'awaiting_agent' && !reason) next.assertedAt = effects.now;
     }
+    const consentKey = `${next.handle}\u0000${next.clientId}`;
+    const previousConsent = this.consents.get(consentKey);
+    if (!TERMINAL.has(next.status) && effects.touchConsent && !effects.consent) {
+      const reason = consentRecordReason(previousConsent,
+        effects.consentContext ?? { scopes: next.scopes, redirectHost: new URL(next.redirectUri).host }, effects.expireConsentBefore);
+      if (reason) {
+        next.consentRelied = false;
+        next.reviewOutstanding = true;
+        next.consentReason = reason;
+        if (next.prompt === 'none') deny('consent_required');
+        else next.status = next.ownerApprovalOutstanding ? 'awaiting_owner' : 'awaiting_consent';
+      }
+    }
+    if (TERMINAL.has(next.status) && !expired) next.terminalAt = effects.now;
     next.version = expectedVersion + 1;
     this.transactions.set(next.id, next);
     if (TERMINAL.has(next.status) && next.ownerId) this.releaseSignup({ ownerId: next.ownerId, clientId: next.clientId, txnId: next.id });
     else {
       if (next.passedCap && next.ownerId) this.extendSignup({ ownerId: next.ownerId, clientId: next.clientId, txnId: next.id, expiresAt: next.expiresAt });
-      const consentKey = `${next.handle}\u0000${next.clientId}`;
-      const previousConsent = this.consents.get(consentKey);
       if (previousConsent && effects.expireConsentBefore !== undefined && previousConsent.lastUsedAt < effects.expireConsentBefore) this.consents.delete(consentKey);
       if (effects.consent) this.grantConsent(effects.consent, effects.now);
-      else if (effects.touchConsent && next.handle) this.touchConsent(next.handle, next.clientId, effects.now);
+      else if (effects.touchConsent && next.consentRelied && next.status === 'ready' && next.handle) this.touchConsent(next.handle, next.clientId, effects.now);
     }
     return copy(next);
   }
@@ -584,9 +677,14 @@ export class StoreState implements SyncStore {
     if (now >= cur.expiresAt || dead || (needsReservation && (!reservation || reservation.expiresAt <= now))) {
       return this.updateTransaction({ ...cur, status: 'denied', reason: dead ?? 'signup_limit_reached', terminalAt: now, challenge: undefined }, expectedVersion, { now });
     }
+    if (this.codes.has(code.hash)) throw new Error('Authorization code already exists');
     const next = { ...copy(cur), version: expectedVersion + 1, status: 'completed' as const, terminalAt: now, challenge: undefined, codeIssued: true };
+    const issued: Code = { ...copy(code), txnId: cur.id, clientId: cur.clientId, redirectUri: cur.redirectUri,
+      codeChallenge: cur.codeChallenge, nonce: cur.nonce, scopes: copy(cur.scopes), handle: cur.handle!, kid: cur.kid!,
+      keyEnrollment: cur.keyEnrollment!, agentSub: cur.agentSub!, agentVersion: cur.agentVersion!, accountVersion: cur.accountVersion!,
+      authTime: cur.assertedAt!, used: false, voided: false, replayed: undefined };
     this.transactions.set(next.id, next);
-    this.codes.set(code.hash, copy(code));
+    this.codes.set(code.hash, issued);
     this.recordSignIn({ handle: next.handle!, clientId: next.clientId, ownerId: next.ownerId!, txnId: next.id, now });
     return copy(next);
   }
@@ -611,8 +709,13 @@ export class StoreState implements SyncStore {
   voidCodes(f: SubjectFilter) { for (const c of this.codes.values()) if (!c.used && matches(c, f)) c.voided = true; }
   insertAccessToken(t: AccessToken, now: number) {
     const code = [...this.codes.values()].find((c) => c.txnId === t.txnId);
-    if (!code || !code.used || code.replayed || this.subjectReason(t, now)) return false;
-    this.tokens.set(t.hash, copy(t));
+    if (!code || !code.used || code.replayed || this.subjectReason(code, now) || this.subjectReason(t, now)) return false;
+    for (const field of ['handle', 'kid', 'agentSub', 'keyEnrollment', 'agentVersion', 'accountVersion', 'clientId'] as const) {
+      if (t[field] !== code[field]) return false;
+    }
+    if (JSON.stringify(t.scopes) !== JSON.stringify(code.scopes)) return false;
+    if (this.tokens.has(t.hash) || [...this.tokens.values()].some((token) => token.txnId === t.txnId)) return false;
+    this.tokens.set(t.hash, { ...copy(t), issuedAt: now });
     return true;
   }
   getAccessToken(hash: string) { return copy(this.tokens.get(hash)); }
@@ -656,7 +759,11 @@ export class StoreState implements SyncStore {
   private reserveSignup(p: { ownerId: string; clientId: string; handle: string; txnId: string; expiresAt: number; max: number; now: number }) {
     const key = `${p.ownerId}\u0000${p.clientId}`;
     const held = this.reservations.get(key) ?? new Map<string, { handle: string; expiresAt: number }>();
-    for (const [txn, r] of held) if (r.expiresAt <= p.now) held.delete(txn); // an expired transaction holds no place
+    for (const [txn, r] of held) {
+      const t = this.transactions.get(txn);
+      // Effective lifecycle expiry releases admission capacity even if nobody polled or persisted a denial.
+      if (r.expiresAt <= p.now || !t || TERMINAL.has(t.status) || (t.kid && this.subjectReason(t, p.now))) held.delete(txn);
+    }
     const others = new Set<string>();
     for (const r of held.values()) if (r.handle !== p.handle && !this.accounts.has(`${r.handle}\u0000${p.clientId}`)) others.add(r.handle);
     const admitted = (this.signups.get(key) ?? 0) + others.size < p.max;

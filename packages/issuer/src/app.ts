@@ -53,7 +53,9 @@ export function createIssuerApp(ctx: IssuerContext): Hono {
       const extra = (c.get as unknown as (k: string) => unknown)('txError') as Record<string, unknown> | undefined;
       return c.json({ ...body, ...extra }, err.status as 400, { ...NO_STORE, ...err.headers });
     }
-    console.error(err);
+    // Database errors can include complete failing rows in message/detail/cause. Never log that payload.
+    const code = 'code' in err && typeof err.code === 'string' && /^[0-9A-Z]{5}$/.test(err.code) ? err.code : undefined;
+    console.error('Issuer request failed', { category: 'internal_error', sqlState: code });
     return c.json({ error: 'server_error' }, 500, NO_STORE);
   });
 
@@ -447,7 +449,7 @@ export function createIssuerApp(ctx: IssuerContext): Hono {
     const owner = await ctx.store.getOwnerByEmail(b.email);
     if (owner) {
       const code = randomId();
-      const expiresAt = ctx.now() + OWNER_CODE_TTL;
+      const expiresAt = await ctx.store.currentTime(ctx.now()) + OWNER_CODE_TTL;
       await ctx.store.putOwnerCode({ ownerId: owner.id, hash: sha256(code), expiresAt }); // replaces an earlier code for this Owner
       await ctx.sendOwnerCode({ email: owner.email, code, expiresAt });
     }
@@ -458,9 +460,10 @@ export function createIssuerApp(ctx: IssuerContext): Hono {
     if (!isPlainObject(b) || typeof b.email !== 'string' || typeof b.code !== 'string') throw new OAuthError(400, 'invalid_request', 'email and code required');
     const owner = await ctx.store.getOwnerByEmail(b.email);
     const pending = owner && (await ctx.store.takeOwnerCode(owner.id)); // single use: taken whether or not it matches
-    if (!owner || !pending || ctx.now() >= pending.expiresAt || !safeEqual(sha256(b.code), pending.hash)) throw new OAuthError(401, 'invalid_token', 'the code is wrong, used or expired', { 'WWW-Authenticate': 'Bearer error="invalid_token"' });
+    const now = await ctx.store.currentTime(ctx.now());
+    if (!owner || !pending || now >= pending.expiresAt || !safeEqual(sha256(b.code), pending.hash)) throw new OAuthError(401, 'invalid_token', 'the code is wrong, used or expired', { 'WWW-Authenticate': 'Bearer error="invalid_token"' });
     const credential = randomSecret();
-    await ctx.store.putCredential({ hash: sha256(credential), ownerId: owner.id, kind: 'owner', sessionAuth: 'email_only', createdAt: ctx.now() });
+    await ctx.store.putCredential({ hash: sha256(credential), ownerId: owner.id, kind: 'owner', sessionAuth: 'email_only', createdAt: now });
     return c.json({ owner_id: owner.id, credential, session_auth: 'email_only' }, 200, NO_STORE);
   });
 

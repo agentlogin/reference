@@ -49,12 +49,18 @@ must commit the full transition, including its preconditions and effects, in one
 | --- | --- |
 | `putAgent` | Insert only when the handle is absent; an existing identity is never overwritten |
 | `insertKey` | The credential, Owner and immutable Agent subject still match the authorization; enforce key uniqueness and revocation history |
-| `activateKey`, `patchKey`, `revokeKey` | Match the exact key enrollment; revocation also denies transactions and invalidates codes and tokens |
-| `updateTransaction` | Compare the open transaction version, check subject identity, disable versions and expiry, and commit cap admission, reservation and consent effects together |
+| `activateKey`, `patchKey`, `revokeKey` | Match the exact key enrollment; activation rechecks the signed proof window; revocation also denies transactions and invalidates codes and tokens |
+| `updateTransaction` | Compare the open transaction version, check subject identity, disable versions, assertion expiry and consent reliance, and commit cap admission, reservation and consent effects together |
 | `completeTransaction` | Check the ready version, subject, expiry and reservation; complete, issue the code, update the Account and signup count, and release the reservation together |
 | `setAgentEnabled`, `setAccountStatus` | Check the authorized Agent identity, increment the persistent disable version, and invalidate dependent records together |
 | `deleteAgent`, `revokeAllKeys` | Check the immutable identity and apply all cleanup in the same transaction |
 | `redeemCode`, `insertAccessToken` | Redeem once; validate lifecycle fences, and refuse token insertion for replayed codes |
+
+`readTransaction` computes effective lifecycle/expiry state and retention without writing. Polling does not determine
+whether a reservation counts or a credential remains valid. `currentTime` supplies the adapter's authoritative clock:
+memory and SQLite use the supplied application clock, while PostgreSQL uses the database clock. Mutations recheck
+expiry and the verified assertion window at acceptance. ID-token `iat` and `exp` come from the persisted access-token
+issuance bounds, including when lock contention moves the database's issuance time past the application's timestamp.
 
 Agent subjects never change or transfer to a replacement at the same handle. Keys remember the authorizing subject;
 transactions, codes and access tokens retain that subject, their key enrollment, and Agent/Account disable versions.
@@ -66,9 +72,10 @@ client name, terms URI and policy URI remain unchanged; accepting changed terms 
 preserves an expired transaction's original terminal time and never restarts its retention window.
 
 `MemoryStore` implements these operations synchronously within one process. `SQLiteStore` runs that same state machine
-inside `BEGIN IMMEDIATE`/`COMMIT`, with WAL and `synchronous=FULL`. It uses Node’s built-in `node:sqlite` module
-(experimental in Node 22). Every operation loads fresh state and writes a
-versioned JSON snapshot; no cached state or JavaScript lock determines cross-process ownership. A failed commit rolls
+inside `BEGIN IMMEDIATE`/`COMMIT` for mutations, with WAL and `synchronous=FULL`; reads use `BEGIN` and never update the
+snapshot or acquire the writer lock. It uses Node’s built-in `node:sqlite` module (experimental in Node 22). Every
+operation loads the complete fresh snapshot, and mutations serialize it back; no cached state or JavaScript lock
+determines cross-process ownership. A failed commit rolls
 back the whole operation. Tests exercise separate database connections, independent writer processes, persistence
 across reopen, injected database write failures, and adversarial HTTP lifecycle schedules against both adapters.
 
@@ -83,11 +90,13 @@ For the standalone server, set `DATABASE_PATH` and a persistent `SIGNING_JWK`. A
 database must use the same issuer configuration and signing key. Keep the database and its WAL files in a private
 application directory on a local filesystem; the adapter is for processes on one host, not a network filesystem.
 Back up a live database using SQLite's backup facilities, not by copying only the main file while WAL is active.
-The adapter deliberately serializes operations and rewrites the full snapshot, including reads: it is a durable,
-auditable reference adapter, not a high-throughput database design. Large deployments need normalized/indexed storage,
+The adapter deliberately serializes mutations and rewrites the full snapshot. Reads still parse the full snapshot,
+and synchronous SQLite calls block the Node event loop. It is a durable, auditable reference adapter, not a
+high-throughput database design. Large deployments need normalized/indexed storage,
 retention cleanup, capacity planning and operational testing while preserving this transaction contract.
 
-Migration: the `Store` API and stored records have changed. Custom adapters must implement the new atomic operations
+Migration: the `Store` API and stored records have changed. Custom adapters must implement `currentTime`, read-only
+`readTransaction`, the new atomic operations, assertion/proof-window and consent-context checks, persisted token issuance timestamps
 and identity/version fields; do not run old and new issuers against the same store. This adapter creates a new schema;
 there is no migration from third-party stores. The RP handler also now requires explicit shared callback storage
 (see `@agentlogin/rp`). These fixes do not implement rate limiting or a production Owner authentication system, so
