@@ -47,7 +47,10 @@ export async function main(argv: string[]): Promise<void> {
       log: args.has('json') ? undefined : (l) => console.log(l),
     });
     if (args.has('json')) console.log(JSON.stringify(report, null, 2));
-    else console.log(`\n${report.passed} passed, ${report.failed} failed, ${report.skipped} skipped`);
+    else {
+      console.log(`\nPartial probe report: ${report.passed} passed, ${report.failed} failed, ${report.skipped} skipped`);
+      console.log('Counts cover the probes implemented by this harness; passing them alone does not establish full conformance. See the package README for coverage.');
+    }
     process.exitCode = report.failed ? 1 : 0;
   } catch (e) {
     console.error(e instanceof Error ? e.message : String(e));

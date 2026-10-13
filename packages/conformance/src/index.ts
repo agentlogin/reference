@@ -585,7 +585,7 @@ class Harness {
       const a4 = obj((await this.assert(s4.tx, fresh)).json);
       expect(a4.status === 'awaiting_consent' && a4.consent_reason === 'first_visit', 'review required after consent revocation');
     });
-    await this.check('I-17', 'Continue URL released per 6.5; JSON answers {redirect}; ready continue single use; denied continue repeatable', async () => {
+    await this.check('I-17', 'Continue URL released per 6.5; JSON answers {redirect}; ready continue single use; denied continuation may be repeated', async () => {
       const s = await this.start();
       const a = obj((await this.assert(s.tx, this.agent, { accept_disclosure: true })).json);
       const asSession = obj((await this.get(s.tx, s.tx.session_token)).json);
@@ -607,14 +607,22 @@ class Harness {
       const html = await call(sess.next.url, { headers: { accept: 'text/html', authorization: `Bearer ${s2.tx.session_token}` } });
       expect(html.status === 303 && redirectMatches(new URL(html.headers.get('location') ?? 'https://invalid.example/'), this.client.redirect_uri) && (html.headers.get('cache-control') ?? '').includes('no-store'), `html continue → ${html.status} ${html.headers.get('cache-control')}`);
       expect(a2.transaction_token !== undefined, 'agent still receives a transaction_token');
-      // denied path repeatable
+      // A denied continuation may be repeatable or single-use.
       const s3 = await this.start(this.client, { prompt: 'none' });
       const fresh = await this.newAgent(this.ownerId ?? (() => { throw new Skip('needs adminToken'); })());
       const a3 = obj((await this.assert(s3.tx, fresh)).json);
       expect(a3.status === 'denied', 'denied');
       const d1 = await this.cont(a3.next.url, a3.transaction_token);
       const d2 = await this.cont(a3.next.url, a3.transaction_token);
-      expect(d1.status === 200 && d2.status === 200, 'denied continue repeatable');
+      const deniedRedirect = obj(d1.json).redirect;
+      expect(d1.status === 200 && typeof deniedRedirect === 'string', `first denied continue → ${d1.status}`);
+      const errorUrl = new URL(deniedRedirect);
+      const boundError = (u: URL) => redirectMatches(u, this.client.redirect_uri) && u.searchParams.get('state') === s3.params.state && u.searchParams.get('iss') === iss && !!u.searchParams.get('error') && !u.searchParams.has('code');
+      expect(boundError(errorUrl), 'denied continuation returns a bound error response');
+      const repeated = obj(d2.json).redirect;
+      const sameError = typeof repeated === 'string' && URL.canParse(repeated) && boundError(new URL(repeated)) && new URL(repeated).searchParams.get('error') === errorUrl.searchParams.get('error');
+      expect((d2.status === 200 && sameError) || (d2.status === 410 && obj(d2.json).error === 'transaction_expired'), `optional repeated denied continue → ${d2.status} ${obj(d2.json).error ?? ''}`);
+      this.log(`INFO I-17 denied continuation is ${d2.status === 200 ? 'repeatable' : 'single use'} (either is permitted)`);
     });
     const concurrentlyIssuedTokens: string[] = [];
     await this.check('I-19', 'A fresh code succeeds sequentially; concurrent Token Requests redeem at most once', async () => {
@@ -1082,14 +1090,20 @@ class Harness {
         expect(bh.status === 400 && !bh.headers.get('location') && (bh.headers.get('content-type') ?? '').includes('text/html'), `Open Client document the Issuer must refuse (${oc.name}), HTML path → ${bh.status} ${bh.headers.get('content-type')} ${bh.headers.get('location') ?? ''}`);
       }
     });
-    await this.check('I-40', 'Loopback IP literal redirect_uri of a Registered Client matches with any port and nothing else differing; everything else by simple string comparison', async () => {
+    await this.check('I-40', 'Registered loopback port variation is optional; other URI differences are rejected', async () => {
       const exact = `https://rp-${slug()}.example/cb`;
       const reg = await this.register({ redirect_uris: ['http://127.0.0.1:8080/cb', 'http://[::1]:8080/cb', 'http://localhost:8080/cb', exact] });
       const at = (redirect_uri: string): RegisteredClient => ({ ...reg, redirect_uri });
-      const v4 = await this.start(at('http://127.0.0.1:49152/cb'));
-      expect(v4.tx.client?.redirect_host === '127.0.0.1:49152', `IPv4 loopback with another port: redirect_host ${v4.tx.client?.redirect_host}`);
-      const v6 = await this.start(at('http://[::1]:49153/cb'));
-      expect(v6.tx.status === 'awaiting_agent', 'IPv6 loopback with another port');
+      for (const uri of ['http://127.0.0.1:8080/cb', 'http://[::1]:8080/cb']) {
+        const same = await this.start(at(uri));
+        expect(same.tx.status === 'awaiting_agent', `exact registered loopback redirect ${uri}`);
+      }
+      for (const uri of ['http://127.0.0.1:49152/cb', 'http://[::1]:49153/cb']) {
+        const variant = await call(this.authUrl(at(uri)).url);
+        expect((variant.status === 200 && obj(variant.json).status === 'awaiting_agent') || (variant.status === 400 && obj(variant.json).error === 'invalid_request' && obj(variant.json).redirect === undefined && !variant.headers.get('location')), `optional loopback port variation → ${variant.status} ${variant.text.slice(0, 120)}`);
+        if (variant.status === 200) expect(obj(variant.json).client?.redirect_host === new URL(uri).host, 'accepted loopback variant reports its actual redirect host');
+        this.log(`INFO I-40 ${uri}: port variation ${variant.status === 200 ? 'accepted' : 'refused'} (either is permitted)`);
+      }
       const same = await this.start(at(exact));
       expect(same.tx.status === 'awaiting_agent', 'exact https redirect_uri');
       // Only the port may differ. Each of these is another string that a URL parser would equate with a registered value or with its host.

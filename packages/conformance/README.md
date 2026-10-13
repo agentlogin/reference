@@ -3,6 +3,9 @@
 Black-box harness for Agent Login issuers. Each check corresponds to an item of the specification's
 [conformance checklist](https://github.com/agentlogin/spec/blob/main/conformance.md) and reports pass, fail or skip
 with the observed response.
+This is a partial probe report, not a certification decision. Counts cover implemented probes only: checklist
+items without a probe are absent from the report, not counted as passes or skips. Passing this harness alone does
+not establish full conformance; an untested requirement is not evidence of a violation either.
 
 ```bash
 npm run conformance -- --issuer http://localhost:3000 --admin-token TOKEN
@@ -11,7 +14,7 @@ npm run conformance -- --issuer https://issuer.example --handle scout@example.co
 ```
 
 Two modes. With `--admin-token` the harness creates its own owners, agents and registered clients through the
-reference issuer's bootstrap API and runs every check; each run uses fresh handles and keys, so it can be repeated
+reference issuer's bootstrap API and runs every implemented check; each run uses fresh handles and keys, so it can be repeated
 against an issuer that keeps its state. With `--handle` and `--owner-credential` it uses an existing agent and needs
 a client that already exists at the issuer: a Registered Client (`--client-id`, `--client-secret`, `--redirect-uri`)
 or an Open Client (`--open-client-id`, `--open-redirect-uri`). Checks that need more than that are reported as
@@ -44,6 +47,12 @@ of the reference issuer's own surface: M-1 (Delegated Credential binding) and M-
 I-49 runs last: it audits every response the whole run received from the authorization, transaction, token, UserInfo,
 registration and agents endpoints. Owner approval (I-13, I-45) is exercised through the reference issuer's
 `/owner/transactions/{id}` API, which the specification does not define.
+These identifiers name check groups, not exhaustive coverage of every requirement in those groups. Groups absent
+from this list have no dedicated probes.
+
+Optional behavior is not required to pass: I-40 accepts either an exact-match-only policy or the permitted port
+exception for registered loopback IP redirects, while rejecting other URI differences. I-17 accepts repeatable or
+single-use denied continuations. Both checks still validate the returned protocol response.
 
 The concurrent code-redemption check requires a fresh sequential exchange to succeed and permits at most one
 successful concurrent response. Replay detection may invalidate the first request before it returns tokens, so
@@ -56,3 +65,5 @@ Consent Record unused for T_CONSENT; within I-45 the wording of the approval pag
 proves only that a credential from the one-time-code sign-in does not). Within I-40 a loopback URI without a port is
 not tested either way: Section 5.2 does not say whether it counts as a differing port. The library export
 `runConformance(options)` returns the report as data.
+The command exits nonzero for a failed probe or a setup error. Skips do not change its exit status; the details
+distinguish unavailable fixtures from a replay-revocation recommendation the issuer did not follow.
