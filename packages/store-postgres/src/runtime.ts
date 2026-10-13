@@ -1,6 +1,6 @@
 import { setTimeout as delay } from 'node:timers/promises';
 import { Pool, type PoolClient, type QueryResult, type QueryResultRow } from 'pg';
-import { identifier, schemaV1, SCHEMA_VERSION, TABLES, type TableName, validateSchema } from './schema.js';
+import { identifier, schemaV1, schemaV2, SCHEMA_VERSION, TABLES, type TableName, validateSchema } from './schema.js';
 
 export interface PgCheckpoint {
   operation: string;
@@ -217,11 +217,16 @@ export class PgDatabase {
       const migrations = `${identifier(this.schema)}.schema_migrations`;
       await client.query(`CREATE TABLE IF NOT EXISTS ${migrations} (version integer PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT clock_timestamp())`);
       const found = await client.query<{ version: number }>(`SELECT version FROM ${migrations} ORDER BY version DESC LIMIT 1`);
-      const version = found.rows[0]?.version ?? 0;
+      let version = found.rows[0]?.version ?? 0;
       if (version > SCHEMA_VERSION) throw new Error(`Database schema ${version} is newer than supported schema ${SCHEMA_VERSION}`);
       if (version === 0) {
         await client.query(schemaV1(this.schema));
-        await client.query(`INSERT INTO ${migrations} (version) VALUES ($1)`, [SCHEMA_VERSION]);
+        await client.query(`INSERT INTO ${migrations} (version) VALUES (1)`);
+        version = 1;
+      }
+      if (version === 1) {
+        await client.query(schemaV2(this.schema));
+        await client.query(`INSERT INTO ${migrations} (version) VALUES (2)`);
       }
       await client.query('COMMIT');
     } catch (error) {

@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { spawn } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
 import { SQLiteStore } from '../src/sqlite-store.js';
-import type { Owner } from '../src/store.js';
+import type { AgentKey, Owner } from '../src/store.js';
 import { prepareAgent, beginSignIn, finishSignIn } from './sqlite-fixtures.js';
 
 const owner = (id: string): Owner => ({ id, ownerSub: `sub-${id}`, email: `${id}@example.com`, emailVerified: true, verifiedVia: 'passkey', createdAt: 1 });
@@ -154,4 +154,49 @@ test('independent SQLite writer processes lose no successful writes and cannot e
     store.close();
     await f.cleanup();
   }
+});
+
+test('SQLite loads legacy key indexes, preserves history, and persists scoped keys in a version 2 snapshot', async () => {
+  const f = await fixture();
+  let store = new SQLiteStore(f.path);
+  const database = new DatabaseSync(f.path);
+  try {
+    await prepareAgent(store, 'first');
+    await prepareAgent(store, 'second');
+    const completed = await beginSignIn(store, 'first', 'completed', 'client');
+    await finishSignIn(store, completed);
+    const held = await beginSignIn(store, 'first', 'held', 'capped-client', 1);
+    await store.revokeKey('key-second', 'enrollment-second', 2);
+    store.close();
+    const snapshot = JSON.parse(database.prepare('SELECT snapshot FROM agentlogin_state WHERE id = 1').get()!.snapshot as string);
+    snapshot.version = 1;
+    snapshot.maps.keys = snapshot.maps.keys.map(([, key]: [string, AgentKey]) => [key.kid, key]);
+    const legacy = JSON.stringify(snapshot);
+    database.prepare('UPDATE agentlogin_state SET snapshot = ? WHERE id = 1').run(legacy);
+    store = new SQLiteStore(f.path);
+    assert.equal((await store.getKey('key-first', 'first@example.com'))?.enrollment, 'enrollment-first');
+    assert.equal(await store.wasRevoked('second@example.com', 'key-second'), true);
+    assert.equal((await store.getCode('code-completed'))?.used, false);
+    assert.equal(await store.signupsEver('owner', 'client'), 1);
+    assert.equal((await store.getTransaction(held.id))?.passedCap, true);
+    assert.equal(database.prepare('SELECT snapshot FROM agentlogin_state WHERE id = 1').get()!.snapshot, legacy, 'migration on a read stays read-only');
+    const first = (await store.getKey('key-first', 'first@example.com'))!;
+    const pending: AgentKey = { ...first, handle: 'second@example.com', agentSub: 'second', enrollment: 'second-pending',
+      status: 'pending', challenge: { value: 'second-challenge', expiresAt: 100 } };
+    const credential = (await store.getCredential('credential-second'))!;
+    assert.equal(await store.insertKey(pending, 3, { ...credential, agentSub: 'second' }), 'ok');
+    const migrated = JSON.parse(database.prepare('SELECT snapshot FROM agentlogin_state WHERE id = 1').get()!.snapshot as string);
+    assert.equal(migrated.version, 2, 'older binaries must reject the new key representation');
+    const { keys: _oldKeys, ...oldMaps } = snapshot.maps;
+    const { keys: _newKeys, ...newMaps } = migrated.maps;
+    assert.deepEqual(newMaps, oldMaps);
+    assert.deepEqual(migrated.revoked, snapshot.revoked);
+    assert.deepEqual(migrated.reservations, snapshot.reservations);
+    store.close();
+    store = new SQLiteStore(f.path);
+    assert.equal((await store.getKey('key-first', 'first@example.com'))?.status, 'active');
+    assert.equal((await store.getKey('key-first', 'second@example.com'))?.status, 'pending');
+    assert.equal((await store.listKeys('second@example.com')).length, 2);
+    assert.equal((await store.getTransaction(held.id))?.passedCap, true);
+  } finally { database.close(); store.close(); await f.cleanup(); }
 });

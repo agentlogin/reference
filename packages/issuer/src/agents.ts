@@ -3,7 +3,7 @@ import { calculateJwkThumbprint, compactVerify, decodeProtectedHeader, importJWK
 import { ENROLLMENT_TYP } from './constants.js';
 import type { IssuerContext } from './context.js';
 import { OAuthError } from './errors.js';
-import { isAssertionWindowError, type Agent, type AgentKey, type Credential, type ManagementAuthorization, type P256Jwk } from './store.js';
+import { isAssertionWindowError, isKeyActivationConflictError, type Agent, type AgentKey, type Credential, type ManagementAuthorization, type P256Jwk } from './store.js';
 import { isPlainObject, parseBearer, randomId, randomSecret, sha256, typMatches } from './util.js';
 
 const B64U_32 = /^[A-Za-z0-9_-]{43}$/; // 32 octets
@@ -39,13 +39,20 @@ export async function validateP256Jwk(jwk: unknown): Promise<P256Jwk> {
 
 /** Section 7.2: a `pending` key not proved within T_ASSERT is deleted. Applied wherever a key is read, so it is never seen again. */
 async function dropIfUnproved(ctx: IssuerContext, key: AgentKey | undefined): Promise<AgentKey | undefined> {
-  if (key && key.status === 'pending' && (!key.challenge || (await ctx.store.currentTime(ctx.now())) > key.challenge.expiresAt)) {
-    await ctx.store.deleteKey(key.kid, key.enrollment); // only this enrollment: a newer one of the same key stays
-    return undefined;
+  if (key?.status === 'pending') {
+    const now = await ctx.store.currentTime(ctx.now());
+    if (!key.challenge || now >= key.challenge.expiresAt) {
+      // The pending read may predate a successful proof. Cleanup must still find an expired pending challenge,
+      // and the reread may return this enrollment's activation, but must not retarget a management request
+      // to a replacement enrollment created while cleanup was delayed.
+      await ctx.store.deleteKey(key.kid, key.enrollment, now);
+      const current = await ctx.store.getKey(key.kid, key.handle);
+      return current?.enrollment === key.enrollment && current.agentSub === key.agentSub ? current : undefined;
+    }
   }
   return key;
 }
-export const getLiveKey = async (ctx: IssuerContext, kid: string): Promise<AgentKey | undefined> => dropIfUnproved(ctx, await ctx.store.getKey(kid));
+export const getLiveKey = async (ctx: IssuerContext, kid: string, handle: string): Promise<AgentKey | undefined> => dropIfUnproved(ctx, await ctx.store.getKey(kid, handle));
 export async function listLiveKeys(ctx: IssuerContext, handle: string): Promise<AgentKey[]> {
   const keys: AgentKey[] = [];
   for (const k of await ctx.store.listKeys(handle)) {
@@ -99,7 +106,7 @@ export async function enrollKey(ctx: IssuerContext, handle: string, body: unknow
 
 /** Section 7.2: verify the enrollment proof and activate the key. */
 export async function proveKey(ctx: IssuerContext, handle: string, kid: string, body: unknown): Promise<Record<string, unknown>> {
-  const key = await getLiveKey(ctx, kid);
+  const key = await getLiveKey(ctx, kid, handle);
   const now = await ctx.store.currentTime(ctx.now());
   // Section 6.7: `unknown_key` (401) when `kid` names no enrolled key of the handle; a pending key that timed out is gone (Section 7.2).
   if (!key || key.handle !== handle) throw new OAuthError(401, 'unknown_key');
@@ -143,11 +150,12 @@ export async function proveKey(ctx: IssuerContext, handle: string, kid: string, 
   try {
     activated = await ctx.store.activateKey(kid, key.enrollment, key.challenge.value, verifiedAt, { notBefore: iat - ctx.constants.T_SKEW, expiresAt: exp });
   } catch (error) {
+    if (isKeyActivationConflictError(error)) throw new OAuthError(400, 'invalid_request', 'public key is active for another Agent');
     if (isAssertionWindowError(error)) throw bad('proof expired while awaiting activation');
     throw error;
   }
   if (!activated) {
-    const current = await ctx.store.getKey(kid);
+    const current = await ctx.store.getKey(kid, handle);
     if (current?.status === 'revoked') throw new OAuthError(401, 'key_revoked');
     throw new OAuthError(current && current.handle === handle ? 400 : 401, current && current.handle === handle ? 'invalid_assertion' : 'unknown_key', 'the key has no unconsumed challenge');
   }

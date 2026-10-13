@@ -33,6 +33,10 @@ The installed package includes `agentlogin-migrate`; from the repository, run
 and print only the schema/version on success. Use the migration role for this command.
 Normal server startup verifies the schema version and does not perform DDL.
 
+Schema version 2 upgrades version 1 in place, preserving enrollments and their
+dependent authorizations. Stop old adapter instances before migration: version 1
+assumes one row per key thumbprint and cannot safely use the new key layout.
+
 The default schema is `agentlogin`. Names must be lowercase SQL identifiers, at most
 63 characters, and cannot start with `pg_`. Schema migrations are versioned and
 transactional. Concurrent migration commands coordinate through a migration-only
@@ -54,10 +58,13 @@ therefore cannot silently leave its indexed values stale.
   unique immutable subject. Management
   operations revalidate the authorized subject and credential inside their mutation.
   Deleting and reassigning a handle does not transfer accounts, consent, or keys.
-* A key thumbprint owns one current enrollment slot across the issuer. Enrollment
-  identifiers are unique. Replacement first handles effective expiry; a stale request
-  cannot change a newer enrollment. Permanent `(handle, kid)` revocation records
-  prevent prohibited enrollment reuse.
+* Pending key challenges belong to `(handle, kid)`; they do not reserve another
+  agent's public key. Enrollment identifiers are unique. A partial unique index
+  permits only one active enrollment per thumbprint across the issuer. Activation
+  retires an expired active enrollment before claiming exclusivity; a concurrent
+  unique-index conflict rejects the losing activation. A stale request cannot
+  change another enrollment. Permanent `(handle, kid)` revocation records prevent
+  prohibited enrollment reuse.
 * Accounts and consents use `(agent_sub, client_id)` identity, with a unique current
   `(handle, client_id)` lookup. Codes are unique by transaction; access tokens are
   unique by transaction and refer to their code. Token hashes are unique.

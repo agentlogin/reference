@@ -215,7 +215,7 @@ export async function assert(ctx: IssuerContext, loaded: Transaction, client: Cl
   if (!parsed) throw bad('handle syntax');
 
   // Step 2: resolve the key.
-  const key = await getLiveKey(ctx, header.kid);
+  const key = await getLiveKey(ctx, header.kid, parsed.handle);
   if (!key || !handlesEqual(key.handle, parsed.handle) || !domainServed(parsed.domain, ctx.handleDomains)) throw new OAuthError(401, 'unknown_key');
   if (key.status !== 'active' || (await ctx.store.currentTime(ctx.now())) >= key.expiresAt) throw new OAuthError(401, 'key_revoked');
   if (header.alg !== 'ES256') throw bad('alg does not match the key'); // only P-256 keys are enrolled

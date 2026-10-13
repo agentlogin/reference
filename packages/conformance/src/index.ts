@@ -3,7 +3,7 @@ import { calculateJwkThumbprint, createRemoteJWKSet, decodeProtectedHeader, jwtV
 import { createHash, randomBytes } from 'node:crypto';
 import { AgentClient, rnd } from './agent.js';
 import { call, callContext, obj, type CallContext, type Exchange, type Res } from './http.js';
-import { concurrentAccessTokens, redirectMatches, validateMetadata, validateForbiddenMetadata } from './validation.js';
+import { authorizationRedirectMatches, concurrentAccessTokens, redirectMatches, singleUseContinueError, validateMetadata, validateForbiddenMetadata } from './validation.js';
 
 export interface HarnessOptions {
   issuer: string;
@@ -596,16 +596,16 @@ class Harness {
       expect(none.status === 401, `anonymous continue → ${none.status}`);
       const c = await this.cont(a.next.url, a.transaction_token);
       const r = new URL(obj(c.json).redirect);
-      expect(c.status === 200 && redirectMatches(r, this.client.redirect_uri) && r.searchParams.get('code') && r.searchParams.get('state') === s.params.state && r.searchParams.get('iss') === iss, `continue → ${c.status} ${c.text.slice(0, 160)}`);
+      expect(c.status === 200 && authorizationRedirectMatches(r, this.client.redirect_uri, s.params.state, iss, 'code'), `continue → ${c.status} ${c.text.slice(0, 160)}`);
       const twice = await this.cont(a.next.url, a.transaction_token);
-      expect(twice.status === 410 && obj(twice.json).error === 'transaction_expired' && obj(twice.json).status === 'completed', `second continue → ${twice.status}`);
+      expect(twice.status === 410 && singleUseContinueError(twice.json, 'completed'), `second continue → ${twice.status}`);
       // deliver_to_session path, HTML redirect
       const s2 = await this.start();
       const a2 = obj((await this.assert(s2.tx, this.agent, { accept_disclosure: true, deliver_to_session: true })).json);
       const sess = obj((await this.get(s2.tx, s2.tx.session_token)).json);
       expect(typeof sess.next?.url === 'string', 'continue URL released to the Session Holder with deliver_to_session');
       const html = await call(sess.next.url, { headers: { accept: 'text/html', authorization: `Bearer ${s2.tx.session_token}` } });
-      expect(html.status === 303 && redirectMatches(new URL(html.headers.get('location') ?? 'https://invalid.example/'), this.client.redirect_uri) && (html.headers.get('cache-control') ?? '').includes('no-store'), `html continue → ${html.status} ${html.headers.get('cache-control')}`);
+      expect(html.status === 303 && authorizationRedirectMatches(new URL(html.headers.get('location') ?? 'https://invalid.example/'), this.client.redirect_uri, s2.params.state, iss, 'code') && (html.headers.get('cache-control') ?? '').includes('no-store'), `html continue → ${html.status} ${html.headers.get('cache-control')}`);
       expect(a2.transaction_token !== undefined, 'agent still receives a transaction_token');
       // A denied continuation may be repeatable or single-use.
       const s3 = await this.start(this.client, { prompt: 'none' });
@@ -617,11 +617,11 @@ class Harness {
       const deniedRedirect = obj(d1.json).redirect;
       expect(d1.status === 200 && typeof deniedRedirect === 'string', `first denied continue → ${d1.status}`);
       const errorUrl = new URL(deniedRedirect);
-      const boundError = (u: URL) => redirectMatches(u, this.client.redirect_uri) && u.searchParams.get('state') === s3.params.state && u.searchParams.get('iss') === iss && !!u.searchParams.get('error') && !u.searchParams.has('code');
+      const boundError = (u: URL) => authorizationRedirectMatches(u, this.client.redirect_uri, s3.params.state, iss, 'error');
       expect(boundError(errorUrl), 'denied continuation returns a bound error response');
       const repeated = obj(d2.json).redirect;
       const sameError = typeof repeated === 'string' && URL.canParse(repeated) && boundError(new URL(repeated)) && new URL(repeated).searchParams.get('error') === errorUrl.searchParams.get('error');
-      expect((d2.status === 200 && sameError) || (d2.status === 410 && obj(d2.json).error === 'transaction_expired'), `optional repeated denied continue → ${d2.status} ${obj(d2.json).error ?? ''}`);
+      expect((d2.status === 200 && sameError) || (d2.status === 410 && singleUseContinueError(d2.json, 'denied', m.transaction_endpoint)), `optional repeated denied continue → ${d2.status} ${obj(d2.json).error ?? ''}`);
       this.log(`INFO I-17 denied continuation is ${d2.status === 200 ? 'repeatable' : 'single use'} (either is permitted)`);
     });
     const concurrentlyIssuedTokens: string[] = [];

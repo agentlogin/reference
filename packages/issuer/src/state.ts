@@ -64,7 +64,7 @@ export interface Subject { handle: string; kid: string; keyEnrollment: string; c
  * unexpired; the Agent exists and is enabled; the Account is not disabled. Otherwise the reason it does not.
  */
 export async function subjectState(ctx: IssuerContext, s: Subject): Promise<null | 'key_revoked' | 'access_denied'> {
-  const key = await ctx.store.getKey(s.kid);
+  const key = await ctx.store.getKey(s.kid, s.handle);
   if (!key || key.handle !== s.handle || key.enrollment !== s.keyEnrollment || key.agentSub !== s.agentSub || key.status !== 'active' || (await ctx.store.currentTime(ctx.now())) >= key.expiresAt) return 'key_revoked';
   const agent = await ctx.store.getAgent(s.handle);
   if (!agent || agent.sub !== s.agentSub || !agent.enabled || agent.authorizationVersion !== s.agentVersion) return 'access_denied';

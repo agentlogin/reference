@@ -331,7 +331,7 @@ export function createIssuerApp(ctx: IssuerContext): Hono {
   app.get('/agents/:handle/keys/:kid', async (c) => {
     const handle = handleOf(c);
     const cred = await agents.authorizeManagement(ctx, c.req.header('authorization'), handle, true);
-    const k = await agents.getLiveKey(ctx, (c.req.param('kid') ?? ''));
+    const k = await agents.getLiveKey(ctx, (c.req.param('kid') ?? ''), handle);
     if (!k || k.handle !== handle || k.agentSub !== cred.agentSub) throw new OAuthError(404, 'not_found');
     return c.json(agents.keyRecord(ctx, k), 200, NO_STORE);
   });
@@ -340,7 +340,7 @@ export function createIssuerApp(ctx: IssuerContext): Hono {
     const body = await jsonBody(c);
     const wantsPermissions = isPlainObject(body) && body.permissions !== undefined;
     const cred = await agents.authorizeManagement(ctx, c.req.header('authorization'), handle, !wantsPermissions);
-    const k = await agents.getLiveKey(ctx, (c.req.param('kid') ?? ''));
+    const k = await agents.getLiveKey(ctx, (c.req.param('kid') ?? ''), handle);
     if (!k || k.handle !== handle || k.agentSub !== cred.agentSub) throw new OAuthError(404, 'not_found');
     if (!isPlainObject(body)) throw new OAuthError(400, 'invalid_request');
     const patch: { name?: string; shareOwner?: boolean } = {};
@@ -359,7 +359,7 @@ export function createIssuerApp(ctx: IssuerContext): Hono {
   app.delete('/agents/:handle/keys/:kid', async (c) => {
     const handle = handleOf(c);
     const cred = await agents.authorizeManagement(ctx, c.req.header('authorization'), handle, true);
-    const k = await agents.getLiveKey(ctx, (c.req.param('kid') ?? ''));
+    const k = await agents.getLiveKey(ctx, (c.req.param('kid') ?? ''), handle);
     if (!k || k.handle !== handle || k.agentSub !== cred.agentSub) throw new OAuthError(404, 'not_found');
     await agents.revokeKeyEffects(ctx, k);
     return c.body(null, 204, NO_STORE);

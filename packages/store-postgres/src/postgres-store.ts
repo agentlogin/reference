@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import {
-  AssertionWindowError, TERMINAL, sameConsentMetadata, consentRecordReason,
+  AssertionWindowError, KeyActivationConflictError, TERMINAL, sameConsentMetadata, consentRecordReason,
   type Store, type Owner, type OwnerCode, type Agent, type AgentKey, type Credential, type Client,
   type Transaction, type Code, type AccessToken, type Account, type Consent, type SubjectFilter,
   type ManagementAuthorization, type TransitionEffects, type InsertKeyResult, type RedeemResult,
@@ -95,7 +95,13 @@ export class PostgresStore implements Store {
     return this.list<Credential>('credentials', where || 'TRUE', values);
   }
   deleteCredential(hash: string) { return this.db.mutate('deleteCredential', async (s) => { await s.query(`DELETE FROM ${s.table('credentials')} WHERE hash=$1`, [hash]); }); }
-  getKey(kid: string) { return this.get<AgentKey>('keys', 'kid=$1', [kid]); }
+  getKey(kid: string, handle?: string) {
+    return this.db.read(async (s) => {
+      if (handle !== undefined) return this.one<AgentKey>(s, 'keys', 'kid=$1 AND handle=$2', [kid, handle]);
+      const keys = await this.many<AgentKey>(s, 'keys', 'kid=$1', [kid]);
+      return keys.find((key) => key.status === 'active') ?? (keys.length === 1 ? keys[0] : undefined);
+    });
+  }
   listKeys(handle: string) { return this.list<AgentKey>('keys', 'handle=$1', [handle]); }
   wasRevoked(handle: string, kid: string) { return this.db.read(async (s) => (await s.query(`SELECT 1 FROM ${s.table('revoked_keys')} WHERE handle=$1 AND kid=$2`, [handle, kid])).rowCount !== 0); }
   putClient(c: Client) { return this.put('putClient', 'clients', 'client_id', c.clientId, c); }
@@ -136,7 +142,7 @@ export class PostgresStore implements Store {
     return a?.sub === auth.agentSub && a.ownerId === auth.ownerId && c?.ownerId === auth.ownerId && c.kind === auth.kind && (c.kind === 'owner' || c.handle === handle);
   }
   private async subject(s: PgSession, t: Partial<Subject>, now: number): Promise<'key_revoked' | 'access_denied' | undefined> {
-    const k = t.kid ? await this.one<AgentKey>(s, 'keys', 'kid=$1', [t.kid]) : undefined;
+    const k = t.kid ? await this.one<AgentKey>(s, 'keys', 'kid=$1 AND enrollment=$2 AND handle=$3', [t.kid,t.keyEnrollment,t.handle]) : undefined;
     if (!k || k.handle !== t.handle || k.enrollment !== t.keyEnrollment || k.agentSub !== t.agentSub || k.status !== 'active' || now >= k.expiresAt) return 'key_revoked';
     const a = await this.one<Agent>(s, 'agents', 'handle=$1', [t.handle]);
     if (!a || a.sub !== t.agentSub || !a.enabled || a.authorizationVersion !== t.agentVersion) return 'access_denied';
@@ -149,7 +155,7 @@ export class PostgresStore implements Store {
     await s.query(`WITH affected AS (
       SELECT t.id,t.expires_at,COALESCE(k.expires_at,9223372036854775807) AS key_expiry
       FROM ${s.table('transactions')} t LEFT JOIN ${s.table('keys')} k
-        ON k.kid=t.kid AND k.enrollment=t.key_enrollment AND k.agent_sub=t.agent_sub AND k.status<>'pending'
+        ON k.kid=t.kid AND k.enrollment=t.key_enrollment AND k.handle=t.handle AND k.agent_sub=t.agent_sub AND k.status<>'pending'
       WHERE t.status NOT IN ('completed','denied','expired') AND ${f.where})
       UPDATE ${s.table('transactions')} t SET data=(t.data-'challenge'-'reason') || jsonb_build_object(
         'status',CASE WHEN x.expires_at<=$1::bigint AND x.expires_at<=x.key_expiry THEN 'expired' ELSE 'denied' END,
@@ -197,31 +203,50 @@ export class PostgresStore implements Store {
   insertKey(input: AgentKey, _now: number, authorization: ManagementAuthorization): Promise<InsertKeyResult> {
     const key = clone(input);
     return this.db.mutate('insertKey', async (s) => {
-      const old = await this.one<AgentKey>(s, 'keys', 'kid=$1', [key.kid]);
+      const old = await this.one<AgentKey>(s, 'keys', 'kid=$1 AND handle=$2', [key.kid,key.handle]);
       if (old) await this.subjectQuotas(s, { kid: old.kid, keyEnrollment: old.enrollment });
       const now = await s.now();
-      if (key.agentSub !== authorization.agentSub || !await this.authorized(s, key.handle, authorization)) return 'unauthorized';
+      if (key.status !== 'pending' || key.agentSub !== authorization.agentSub || !await this.authorized(s, key.handle, authorization)) return 'unauthorized';
       if ((await s.query(`SELECT 1 FROM ${s.table('revoked_keys')} WHERE handle=$1 AND kid=$2`, [key.handle, key.kid])).rowCount) return 'revoked';
-      if (old && ((old.status === 'pending' && old.challenge && now <= old.challenge.expiresAt) || (old.status === 'active' && now < old.expiresAt))) return old.handle === key.handle ? 'enrolled' : 'other_handle';
-      if (key.expiresAt <= now || !key.challenge || key.challenge.expiresAt < now) return 'unauthorized';
+      if (old && now < old.expiresAt && ((old.status === 'pending' && old.challenge && now < old.challenge.expiresAt) || old.status === 'active')) return 'enrolled';
+      if (key.expiresAt <= now || !key.challenge || key.challenge.expiresAt <= now) return 'unauthorized';
+      if (await this.one(s, 'keys', 'enrollment=$1', [key.enrollment])) throw new Error('Key enrollment already exists');
       if (old?.status === 'active' && now >= old.expiresAt) await this.invalidate(s, { kid: old.kid, keyEnrollment: old.enrollment }, 'key_revoked', old.expiresAt);
-      await s.query(`INSERT INTO ${s.table('keys')}(data) VALUES($1::jsonb) ON CONFLICT(kid) DO UPDATE SET data=EXCLUDED.data`, [JSON.stringify(key)]);
+      await s.query(`INSERT INTO ${s.table('keys')}(data) VALUES($1::jsonb) ON CONFLICT(handle,kid) DO UPDATE SET data=EXCLUDED.data`, [JSON.stringify(key)]);
       return 'ok';
     }, async (s) => sameRecord(await this.one(s, 'keys', 'kid=$1 AND enrollment=$2', [key.kid, key.enrollment]), key) ? { resolved: true, value: 'ok' } : unknown);
   }
   activateKey(kid: string, enrollment: string, challenge: string, _now: number, assertionWindow?: {notBefore:number;expiresAt:number}) {
     return this.db.mutate('activateKey', async (s) => {
+      // Expiring a previously proved enrollment can invalidate reservations. Take quota
+      // coordination first, including when this pending enrollment has no transactions.
+      await this.subjectQuotas(s, { kid });
       const key = await this.one<AgentKey>(s, 'keys', 'kid=$1 AND enrollment=$2', [kid, enrollment]);
       const now = await s.now();
       if (assertionWindow && (now < assertionWindow.notBefore || now >= assertionWindow.expiresAt)) throw new AssertionWindowError();
-      if (!key || key.status !== 'pending' || key.challenge?.value !== challenge || now > key.challenge.expiresAt || now >= key.expiresAt) return false;
+      if (!key || key.status !== 'pending' || key.challenge?.value !== challenge || now >= key.challenge.expiresAt || now >= key.expiresAt) return false;
       if (!await this.one(s, 'agents', 'handle=$1 AND sub=$2', [key.handle, key.agentSub])) return false;
-      await this.replace(s, 'keys', 'kid', kid, { ...key, status: 'active', challenge: undefined });
+      const active = await this.one<AgentKey>(s, 'keys', "kid=$1 AND status='active'", [kid]);
+      if (active) {
+        if (now < active.expiresAt) throw new KeyActivationConflictError();
+        await this.invalidate(s, { kid, keyEnrollment: active.enrollment }, 'key_revoked', active.expiresAt);
+        await this.replace(s, 'keys', 'enrollment', active.enrollment, { ...active, status: 'expired', challenge: undefined });
+      }
+      await s.checkpoint('activation_checked');
+      await this.replace(s, 'keys', 'enrollment', enrollment, { ...key, status: 'active', challenge: undefined });
       const acceptedAt = await s.now();
       if (assertionWindow && (acceptedAt < assertionWindow.notBefore || acceptedAt >= assertionWindow.expiresAt)) throw new AssertionWindowError();
-      if (acceptedAt > key.challenge.expiresAt || acceptedAt >= key.expiresAt) throw new WindowElapsed('expired');
+      if (acceptedAt >= key.challenge.expiresAt || acceptedAt >= key.expiresAt) throw new WindowElapsed('expired');
       return true;
-    }).catch((error) => { if (error instanceof WindowElapsed) return false; throw error; });
+    }).catch((error: unknown) => {
+      if (error instanceof WindowElapsed) return false;
+      // SSI may report a unique violation when concurrent snapshots each saw no
+      // active enrollment. Only this exact index denotes an activation conflict;
+      // mutate() has already rolled back all changes before this mapping.
+      if (error && typeof error === 'object' && 'code' in error && error.code === '23505'
+        && 'constraint' in error && error.constraint === 'keys_active_kid') throw new KeyActivationConflictError();
+      throw error;
+    });
   }
   revokeKey(kid: string, enrollment: string, _now: number) {
     return this.db.mutate('revokeKey', async (s) => {
@@ -230,7 +255,7 @@ export class PostgresStore implements Store {
       if (!key || !['active','pending'].includes(key.status)) return undefined;
       const now = await s.now();
       const revoked: AgentKey = { ...key, status: 'revoked', revokedAt: now, challenge: undefined };
-      await this.replace(s, 'keys', 'kid', kid, revoked);
+      await this.replace(s, 'keys', 'enrollment', enrollment, revoked);
       await s.query(`INSERT INTO ${s.table('revoked_keys')}(handle,kid) VALUES($1,$2) ON CONFLICT DO NOTHING`, [key.handle,kid]);
       await this.invalidate(s, { kid, keyEnrollment: enrollment }, 'key_revoked', now);
       return revoked;
@@ -243,7 +268,7 @@ export class PostgresStore implements Store {
       const now = await s.now();
       const keys = await this.many<AgentKey>(s, 'keys', "handle=$1 AND agent_sub=$2 AND status IN ('pending','active')", [handle,auth.agentSub]);
       for (const key of keys) {
-        await this.replace(s, 'keys', 'kid', key.kid, { ...key,status:'revoked',revokedAt:now,challenge:undefined });
+        await this.replace(s, 'keys', 'enrollment', key.enrollment, { ...key,status:'revoked',revokedAt:now,challenge:undefined });
         await s.query(`INSERT INTO ${s.table('revoked_keys')}(handle,kid) VALUES($1,$2) ON CONFLICT DO NOTHING`, [handle,key.kid]);
         await this.invalidate(s, { kid:key.kid,keyEnrollment:key.enrollment }, 'key_revoked', now);
       }
@@ -257,11 +282,28 @@ export class PostgresStore implements Store {
       if (!key) return undefined;
       if (patch.name !== undefined) key.name = patch.name;
       if (patch.shareOwner !== undefined) key.permissions.share_owner = patch.shareOwner;
-      await this.replace(s, 'keys', 'kid', kid, key);
+      await this.replace(s, 'keys', 'enrollment', enrollment, key);
       return key;
     });
   }
-  deleteKey(kid: string, enrollment?: string) { return this.db.mutate('deleteKey', async (s) => { await s.query(`DELETE FROM ${s.table('keys')} WHERE kid=$1 AND ($2::text IS NULL OR enrollment=$2)`, [kid,enrollment ?? null]); }); }
+  deleteKey(kid: string, enrollment?: string, pendingExpiredAt?: number) {
+    return this.db.mutate('deleteKey', async (s) => {
+      let target = enrollment;
+      if (target === undefined) {
+        const keys = await this.many<AgentKey>(s, 'keys', 'kid=$1', [kid]);
+        target = (keys.find((key) => key.status === 'active') ?? (keys.length === 1 ? keys[0] : undefined))?.enrollment;
+      }
+      if (target !== undefined) {
+        if (pendingExpiredAt === undefined) {
+          await s.query(`DELETE FROM ${s.table('keys')} WHERE kid=$1 AND enrollment=$2`, [kid,target]);
+        } else {
+          const now = await s.now();
+          await s.query(`DELETE FROM ${s.table('keys')} WHERE kid=$1 AND enrollment=$2 AND status='pending'
+            AND (challenge_expires_at IS NULL OR challenge_expires_at<=$3)`, [kid,target,now]);
+        }
+      }
+    });
+  }
 
   /** One read-only SQL snapshot computes lifecycle status; polling never writes or renews retention. */
   readTransaction(id: string, options: { now: number; retainFor: number }): Promise<Transaction | undefined> {
@@ -273,7 +315,7 @@ export class PostgresStore implements Store {
           WHEN k.kid IS NULL OR k.enrollment<>t.key_enrollment OR k.agent_sub<>t.agent_sub OR k.status<>'active' THEN 'key_revoked'
           WHEN a.sub IS DISTINCT FROM t.agent_sub OR NOT a.enabled OR a.authorization_version<>(t.data->>'agentVersion')::bigint
             OR ac.status='disabled' OR COALESCE(ac.authorization_version,0)<>(t.data->>'accountVersion')::bigint THEN 'access_denied' ELSE NULL END AS dead
-        FROM ${s.table('transactions')} t CROSS JOIN clock c LEFT JOIN ${s.table('keys')} k ON k.kid=t.kid
+        FROM ${s.table('transactions')} t CROSS JOIN clock c LEFT JOIN ${s.table('keys')} k ON k.kid=t.kid AND k.enrollment=t.key_enrollment AND k.handle=t.handle
         LEFT JOIN ${s.table('agents')} a ON a.handle=t.handle
         LEFT JOIN ${s.table('accounts')} ac ON ac.agent_sub=t.agent_sub AND ac.client_id=t.client_id WHERE t.id=$1),
       effective AS (SELECT now, CASE WHEN status IN ('completed','denied','expired') THEN data
@@ -286,7 +328,7 @@ export class PostgresStore implements Store {
     });
   }
   private async expiration(s: PgSession, tx: Transaction, now: number): Promise<Transaction | undefined> {
-    const k = tx.kid ? await this.one<AgentKey>(s, 'keys', 'kid=$1', [tx.kid]) : undefined;
+    const k = tx.kid ? await this.one<AgentKey>(s, 'keys', 'kid=$1 AND enrollment=$2 AND handle=$3', [tx.kid,tx.keyEnrollment,tx.handle]) : undefined;
     const keyExpiry = k && k.enrollment === tx.keyEnrollment && k.agentSub === tx.agentSub && k.status !== 'pending' ? k.expiresAt : Infinity;
     if (now >= tx.expiresAt && tx.expiresAt <= keyExpiry) return { ...tx,status:'expired',reason:undefined,terminalAt:tx.expiresAt,challenge:undefined };
     if (now >= keyExpiry) return { ...tx,status:'denied',reason:'key_revoked',terminalAt:keyExpiry,challenge:undefined };
@@ -296,7 +338,7 @@ export class PostgresStore implements Store {
     // Retire invalid/expired reservations during admission. Polling and garbage collection are not quota authorities.
     await s.query(`DELETE FROM ${s.table('reservations')} r WHERE r.owner_id=$1 AND r.client_id=$2 AND (
       r.expires_at<=$3 OR NOT EXISTS (SELECT 1 FROM ${s.table('transactions')} t
-        JOIN ${s.table('keys')} k ON k.kid=t.kid AND k.enrollment=t.key_enrollment AND k.status='active' AND k.expires_at>$3
+        JOIN ${s.table('keys')} k ON k.kid=t.kid AND k.enrollment=t.key_enrollment AND k.handle=t.handle AND k.agent_sub=t.agent_sub AND k.status='active' AND k.expires_at>$3
         JOIN ${s.table('agents')} a ON a.sub=t.agent_sub AND a.enabled AND a.authorization_version=(t.data->>'agentVersion')::bigint
         LEFT JOIN ${s.table('accounts')} ac ON ac.agent_sub=t.agent_sub AND ac.client_id=t.client_id
         WHERE t.id=r.txn_id AND t.status NOT IN ('completed','denied','expired') AND t.expires_at>$3
@@ -520,7 +562,7 @@ export class PostgresStore implements Store {
       // Row-value selection respects each immutable Agent/client pair.
       const consentResult = await s.query(`DELETE FROM ${s.table('consents')} WHERE (agent_sub,client_id) IN (SELECT agent_sub,client_id FROM ${s.table('consents')} WHERE last_used_at<$1 LIMIT $2)`,[now-consentAge,batch]);
       // Keep an expired enrollment until its transaction expiry evidence has been retired. No unbounded invalidation in GC.
-      const keys = await s.query(`DELETE FROM ${s.table('keys')} WHERE kid IN (SELECT k.kid FROM ${s.table('keys')} k WHERE (k.expires_at<=$1 OR (k.status='pending' AND k.challenge_expires_at<$1)) AND NOT EXISTS(SELECT 1 FROM ${s.table('transactions')} t WHERE t.kid=k.kid AND t.key_enrollment=k.enrollment) LIMIT $2)`,[now,batch]);
+      const keys = await s.query(`DELETE FROM ${s.table('keys')} WHERE enrollment IN (SELECT k.enrollment FROM ${s.table('keys')} k WHERE (k.expires_at<=$1 OR (k.status='pending' AND k.challenge_expires_at<$1)) AND NOT EXISTS(SELECT 1 FROM ${s.table('transactions')} t WHERE t.kid=k.kid AND t.key_enrollment=k.enrollment) LIMIT $2)`,[now,batch]);
       return {tokens,codes,transactions,reservations,ownerCodes,consents:consentResult.rowCount ?? 0,keys:keys.rowCount ?? 0};
     });
   }

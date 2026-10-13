@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { runConformance } from '../src/index.js';
-import { concurrentAccessTokens, redirectMatches, validateMetadata, validateForbiddenMetadata } from '../src/validation.js';
+import { authorizationRedirectMatches, concurrentAccessTokens, redirectMatches, singleUseContinueError, validateMetadata, validateForbiddenMetadata } from '../src/validation.js';
 
 const issuer = 'https://issuer.example';
 const metadata = (base = issuer): Record<string, unknown> => ({
@@ -99,6 +99,57 @@ test('callback comparison retains application query parameters and rejects prefi
     mutate(bad);
     assert.equal(redirectMatches(bad, callback), false, bad.href);
   }
+});
+
+test('authorization responses bind unique protocol members while retaining reordered application parameters', () => {
+  const callback = 'https://rp.example/cb?tenant=a%20b&tag=one&tag=two&tag=two';
+  for (const response of ['code', 'error'] as const) {
+    const good = new URL(callback);
+    good.searchParams.set('state', 'state');
+    good.searchParams.set('iss', issuer);
+    good.searchParams.set(response, response === 'code' ? 'the-code' : 'access_denied');
+    good.search = new URLSearchParams([...good.searchParams].reverse()).toString();
+    const matches = (u: URL) => authorizationRedirectMatches(u, callback, 'state', issuer, response);
+    assert.equal(matches(good), true);
+    for (const name of ['state', 'iss', response, 'error_description', 'error_uri']) {
+      const duplicate = new URL(good);
+      if (!duplicate.searchParams.has(name)) duplicate.searchParams.set(name, 'first');
+      duplicate.searchParams.append(name, 'conflicting');
+      assert.equal(matches(duplicate), false, `duplicate ${name}`);
+    }
+    for (const name of ['state', 'iss', response]) {
+      const missing = new URL(good);
+      missing.searchParams.delete(name);
+      assert.equal(matches(missing), false, `missing ${name}`);
+      missing.searchParams.set(name, '');
+      assert.equal(matches(missing), false, `empty ${name}`);
+    }
+    const mixed = new URL(good);
+    mixed.searchParams.set(response === 'code' ? 'error' : 'code', '');
+    assert.equal(matches(mixed), false, 'an empty conflicting response member is still mixed');
+    const changedApplication = new URL(good);
+    changedApplication.searchParams.set('tag', 'one');
+    assert.equal(matches(changedApplication), false, 'application query multiplicity is preserved');
+  }
+});
+
+test('single-use continuation errors retain the terminal status and its required next step', () => {
+  const endpoint = 'https://issuer.example/transactions';
+  const url = 'https://issuer.example/transactions/txn/continue/secret';
+  for (const status of ['denied', 'expired'] as const) {
+    const body = { error: 'transaction_expired', status, next: { action: 'continue', method: 'GET', url } };
+    assert.equal(singleUseContinueError(body, status, endpoint), true);
+    assert.equal(singleUseContinueError({ ...body, next: { ...body.next, url: `${url}-rotated` } }, status, endpoint), true, 'the current continue URL need not equal the previous URL');
+    for (const mutation of [
+      { status: undefined }, { status: 'completed' }, { status: status === 'denied' ? 'expired' : 'denied' },
+      { next: undefined }, { next: [] }, { next: { action: 'none' } },
+      { next: { ...body.next, method: 'POST' } }, { next: { ...body.next, method: undefined } },
+      { next: { ...body.next, url: undefined } },
+      ...['/relative', 'https://attacker.example/continue', `${url}#fragment`, 'https://user:password@issuer.example/continue', 'http://issuer.example/continue'].map((url) => ({ next: { ...body.next, url } })),
+    ]) assert.equal(singleUseContinueError({ ...body, ...mutation }, status, endpoint), false, JSON.stringify(mutation));
+  }
+  assert.equal(singleUseContinueError({ error: 'transaction_expired', status: 'completed', next: { action: 'none' } }, 'completed'), true);
+  assert.equal(singleUseContinueError({ error: 'transaction_expired', status: 'completed', next: { action: 'none', url } }, 'completed'), false);
 });
 
 test('concurrent redemption permits zero or one success, but never two successes or tokens in an error', () => {

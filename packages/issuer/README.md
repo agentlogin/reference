@@ -48,8 +48,8 @@ must commit the full transition, including its preconditions and effects, in one
 | Operation | Atomic guarantee |
 | --- | --- |
 | `putAgent` | Insert only when the handle is absent; an existing identity is never overwritten |
-| `insertKey` | The credential, Owner and immutable Agent subject still match the authorization; enforce key uniqueness and revocation history |
-| `activateKey`, `patchKey`, `revokeKey` | Match the exact key enrollment; activation rechecks the signed proof window; revocation also denies transactions and invalidates codes and tokens |
+| `insertKey` | The credential, Owner and immutable Agent subject still match the authorization; enforce Agent-scoped pending uniqueness and revocation history |
+| `activateKey`, `patchKey`, `revokeKey` | Match the exact enrollment; activation rechecks the proof window and claims global active-key exclusivity; revocation also denies transactions and invalidates codes and tokens |
 | `updateTransaction` | Compare the open transaction version, check subject identity, disable versions, assertion expiry and consent reliance, and commit cap admission, reservation and consent effects together |
 | `completeTransaction` | Check the ready version, subject, expiry and reservation; complete, issue the code, update the Account and signup count, and release the reservation together |
 | `setAgentEnabled`, `setAccountStatus` | Check the authorized Agent identity, increment the persistent disable version, and invalidate dependent records together |
@@ -64,6 +64,12 @@ issuance bounds, including when lock contention moves the database's issuance ti
 
 Agent subjects never change or transfer to a replacement at the same handle. Keys remember the authorizing subject;
 transactions, codes and access tokens retain that subject, their key enrollment, and Agent/Account disable versions.
+Unproved pending enrollments are scoped to the Agent: an attacker knowing only a public key cannot reserve it
+against another Agent. Only successful proof activation claims the one active enrollment for that key across the
+issuer. Conflicting valid proofs fail with `400 invalid_request`; other enrollments remain untouched. Store callers
+should use `getKey(kid, handle)`; an unscoped lookup returns an active or sole record and refuses ambiguous pending keys.
+Pending timeout cleanup uses `deleteKey(kid, enrollment, pendingExpiredAt)`, which atomically requires the same
+enrollment to remain pending and expired. A stale reader cannot delete a key that another request activated.
 Disable versions increase even if an Agent or Account is subsequently enabled. Delayed work cannot become valid again
 simply because the current enabled flag is true. Reservation helpers are private to the state machine: a losing
 assertion cannot release the winning assertion's place. Consent changes commit with their transition, so delayed
@@ -78,6 +84,11 @@ operation loads the complete fresh snapshot, and mutations serialize it back; no
 determines cross-process ownership. A failed commit rolls
 back the whole operation. Tests exercise separate database connections, independent writer processes, persistence
 across reopen, injected database write failures, and adversarial HTTP lifecycle schedules against both adapters.
+
+Snapshot format 2 stores scoped key enrollments. Memory and SQLite read version 1 snapshots and convert their
+key map in memory; the next mutation writes version 2. Stop old issuer instances before upgrading, and do not mix
+versions or roll back the binary against a version 2 snapshot. Keep a backup for rollback of the whole deployment;
+restoring it still requires the security-state reconciliation described in the implementation guidance.
 
 ```ts
 import { createIssuer, SQLiteStore } from '@agentlogin/issuer';

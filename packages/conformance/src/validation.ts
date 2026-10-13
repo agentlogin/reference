@@ -87,6 +87,32 @@ export function redirectMatches(target: URL, registered: string): boolean {
   return true;
 }
 
+/** Sections 5.4, 5.5 and 5.7: response members are single-valued; application query members are preserved. */
+export function authorizationRedirectMatches(target: URL, registered: string, state: string | undefined, issuer: string, response: 'code' | 'error'): boolean {
+  if (!redirectMatches(target, registered)) return false;
+  const params = target.searchParams;
+  for (const name of ['code', 'state', 'iss', 'error', 'error_description', 'error_uri']) {
+    if (params.getAll(name).length > 1) return false;
+  }
+  return !!state && !!issuer && params.get('state') === state && params.get('iss') === issuer &&
+    !!params.get(response) && !params.has(response === 'code' ? 'error' : 'code');
+}
+
+/** Sections 6.2 and 6.7: consuming a continue URL does not change the retained terminal outcome. */
+export function singleUseContinueError(body: unknown, status: 'completed' | 'denied' | 'expired', transactionEndpoint?: string): boolean {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return false;
+  const fields = body as Record<string, unknown>;
+  if (fields.error !== 'transaction_expired' || fields.status !== status || !fields.next || typeof fields.next !== 'object' || Array.isArray(fields.next)) return false;
+  const next = fields.next as Record<string, unknown>;
+  if (status === 'completed') return next.action === 'none' && next.method === undefined && next.url === undefined;
+  if (next.action !== 'continue' || next.method !== 'GET' || typeof next.url !== 'string' || !URL.canParse(next.url) || !transactionEndpoint) return false;
+  const url = new URL(next.url);
+  const endpoint = new URL(transactionEndpoint);
+  const local = endpoint.protocol === 'http:' && (endpoint.hostname === 'localhost' || endpoint.hostname === '[::1]' || /^127\.(?:\d{1,3}\.){2}\d{1,3}$/.test(endpoint.hostname));
+  // The current continue URL may rotate; do not impose URL stability or a path layout on the issuer.
+  return url.origin === endpoint.origin && (url.protocol === 'https:' || local) && !url.username && !url.password && !url.hash;
+}
+
 /** Section 5.6 requires at most one success: replay detection may invalidate even the first request before delivery. */
 export function concurrentAccessTokens(responses: Array<{ status: number; json: unknown }>): string[] {
   expect(responses.length > 1, 'the concurrent redemption probe requires multiple responses');

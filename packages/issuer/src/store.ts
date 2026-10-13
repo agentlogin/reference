@@ -238,6 +238,15 @@ export class AssertionWindowError extends Error {
 export function isAssertionWindowError(error: unknown): error is AssertionWindowError {
   return error instanceof Error && 'code' in error && error.code === 'ASSERTION_WINDOW';
 }
+/** The public key is already active for another Agent; pending enrollments confer no exclusivity. */
+export class KeyActivationConflictError extends Error {
+  readonly code = 'KEY_ACTIVATION_CONFLICT';
+  constructor() { super('The public key is active for another Agent'); this.name = 'KeyActivationConflictError'; }
+}
+/** Stable across separate copies of this package loaded by an external adapter. */
+export function isKeyActivationConflictError(error: unknown): error is KeyActivationConflictError {
+  return error instanceof Error && 'code' in error && error.code === 'KEY_ACTIVATION_CONFLICT';
+}
 export interface Store {
   /** Authoritative clock for protocol timestamps; local adapters use the supplied application/test clock. */
   currentTime(fallbackNow: number): Promise<number>;
@@ -263,19 +272,22 @@ export interface Store {
   deleteCredential(hash: string): Promise<void>;
 
   // ---- keys (Section 7) ----
-  getKey(kid: string): Promise<AgentKey | undefined>;
+  /** Lookup is scoped to the current Agent at handle. Legacy unscoped lookup returns the active or sole record; ambiguous pending records return undefined. */
+  getKey(kid: string, handle?: string): Promise<AgentKey | undefined>;
   listKeys(handle: string): Promise<AgentKey[]>;
   /**
    * ATOMIC. Stores a `pending` key unless the public key was revoked for this handle (`revoked`) or is enrolled
-   * now, pending with an unexpired challenge or active and unexpired, for this handle (`enrolled`) or another
-   * (`other_handle`). A dead record of the same key is replaced. The Agent sub, Owner and credential must still
-   * match the authorization snapshot, otherwise `unauthorized`; check and insert are one transaction.
+   * now, pending with an unexpired challenge or active and unexpired, for this Agent (`enrolled`). Other Agents'
+   * pending or active records do not prevent insertion. A dead record of this Agent's same key is replaced.
+   * The Agent sub, Owner and credential must still match the authorization snapshot, otherwise `unauthorized`;
+   * check and insert are one transaction.
    */
   insertKey(k: AgentKey, now: number, authorization: ManagementAuthorization): Promise<InsertKeyResult>;
   /**
    * ATOMIC. `pending` becomes `active`, only if this enrollment is still pending and `challenge` is its unconsumed,
    * unexpired challenge and the verified proof window still holds. False otherwise, or AssertionWindowError when
    * the signed proof expired: in particular a revocation while the proof was verified cannot be overwritten.
+   * Exclusivity is claimed here: throws KeyActivationConflictError if another Agent has this key active and unexpired.
    */
   activateKey(kid: string, enrollment: string, challenge: string, now: number, assertionWindow?: { notBefore: number; expiresAt: number }): Promise<boolean>;
   /**
@@ -288,8 +300,9 @@ export interface Store {
   revokeAllKeys(handle: string, authorization: ManagementAuthorization, now: number): Promise<boolean>;
   /** ATOMIC. Changes the label or permissions of this enrollment without touching its status. */
   patchKey(kid: string, enrollment: string, patch: { name?: string; shareOwner?: boolean }): Promise<AgentKey | undefined>;
-  /** Deletes the record; with `enrollment`, only if it still is that enrollment. */
-  deleteKey(kid: string, enrollment?: string): Promise<void>;
+  /** Deletes the selected record, requiring enrollment when supplied. With pendingExpiredAt, deletes only a
+   * still-pending challenge expired by that time; database adapters recheck their authoritative clock. */
+  deleteKey(kid: string, enrollment?: string, pendingExpiredAt?: number): Promise<void>;
   wasRevoked(handle: string, kid: string): Promise<boolean>;
 
   // ---- clients ----
@@ -439,18 +452,21 @@ export class StoreState implements SyncStore {
   constructor(snapshot?: string) {
     if (snapshot !== undefined) {
       const parsed = JSON.parse(snapshot);
-      if (parsed.version !== 1 || !parsed.maps || !Array.isArray(parsed.revoked)) throw new Error('Unsupported issuer store snapshot');
+      if ((parsed.version !== 1 && parsed.version !== 2) || !parsed.maps || !Array.isArray(parsed.revoked)) throw new Error('Unsupported issuer store snapshot');
       for (const name of ['owners', 'agents', 'ownerCodes', 'credentials', 'keys', 'clients', 'transactions', 'codes', 'tokens', 'consents', 'accounts', 'signups'] as const) {
         if (!Array.isArray(parsed.maps[name])) throw new Error(`Invalid store map: ${name}`);
         (this[name] as Map<string, unknown>) = new Map(parsed.maps[name]);
       }
+      // Version 1 originally indexed all keys by kid. Derive the scoped index from each value so existing SQLite
+      // snapshots and the newer scoped form both load without losing identity, revocation or transaction history.
+      this.keys = new Map([...this.keys.values()].map((key) => [this.keyIndex(key.agentSub, key.kid), key]));
       this.revoked = new Set(parsed.revoked);
       this.reservations = new Map(parsed.reservations.map(([key, entries]: [string, [string, { handle: string; expiresAt: number }][]]) => [key, new Map(entries)]));
     }
   }
   exportSnapshot(): string {
     const maps = Object.fromEntries(['owners', 'agents', 'ownerCodes', 'credentials', 'keys', 'clients', 'transactions', 'codes', 'tokens', 'consents', 'accounts', 'signups'].map((name) => [name, [...(this as unknown as Record<string, Map<string, unknown>>)[name]!.entries()]]));
-    return JSON.stringify({ version: 1, maps, revoked: [...this.revoked], reservations: [...this.reservations].map(([key, entries]) => [key, [...entries]]) });
+    return JSON.stringify({ version: 2, maps, revoked: [...this.revoked], reservations: [...this.reservations].map(([key, entries]) => [key, [...entries]]) });
   }
 
   currentTime(fallbackNow: number) { return fallbackNow; }
@@ -492,9 +508,9 @@ export class StoreState implements SyncStore {
     const a = this.agents.get(handle);
     if (!a || a.sub !== agentSub) return false;
     this.invalidate({ handle }, 'access_denied', now);
-    for (const k of this.keys.values()) if (k.handle === handle) {
+    for (const [index, k] of this.keys) if (k.handle === handle && k.agentSub === agentSub) {
       this.revoked.add(`${handle}\u0000${k.kid}`);
-      this.keys.delete(k.kid);
+      this.keys.delete(index);
     }
     for (const [id, c] of this.consents) if (c.handle === handle) this.consents.delete(id);
     for (const [id, a] of this.accounts) if (a.handle === handle) this.accounts.delete(id);
@@ -524,7 +540,7 @@ export class StoreState implements SyncStore {
     this.revokeAccessTokens(filter);
   }
   private expiredTransaction(t: Transaction, now: number): Transaction | undefined {
-    const key = t.kid ? this.keys.get(t.kid) : undefined;
+    const key = t.kid && t.keyEnrollment ? this.enrollmentKey(t.kid, t.keyEnrollment) : undefined;
     const keyExpiry = key && key.enrollment === t.keyEnrollment && key.agentSub === t.agentSub && key.status !== 'pending'
       ? key.expiresAt : Infinity;
     if (now >= t.expiresAt && t.expiresAt <= keyExpiry) {
@@ -534,7 +550,7 @@ export class StoreState implements SyncStore {
     return undefined;
   }
   private subjectReason(s: { handle?: string; kid?: string; keyEnrollment?: string; agentSub?: string; agentVersion?: number; accountVersion?: number; clientId: string }, now: number): 'key_revoked' | 'access_denied' | undefined {
-    const key = s.kid && this.keys.get(s.kid);
+    const key = s.kid && s.keyEnrollment && this.enrollmentKey(s.kid, s.keyEnrollment);
     if (!key || key.handle !== s.handle || key.enrollment !== s.keyEnrollment || key.agentSub !== s.agentSub || key.status !== 'active' || now >= key.expiresAt) return 'key_revoked';
     const agent = s.handle && this.agents.get(s.handle);
     if (!agent || agent.sub !== s.agentSub || !agent.enabled || agent.authorizationVersion !== s.agentVersion) return 'access_denied';
@@ -550,32 +566,51 @@ export class StoreState implements SyncStore {
   }
   deleteCredential(hash: string) { this.credentials.delete(hash); }
 
-  getKey(kid: string) { return copy(this.keys.get(kid)); }
+  private keyIndex(agentSub: string, kid: string): string { return `${agentSub}\u0000${kid}`; }
+  private enrollmentKey(kid: string, enrollment: string): AgentKey | undefined {
+    return [...this.keys.values()].find((key) => key.kid === kid && key.enrollment === enrollment);
+  }
+  getKey(kid: string, handle?: string) {
+    if (handle !== undefined) {
+      const agent = this.agents.get(handle);
+      return copy(agent ? this.keys.get(this.keyIndex(agent.sub, kid)) : undefined);
+    }
+    const keys = [...this.keys.values()].filter((key) => key.kid === kid);
+    const active = keys.filter((key) => key.status === 'active');
+    return copy(active.length === 1 ? active[0] : keys.length === 1 ? keys[0] : undefined);
+  }
   listKeys(handle: string) { return copy([...this.keys.values()].filter((k) => k.handle === handle)); }
   insertKey(k: AgentKey, now: number, authorization: ManagementAuthorization): InsertKeyResult {
     if (k.agentSub !== authorization.agentSub || !this.managementCurrent(k.handle, authorization)) return 'unauthorized';
     if (this.revoked.has(`${k.handle}\u0000${k.kid}`)) return 'revoked';
-    const cur = this.keys.get(k.kid);
-    const enrolled = cur !== undefined && ((cur.status === 'pending' && cur.challenge !== undefined && now <= cur.challenge.expiresAt) || (cur.status === 'active' && now < cur.expiresAt));
-    if (enrolled) return cur.handle === k.handle ? 'enrolled' : 'other_handle';
-    if (k.expiresAt <= now || !k.challenge || k.challenge.expiresAt < now) return 'unauthorized';
-    if ([...this.keys.values()].some((key) => key.kid !== k.kid && key.enrollment === k.enrollment)) throw new Error('Key enrollment already exists');
-    // Preserve the original expiry outcome before the current-key index starts pointing at a new enrollment.
+    const index = this.keyIndex(k.agentSub, k.kid);
+    const cur = this.keys.get(index);
+    const enrolled = cur !== undefined && ((cur.status === 'pending' && cur.challenge !== undefined && now < cur.challenge.expiresAt && now < cur.expiresAt) || (cur.status === 'active' && now < cur.expiresAt));
+    if (enrolled) return 'enrolled';
+    if (k.status !== 'pending' || k.expiresAt <= now || !k.challenge || k.challenge.expiresAt <= now) return 'unauthorized';
+    if ([...this.keys.values()].some((key) => key.enrollment === k.enrollment)) throw new Error('Key enrollment already exists');
+    // Preserve the original expiry outcome before this Agent's current-key index points at a new enrollment.
     if (cur?.status === 'active' && now >= cur.expiresAt) this.invalidate({ kid: cur.kid, keyEnrollment: cur.enrollment }, 'key_revoked', cur.expiresAt);
-    this.keys.set(k.kid, copy(k));
+    this.keys.set(index, copy(k));
     return 'ok';
   }
   activateKey(kid: string, enrollment: string, challenge: string, now: number, assertionWindow?: { notBefore: number; expiresAt: number }) {
-    const k = this.keys.get(kid);
-    if (!k || this.agents.get(k.handle)?.sub !== k.agentSub || k.enrollment !== enrollment || k.status !== 'pending' || !k.challenge || k.challenge.value !== challenge || now > k.challenge.expiresAt || now >= k.expiresAt) return false;
+    const k = this.enrollmentKey(kid, enrollment);
+    if (!k || this.agents.get(k.handle)?.sub !== k.agentSub || k.status !== 'pending' || !k.challenge || k.challenge.value !== challenge || now >= k.challenge.expiresAt || now >= k.expiresAt) return false;
     if (assertionWindow && (now < assertionWindow.notBefore || now >= assertionWindow.expiresAt)) throw new AssertionWindowError();
+    const active = [...this.keys.values()].filter((key) => key.kid === kid && key.status === 'active');
+    if (active.some((key) => now < key.expiresAt)) throw new KeyActivationConflictError();
+    for (const expired of active) {
+      this.invalidate({ kid, keyEnrollment: expired.enrollment }, 'key_revoked', expired.expiresAt);
+      expired.status = 'expired';
+    }
     k.status = 'active';
     k.challenge = undefined;
     return true;
   }
   revokeKey(kid: string, enrollment: string, now: number) {
-    const k = this.keys.get(kid);
-    if (!k || k.enrollment !== enrollment || (k.status !== 'pending' && k.status !== 'active')) return undefined;
+    const k = this.enrollmentKey(kid, enrollment);
+    if (!k || (k.status !== 'pending' && k.status !== 'active')) return undefined;
     k.status = 'revoked';
     k.revokedAt = now;
     k.challenge = undefined;
@@ -590,15 +625,16 @@ export class StoreState implements SyncStore {
     return true;
   }
   patchKey(kid: string, enrollment: string, patch: { name?: string; shareOwner?: boolean }) {
-    const k = this.keys.get(kid);
-    if (!k || k.enrollment !== enrollment) return undefined;
+    const k = this.enrollmentKey(kid, enrollment);
+    if (!k) return undefined;
     if (patch.name !== undefined) k.name = patch.name;
     if (patch.shareOwner !== undefined) k.permissions.share_owner = patch.shareOwner;
     return copy(k);
   }
-  deleteKey(kid: string, enrollment?: string) {
-    const k = this.keys.get(kid);
-    if (k && (enrollment === undefined || k.enrollment === enrollment)) this.keys.delete(kid);
+  deleteKey(kid: string, enrollment?: string, pendingExpiredAt?: number) {
+    const k = enrollment === undefined ? this.getKey(kid) : this.enrollmentKey(kid, enrollment);
+    if (!k || (pendingExpiredAt !== undefined && (k.status !== 'pending' || (k.challenge && pendingExpiredAt < k.challenge.expiresAt)))) return;
+    this.keys.delete(this.keyIndex(k.agentSub, kid));
   }
   wasRevoked(handle: string, kid: string) { return this.revoked.has(`${handle}\u0000${kid}`); }
 

@@ -2,7 +2,7 @@
  * Critical lookup/lifecycle fields are stored generated columns, so indexed values cannot drift from payloads.
  * Historical authorizations intentionally do not cascade from live identities; revocation/replay evidence survives.
  */
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 2;
 export const TABLES = [
   'owners', 'agents', 'credentials', 'owner_codes', 'keys', 'revoked_keys', 'clients',
   'transactions', 'codes', 'access_tokens', 'accounts', 'consents', 'quotas', 'reservations',
@@ -200,5 +200,16 @@ CREATE TABLE ${q('reservations')} (
 );
 CREATE INDEX reservations_quota ON ${q('reservations')} (owner_id, client_id, expires_at, agent_sub);
 CREATE INDEX reservations_expiry ON ${q('reservations')} (expires_at);
+`;
+}
+
+/** Pending challenges are scoped to an Agent. Only a proved, active key is exclusive. */
+export function schemaV2(schema: string): string {
+  const keys = `${identifier(schema)}.keys`;
+  return `
+ALTER TABLE ${keys} DROP CONSTRAINT keys_pkey;
+ALTER TABLE ${keys} ADD PRIMARY KEY (handle, kid);
+CREATE INDEX keys_kid ON ${keys} (kid);
+CREATE UNIQUE INDEX keys_active_kid ON ${keys} (kid) WHERE status = 'active';
 `;
 }

@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { SignJWT } from 'jose';
-import { MemoryStore, type Store } from '../src/index.js';
+import { DEFAULT_CONSTANTS, MemoryStore, type Store } from '../src/index.js';
 import { SQLiteStore } from '../src/sqlite-store.js';
 import { world } from './fixtures.js';
 import { hookable, snapshotting } from './stores.js';
@@ -42,6 +42,108 @@ async function proveOnSecond(w: World, handle: string, key: Key, enrollment: { j
 }
 
 for (const backend of ['memory', 'sqlite'] as const) {
+  test(`${backend}: an unproved public-key enrollment cannot block its owner or revoke the owner's active key`, async (t) => {
+    const { w, secondStore, other } = await setup(t, backend);
+    const attacker = await w.agent('attacker@example.com');
+    const handle = 'legitimate@example.com';
+    const legitimateOwner = await other('POST', '/admin/owners', { json: { email: 'legitimate@example.org', session_auth: 'passkey' }, headers: w.admin });
+    assert.equal(legitimateOwner.status, 201);
+    assert.equal((await other('POST', '/admin/agents', { json: { handle, owner_id: legitimateOwner.json.owner_id }, headers: w.admin })).status, 201);
+    const key = await w.newKey();
+    const squatting = await w.enroll(attacker.handle, key);
+    assert.equal(squatting.en.status, 201, squatting.en.text);
+    // The attacker knows only this public key: it never sends a proof of possession.
+    const legitimate = await other('POST', `/agents/${encodeURIComponent(handle)}/keys`, {
+      json: { jwk: key.jwk }, headers: { authorization: `Bearer ${legitimateOwner.json.credential}` },
+    });
+    assert.equal(legitimate.status, 201, legitimate.text);
+    assert.equal(await secondStore.getKey(key.kid), undefined, 'unscoped lookup cannot select either pending record');
+    await proveOnSecond(w, handle, key, legitimate);
+    assert.equal((await secondStore.getKey(key.kid, attacker.handle))?.status, 'pending');
+    assert.equal((await secondStore.getKey(key.kid, handle))?.status, 'active');
+    const attackerRead = await w.req('GET', `/agents/${encodeURIComponent(attacker.handle)}/keys/${key.kid}`, { headers: w.cred });
+    assert.equal(attackerRead.status, 200);
+    assert.equal(attackerRead.json.status, 'pending', 'management never exposes the other Agent enrollment');
+    assert.equal((await w.revoke({ handle: attacker.handle, kid: key.kid })).status, 204);
+    assert.equal((await secondStore.getKey(key.kid, handle))?.status, 'active');
+    const client = await w.client();
+    const code = await w.codeFor(client, { handle, ...key });
+    assert.equal((await w.token(client, code.code, code.verifier, 1)).status, 200, 'the legitimate key still signs in');
+  });
+
+  test(`${backend}: stale pending-key reads cannot delete a proof that activated before the deadline`, async (t) => {
+    const { w, after, secondStore } = await setup(t, backend);
+    const agent = await w.agent('cleanup@example.com');
+    const key = await w.newKey();
+    const { en } = await w.enroll(agent.handle, key);
+    assert.equal(en.status, 201, en.text);
+    after('getKey', async () => {
+      await proveOnSecond(w, agent.handle, key, en);
+      w.advance(DEFAULT_CONSTANTS.T_ASSERT);
+    });
+    const record = await w.req('GET', `/agents/${encodeURIComponent(agent.handle)}/keys/${key.kid}`, { headers: w.cred });
+    assert.equal(record.status, 200, record.text);
+    assert.equal(record.json.status, 'active', 'the request rereads a concurrent proof instead of treating its stale pending snapshot as expired');
+    assert.equal((await secondStore.getKey(key.kid, agent.handle))?.status, 'active');
+    const client = await w.client();
+    const code = await w.codeFor(client, { handle: agent.handle, ...key });
+    assert.equal((await w.token(client, code.code, code.verifier, 1)).status, 200);
+  });
+
+  for (const method of ['DELETE', 'PATCH'] as const) {
+    test(`${backend}: stale pending-key ${method} cannot retarget a replacement enrollment after cleanup`, async (t) => {
+      const { w, after, secondStore, other } = await setup(t, backend);
+      const agent = await w.agent('replacement-cleanup@example.com');
+      const key = await w.newKey();
+      const original = await w.enroll(agent.handle, key);
+      assert.equal(original.en.status, 201, original.en.text);
+      const firstEnrollment = (await secondStore.getKey(key.kid, agent.handle))!.enrollment;
+      let replacementEnrollment = '';
+      after('getKey', async () => {
+        w.advance(DEFAULT_CONSTANTS.T_ASSERT);
+        const replacement = await other('POST', `/agents/${encodeURIComponent(agent.handle)}/keys`, {
+          json: { jwk: key.jwk, name: 'replacement' }, headers: w.cred,
+        });
+        assert.equal(replacement.status, 201, replacement.text);
+        await proveOnSecond(w, agent.handle, key, replacement);
+        replacementEnrollment = (await secondStore.getKey(key.kid, agent.handle))!.enrollment;
+        assert.notEqual(replacementEnrollment, firstEnrollment);
+      });
+      const result = await w.req(method, `/agents/${encodeURIComponent(agent.handle)}/keys/${key.kid}`, {
+        headers: w.cred, ...(method === 'PATCH' ? { json: { name: 'stale label', permissions: { share_owner: true } } } : {}),
+      });
+      assert.equal(result.status, 404, result.text);
+      const preserved = (await secondStore.getKey(key.kid, agent.handle))!;
+      assert.equal(preserved.enrollment, replacementEnrollment);
+      assert.equal(preserved.status, 'active');
+      assert.equal(preserved.name, 'replacement');
+      assert.equal(preserved.permissions.share_owner, false);
+      assert.equal(await secondStore.wasRevoked(agent.handle, key.kid), false);
+    });
+  }
+
+  test(`${backend}: concurrent valid proofs for one public key activate one Agent and return an explicit conflict`, async (t) => {
+    const { w, secondStore } = await setup(t, backend);
+    const agents = await Promise.all([w.agent('first@example.com'), w.agent('second@example.com')]);
+    const key = await w.newKey();
+    const enrollments = await Promise.all(agents.map((agent) => w.enroll(agent.handle, key)));
+    for (const enrollment of enrollments) assert.equal(enrollment.en.status, 201, enrollment.en.text);
+    const results = await Promise.all(enrollments.map(async ({ en }, i) => {
+      const handle = agents[i]!.handle;
+      const now = en.json.created_at as number;
+      const proof = await new SignJWT({ nonce: en.json.challenge, jti: randomBytes(16).toString('base64url') })
+        .setProtectedHeader({ alg: 'ES256', typ: 'agent-login-enrollment+jwt', kid: key.kid })
+        .setIssuer(handle).setSubject(handle).setAudience('https://issuer.test')
+        .setIssuedAt(now).setExpirationTime(now + 60).sign(key.privateKey);
+      return w.on(i)('POST', en.json.proof_url, { json: { proof } });
+    }));
+    assert.deepEqual(results.map((result) => result.status).sort(), [200, 400]);
+    assert.equal(results.find((result) => result.status === 400)?.json.error, 'invalid_request');
+    const records = await Promise.all(agents.map((agent) => secondStore.getKey(key.kid, agent.handle)));
+    assert.equal(records.filter((record) => record?.status === 'active').length, 1);
+    assert.equal(records.filter((record) => record?.status === 'pending').length, 1);
+  });
+
   test(`${backend}: enrollment cannot cross deletion and handle reassignment to another Owner`, async (t) => {
     const { w, after, secondStore, other } = await setup(t, backend);
     const handle = 'scout@example.com';

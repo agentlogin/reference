@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { test, type TestContext } from 'node:test';
 import {
-  isAssertionWindowError, type AccessToken, type Agent, type AgentKey, type Client, type Code,
+  isAssertionWindowError, isKeyActivationConflictError, type AccessToken, type Agent, type AgentKey, type Client, type Code,
   type ManagementAuthorization, type Owner, type Store, type Transaction, type TransitionEffects,
 } from '../src/store.js';
 
@@ -123,19 +123,92 @@ export function registerStoreContract(name: string, factory: StoreContractFactor
     assert.equal((await f.store.getTransaction(tx.id))?.nonce, tx.nonce);
   });
 
-  check('one current key enrollment belongs to one agent and a stale revocation cannot affect its replacement', async (f) => {
-    const a = await subject(f);
-    const b = await subject(f, 'second');
+  check('pending public keys do not reserve exclusivity and concurrent proofs activate only one Agent', async (f) => {
+    const a = await subject(f); const b = await subject(f, 'second');
+    const kid = hash('shared-unproved-key');
+    const attempts = [a, b].map((s): AgentKey => ({ ...s.key, kid, enrollment: `shared-${s.agent.sub}`, status: 'pending',
+      challenge: { value: `proof-${s.agent.sub}`, expiresAt: f.now() + 60 } }));
+    for (const [index, s] of [a, b].entries()) assert.equal(await f.store.insertKey(attempts[index]!, f.now(), s.authorization), 'ok');
+    assert.equal(await f.store.getKey(kid), undefined, 'an unscoped lookup must not pick an arbitrary pending enrollment');
+    assert.equal((await f.store.getKey(kid, a.agent.handle))?.enrollment, attempts[0]!.enrollment);
+    assert.equal((await f.peer.getKey(kid, b.agent.handle))?.enrollment, attempts[1]!.enrollment);
+    const results = await Promise.allSettled(attempts.map((key, i) => [f.store, f.peer][i]!.activateKey(kid, key.enrollment, key.challenge!.value, f.now())));
+    assert.equal(results.filter((result) => result.status === 'fulfilled' && result.value).length, 1);
+    const conflict = results.find((result) => result.status === 'rejected');
+    assert.ok(conflict?.status === 'rejected' && isKeyActivationConflictError(conflict.reason));
+    const records = await Promise.all([a, b].map((s) => f.store.getKey(kid, s.agent.handle)));
+    assert.equal(records.filter((key) => key?.status === 'active').length, 1);
+    assert.equal(records.filter((key) => key?.status === 'pending').length, 1, 'a losing proof does not consume its challenge');
+    assert.equal((await f.store.getKey(kid))?.enrollment, records.find((key) => key?.status === 'active')?.enrollment);
+  });
+
+  check('active key conflicts are decided at proof, while stale cleanup and revocation stay scoped', async (f) => {
+    const a = await subject(f); const b = await subject(f, 'second');
     const replacement: AgentKey = { ...a.key, handle: b.agent.handle, agentSub: b.agent.sub, enrollment: 'new-enrollment',
       status: 'pending', challenge: { value: 'proof', expiresAt: f.now() + 60 }, expiresAt: f.now() + 7200 };
-    assert.equal(await f.peer.insertKey(replacement, f.now(), b.authorization), 'other_handle');
+    assert.equal(await f.peer.insertKey(replacement, f.now(), b.authorization), 'ok', 'insertion does not claim the active slot');
+    await assert.rejects(f.peer.activateKey(replacement.kid, replacement.enrollment, 'proof', f.now()), isKeyActivationConflictError);
+    assert.equal((await f.store.getKey(a.key.kid, a.agent.handle))?.status, 'active');
+    assert.equal((await f.store.getKey(a.key.kid, b.agent.handle))?.challenge?.value, 'proof');
     await f.advance(3601);
-    replacement.challenge!.expiresAt = f.now() + 60;
-    assert.equal(await f.peer.insertKey(replacement, f.now(), b.authorization), 'ok');
+    const refreshed = { ...replacement, enrollment: 'refreshed-enrollment', challenge: { value: 'fresh-proof', expiresAt: f.now() + 60 } };
+    assert.equal(await f.peer.insertKey(refreshed, f.now(), b.authorization), 'ok');
+    assert.equal(await f.peer.activateKey(refreshed.kid, refreshed.enrollment, 'fresh-proof', f.now()), true);
+    assert.equal(await f.store.activateKey(replacement.kid, replacement.enrollment, 'proof', f.now()), false);
     assert.equal(await f.store.revokeKey(a.key.kid, a.key.enrollment, f.now()), undefined);
-    assert.equal(await f.peer.activateKey(replacement.kid, replacement.enrollment, 'proof', f.now()), true);
-    assert.equal((await f.store.getKey(a.key.kid))?.enrollment, replacement.enrollment);
+    await f.store.deleteKey(a.key.kid, replacement.enrollment);
+    await f.store.deleteKey(a.key.kid, a.key.enrollment);
+    assert.equal((await f.store.getKey(a.key.kid, b.agent.handle))?.enrollment, refreshed.enrollment);
     assert.equal((await f.store.getKey(a.key.kid))?.status, 'active');
+  });
+
+  check('revoking or deleting an unproved enrollment cannot affect another Agent using the same key', async (f) => {
+    const a = await subject(f); const b = await subject(f, 'second');
+    const unproved: AgentKey = { ...a.key, handle: b.agent.handle, agentSub: b.agent.sub, enrollment: 'unproved-other-agent',
+      status: 'pending', challenge: { value: 'unproved', expiresAt: f.now() + 60 } };
+    assert.equal(await f.peer.insertKey(unproved, f.now(), b.authorization), 'ok');
+    await f.peer.patchKey(unproved.kid, unproved.enrollment, { shareOwner: true, name: 'other label' });
+    assert.equal((await f.store.getKey(a.key.kid, a.agent.handle))?.permissions.share_owner, false);
+    assert.equal((await f.store.getKey(a.key.kid, a.agent.handle))?.name, undefined);
+    assert.equal((await f.peer.revokeKey(unproved.kid, unproved.enrollment, f.now()))?.status, 'revoked');
+    assert.equal(await f.peer.wasRevoked(b.agent.handle, a.key.kid), true);
+    assert.equal(await f.store.wasRevoked(a.agent.handle, a.key.kid), false);
+    await f.peer.deleteKey(unproved.kid, unproved.enrollment);
+    assert.equal((await f.store.getKey(a.key.kid, a.agent.handle))?.status, 'active');
+    const c = await client(f); const tx = await ready(f, c, a, 'still-active');
+    assert.equal(tx.status, 'ready');
+    await complete(f, tx);
+  });
+
+  check('delayed pending cleanup cannot delete a successfully activated enrollment', async (f) => {
+    const a = await subject(f);
+    const key: AgentKey = { ...a.key, kid: hash('pending-cleanup-race'), enrollment: 'pending-cleanup-race', status: 'pending',
+      challenge: { value: 'proof', expiresAt: f.now() + 10 } };
+    const unproved: AgentKey = { ...key, kid: hash('unproved-cleanup-control'), enrollment: 'unproved-cleanup-control' };
+    for (const candidate of [key, unproved]) assert.equal(await f.store.insertKey(candidate, f.now(), a.authorization), 'ok');
+    const stale = (await f.store.getKey(key.kid, a.agent.handle))!;
+    assert.equal(stale.status, 'pending');
+    await f.store.deleteKey(unproved.kid, unproved.enrollment, f.now());
+    assert.equal((await f.store.getKey(unproved.kid, a.agent.handle))?.status, 'pending', 'a live challenge is not cleaned up');
+    assert.equal(await f.peer.activateKey(key.kid, key.enrollment, 'proof', f.now()), true);
+    await f.advance(10);
+    await f.store.deleteKey(stale.kid, stale.enrollment, f.now());
+    assert.equal((await f.store.getKey(key.kid, a.agent.handle))?.status, 'active', 'stale cleanup cannot delete the same enrollment after activation');
+    await f.store.deleteKey(unproved.kid, unproved.enrollment, f.now());
+    assert.equal(await f.store.getKey(unproved.kid, a.agent.handle), undefined, 'an unproved challenge is deleted at its deadline');
+  });
+
+  check('proof at the enrollment deadline fails without affecting another pending enrollment', async (f) => {
+    const a = await subject(f); const b = await subject(f, 'second');
+    const kid = hash('deadline-key');
+    const first: AgentKey = { ...a.key, kid, enrollment: 'deadline-first', status: 'pending', challenge: { value: 'first', expiresAt: f.now() + 10 } };
+    const second: AgentKey = { ...first, handle: b.agent.handle, agentSub: b.agent.sub, enrollment: 'deadline-second', challenge: { value: 'second', expiresAt: f.now() + 60 } };
+    assert.equal(await f.store.insertKey(first, f.now(), a.authorization), 'ok');
+    assert.equal(await f.peer.insertKey(second, f.now(), b.authorization), 'ok');
+    await f.advance(10);
+    assert.equal(await f.store.activateKey(kid, first.enrollment, 'first', f.now()), false);
+    await f.store.deleteKey(kid, first.enrollment);
+    assert.equal(await f.peer.activateKey(kid, second.enrollment, 'second', f.now()), true);
   });
 
   check('duplicate assertions own no cleanup and concurrent transactions for one agent consume one quota place', async (f) => {
@@ -347,6 +420,25 @@ export function registerStoreContract(name: string, factory: StoreContractFactor
     assert.equal((await f.store.getTransaction(tx.id))?.terminalAt, a.key.expiresAt);
     await f.advance(30);
     assert.equal(await f.store.readTransaction(tx.id, { now: f.now(), retainFor: 30 }), undefined);
+  });
+
+  check('activation by another Agent preserves the expired enrollment terminal time and retention', async (f) => {
+    const a = await subject(f); const b = await subject(f, 'second'); const c = await client(f);
+    const tx = await pending(f, c, 'key-claimed-after-expiry', 7200);
+    await f.store.updateTransaction(asserted(f, tx, a), tx.version, { now: f.now(), maxSignups: 1 });
+    await f.advance(3600);
+    const replacement: AgentKey = { ...a.key, handle: b.agent.handle, agentSub: b.agent.sub, enrollment: 'different-agent-after-expiry',
+      status: 'pending', createdAt: f.now(), expiresAt: f.now() + 3600, challenge: { value: 'new-proof', expiresAt: f.now() + 60 } };
+    assert.equal(await f.peer.insertKey(replacement, f.now(), b.authorization), 'ok');
+    assert.equal(await f.peer.activateKey(replacement.kid, replacement.enrollment, 'new-proof', f.now()), true);
+    assert.equal((await f.store.getKey(a.key.kid, a.agent.handle))?.status, 'expired');
+    const original = await f.store.getTransaction(tx.id);
+    assert.equal(original?.status, 'denied');
+    assert.equal(original?.reason, 'key_revoked');
+    assert.equal(original?.terminalAt, a.key.expiresAt);
+    await f.advance(31);
+    assert.equal(await f.store.readTransaction(tx.id, { now: f.now(), retainFor: 30 }), undefined);
+    assert.equal((await f.store.getKey(a.key.kid, b.agent.handle))?.status, 'active');
   });
 
   for (const change of ['revocation', 'agent disable'] as const) {

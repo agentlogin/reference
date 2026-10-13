@@ -7,7 +7,10 @@ import { serve } from '@hono/node-server';
 import { createIssuer } from '../../issuer/src/index.js';
 import { runConformance } from '../src/index.js';
 
-async function alternativeIssuer(mode: 'single-use' | 'repeatable' | 'malformed') {
+type Mode = 'single-use' | 'single-use-rotated-url' | 'repeatable' | 'malformed' | 'missing-terminal-state' |
+  'duplicate-state' | 'duplicate-iss' | 'duplicate-error' | 'duplicate-error_description' | 'duplicate-error_uri';
+
+async function alternativeIssuer(mode: Mode) {
   const placeholder = http.createServer();
   await new Promise<void>((resolve) => placeholder.listen(0, '127.0.0.1', resolve));
   const port = (placeholder.address() as AddressInfo).port;
@@ -16,6 +19,7 @@ async function alternativeIssuer(mode: 'single-use' | 'repeatable' | 'malformed'
   const { app } = await createIssuer({ issuer, handleDomains: ['example.com'], allowInsecureClients: true, adminToken: 'admin' });
   const registrations = new Map<string, string[]>();
   const consumedErrors = new Map<string, string>();
+  const rotatedContinues = new Map<string, string>();
   const redeemed = new Map<string, string>();
   const observed = { loopbackRefusals: 0, repeatedErrors: 0, replays: 0 };
   const json = (body: unknown, status: number, extra: Record<string, string> = {}) => Response.json(body, {
@@ -37,12 +41,31 @@ async function alternativeIssuer(mode: 'single-use' | 'repeatable' | 'malformed'
     if (previousError) {
       observed.repeatedErrors += 1;
       if (mode === 'malformed') return json({ redirect: `${previousError}&code=unexpected` }, 200);
+      if (mode === 'missing-terminal-state') return json({ error: 'transaction_expired' }, 410);
+      if (mode.startsWith('duplicate-')) {
+        const redirect = new URL(previousError);
+        const name = mode.slice('duplicate-'.length);
+        if (!redirect.searchParams.has(name)) redirect.searchParams.set(name, 'original');
+        redirect.searchParams.append(name, 'conflicting');
+        return json({ redirect: redirect.href }, 200);
+      }
       if (mode === 'repeatable') {
         const redirect = new URL(previousError);
         redirect.search = new URLSearchParams([...redirect.searchParams].reverse()).toString();
         return json({ redirect: redirect.href }, 200);
       }
+      if (mode === 'single-use-rotated-url') {
+        const nextUrl = `${request.url}/rotated`;
+        rotatedContinues.set(nextUrl, previousError);
+        return json({ error: 'transaction_expired', status: 'denied', next: { action: 'continue', method: 'GET', url: nextUrl } }, 410);
+      }
       return json({ error: 'transaction_expired', status: 'denied', next: { action: 'continue', method: 'GET', url: request.url } }, 410);
+    }
+    const rotatedError = rotatedContinues.get(request.url);
+    if (rotatedError) {
+      rotatedContinues.delete(request.url);
+      consumedErrors.set(request.url, rotatedError);
+      return json({ redirect: rotatedError }, 200);
     }
     if (url.pathname === '/token') {
       // Serialize redemption, enforcing single use but choosing not to revoke the first token on replay.
@@ -78,7 +101,7 @@ async function alternativeIssuer(mode: 'single-use' | 'repeatable' | 'malformed'
   return { issuer, observed, close: () => new Promise<void>((resolve) => server.close(() => resolve())) };
 }
 
-for (const mode of ['single-use', 'repeatable'] as const) test(`optional behavior stays optional with ${mode} denied continuations`, async () => {
+for (const mode of ['single-use', 'single-use-rotated-url', 'repeatable'] as const) test(`optional behavior stays optional with ${mode} denied continuations`, async () => {
   const fixture = await alternativeIssuer(mode);
   try {
     const report = await runConformance({ issuer: fixture.issuer, adminToken: 'admin' });
@@ -104,3 +127,16 @@ test('optional behavior still fails for an unsafe redirect refusal or changed re
     assert.match(report.results.find((r) => r.id === 'I-40')?.detail ?? '', /optional loopback port variation/);
   } finally { await fixture.close(); }
 });
+
+for (const mode of ['missing-terminal-state', 'duplicate-state', 'duplicate-iss', 'duplicate-error', 'duplicate-error_description', 'duplicate-error_uri'] as const) {
+  test(`I-17 rejects ${mode} on a repeated denied continuation`, async () => {
+    const fixture = await alternativeIssuer(mode);
+    try {
+      const report = await runConformance({ issuer: fixture.issuer, adminToken: 'admin' });
+      assert.ok(fixture.observed.repeatedErrors > 0, 'the malformed response was exercised');
+      const result = report.results.find((r) => r.id === 'I-17');
+      assert.equal(result?.outcome, 'fail');
+      assert.match(result?.detail ?? '', /optional repeated denied continue/);
+    } finally { await fixture.close(); }
+  });
+}

@@ -43,6 +43,9 @@ for (const entry of ['signIn', 'signInAt'] as const) {
 
 for (const slowAt of ['/login', '/next', '/authorize']) {
   test(`signInAt shares one deadline through application redirects and authorization: ${slowAt}`, async () => {
+    // Leave room for metadata and loopback scheduling before the chosen slow step. The two fast redirects
+    // plus the slow authorization response still exceed one budget, but not a wrongly restarted budget.
+    const deadlineMs = 1_000;
     let url = '';
     const requests: string[] = [];
     const server = http.createServer((req, res) => {
@@ -56,7 +59,7 @@ for (const slowAt of ['/login', '/next', '/authorize']) {
       const timer = setTimeout(() => {
         if (path === '/authorize') { res.writeHead(400); res.end('{}'); }
         else { res.writeHead(302, { location: path === '/login' ? '/next' : '/authorize' }); res.end(); }
-      }, path === slowAt ? (slowAt === '/authorize' ? 75 : 400) : 25);
+      }, path === slowAt ? (slowAt === '/authorize' ? 750 : 4_000) : 200);
       res.on('close', () => clearTimeout(timer));
     });
     await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
@@ -66,8 +69,8 @@ for (const slowAt of ['/login', '/next', '/authorize']) {
       await keystore.put({ kid: 'placeholder', handle: 'scout@example.com', issuer: url, privateJwk: {}, publicJwk: {}, createdAt: 0, status: 'active' });
       const al = new AgentLogin({ handle: 'scout@example.com', issuer: url, allowInsecure: true, keystore });
       const started = performance.now();
-      await assert.rejects(al.signInAt(`${url}/login`, { deadlineMs: 100 }), (e: unknown) => e instanceof AgentLoginError && e.code === 'timeout');
-      assert.ok(performance.now() - started < 250, 'redirects and protocol steps do not restart the overall budget');
+      await assert.rejects(al.signInAt(`${url}/login`, { deadlineMs }), (e: unknown) => e instanceof AgentLoginError && e.code === 'timeout');
+      assert.ok(performance.now() - started < 2_500, 'redirects and protocol steps do not restart the overall budget');
       assert.equal(requests.at(-1), slowAt, 'no subsequent request started');
       assert.equal(requests.filter((p) => p === '/.well-known/openid-configuration').length, 1, 'one discovery is reused throughout this sign-in');
     } finally {
