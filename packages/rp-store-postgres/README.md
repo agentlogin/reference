@@ -6,7 +6,9 @@ claim before either can exchange the authorization code. PostgreSQL 17 is exerci
 
 This is separate from the issuer's `@agentlogin/store-postgres`. The callback table contains only opaque HMAC
 state digests, expiry times and consumption flags. Pending cookies, PKCE verifiers, authorization codes, issuer
-records, application accounts and application sessions are not stored here.
+records, application accounts and application sessions are not stored here. The
+[Hono example](../../examples/rp-hono/README.md) demonstrates separate PostgreSQL account and session tables, using
+the same bounded connection pool while keeping callback and session lifecycles independent.
 
 ```ts
 import { createHandlers, RelyingParty } from '@agentlogin/rp';
@@ -108,5 +110,6 @@ checks follow [RFC 9700](https://www.rfc-editor.org/rfc/rfc9700.html#section-2.1
 Run `npm test` for the repository suite or `npm run test:postgres` for both PostgreSQL packages. Database tests use
 the explicit `AGENTLOGIN_TEST_POSTGRES_URL`, isolate their schemas, and skip when it is absent. Set
 `REQUIRE_POSTGRES_TESTS=1` to fail on missing configuration, as CI does. Concurrency and failure tests provide
-correctness evidence; they do not establish deployment capacity. Load testing, application session storage,
-rate limiting and operational recovery remain application responsibilities.
+correctness evidence; they do not establish deployment capacity. Load testing, application session policy,
+rate limiting and operational recovery remain application responsibilities. The Hono example supplies shared
+session storage; other applications may integrate their existing session system.

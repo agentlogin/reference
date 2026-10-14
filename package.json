@@ -10,16 +10,17 @@
   ],
   "type": "module",
   "scripts": {
-    "build": "tsc -b packages/issuer packages/conformance packages/agentlogin packages/rp packages/store-postgres packages/rp-store-postgres",
+    "build": "tsc -b packages/issuer packages/conformance packages/agentlogin packages/rp packages/store-postgres packages/rp-store-postgres && tsc -p examples/rp-hono",
     "typecheck": "npm run build",
-    "test": "npm run build && node --import tsx --test --test-concurrency=1 packages/issuer/test/*.test.ts packages/agentlogin/test/*.test.ts packages/rp/test/*.test.ts packages/conformance/test/*.test.ts packages/store-postgres/test/*.test.ts packages/rp-store-postgres/test/*.test.ts",
+    "test": "npm run build && node --import tsx --test --test-concurrency=1 packages/issuer/test/*.test.ts packages/agentlogin/test/*.test.ts packages/rp/test/*.test.ts packages/conformance/test/*.test.ts packages/store-postgres/test/*.test.ts packages/rp-store-postgres/test/*.test.ts examples/rp-hono/test/*.test.ts",
     "issuer": "node --import tsx packages/issuer/src/server.ts",
     "conformance": "node packages/conformance/bin/agentlogin-conformance.js",
     "agentlogin": "node packages/agentlogin/bin/agentlogin.js",
     "example": "node --import tsx examples/rp-hono/server.ts",
-    "test:postgres": "npm run build && node --import tsx --test --test-concurrency=1 packages/store-postgres/test/*.test.ts packages/rp-store-postgres/test/*.test.ts",
+    "test:postgres": "npm run build && node --import tsx --test --test-concurrency=1 packages/store-postgres/test/*.test.ts packages/rp-store-postgres/test/*.test.ts examples/rp-hono/test/*.test.ts",
     "issuer:migrate": "node --import tsx packages/store-postgres/src/migrate.ts",
-    "rp:migrate": "node --import tsx packages/rp-store-postgres/src/migrate.ts"
+    "rp:migrate": "node --import tsx packages/rp-store-postgres/src/migrate.ts",
+    "example:migrate": "node --import tsx examples/rp-hono/migrate.ts"
   },
   "devDependencies": {
     "@hono/node-server": "^1.19.0",
