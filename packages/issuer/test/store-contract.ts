@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { test, type TestContext } from 'node:test';
 import {
-  isAssertionWindowError, isKeyActivationConflictError, type AccessToken, type Agent, type AgentKey, type Client, type Code,
+  isAssertionSubjectError, isAssertionWindowError, isKeyActivationConflictError, isTransactionExpiredError, isTransactionTokenError, type AccessToken, type Agent, type AgentKey, type Client, type Code,
   type ManagementAuthorization, type Owner, type Store, type Transaction, type TransitionEffects,
 } from '../src/store.js';
 
@@ -243,7 +243,8 @@ export function registerStoreContract(name: string, factory: StoreContractFactor
     assert.equal(revoked?.enrollment, a.key.enrollment);
     assert.equal(await f.peer.wasRevoked(a.agent.handle, a.key.kid), true);
     assert.equal(await f.peer.wasRevoked(b.agent.handle, a.key.kid), false);
-    assert.deepEqual(await f.peer.getTransaction(tx.id), terminal, 'revocation cannot restart the terminal retention window');
+    const { transactionTokenHash: _revoked, ...retained } = terminal!;
+    assert.deepEqual(await f.peer.getTransaction(tx.id), { ...retained, version: terminal!.version + 1 }, 'revocation removes bearer authority without changing the terminal outcome');
     assert.equal(await f.peer.readTransaction(tx.id, { now: f.now(), retainFor: 300 }), undefined);
     assert.equal((await f.peer.getKey(a.key.kid, b.agent.handle))?.status, 'active');
     assert.equal((await f.peer.getKey(a.key.kid, b.agent.handle))?.enrollment, replacement.enrollment);
@@ -361,8 +362,9 @@ export function registerStoreContract(name: string, factory: StoreContractFactor
     const stale = await pending(f, c, 'stale');
     await f.peer.setAgentEnabled(a.agent.handle, false, a.agent.sub, f.now());
     await f.peer.setAgentEnabled(a.agent.handle, true, a.agent.sub, f.now());
-    const denied = await f.store.updateTransaction(asserted(f, stale, a), stale.version, { now: f.now(), maxSignups: 1 });
-    assert.equal(denied?.reason, 'access_denied');
+    await assert.rejects(f.store.updateTransaction(asserted(f, stale, a), stale.version, { now: f.now(), maxSignups: 1 }),
+      (error) => isAssertionSubjectError(error) && error.error === 'unknown_key');
+    assert.deepEqual(await f.store.getTransaction(stale.id), stale, 'invalid Agent authority cannot consume the challenge');
     assert.equal(await f.store.redeemCode(code.hash, f.now()), 'void');
     assert.equal((await f.store.getAgent(a.agent.handle))?.authorizationVersion, 1);
     await f.store.deleteAgent(a.agent.handle, a.agent.sub, f.now());
@@ -449,6 +451,170 @@ export function registerStoreContract(name: string, factory: StoreContractFactor
     assert.deepEqual(await f.peer.getTransaction(tx.id), tx);
     assert.equal((await ready(f, c, b, 'fresh-assertion')).status, 'ready');
   });
+
+  for (const outcome of ['ready', 'awaiting_owner', 'denied'] as const) {
+    check(`transaction expiry rejects a first assertion planned as ${outcome} without identity, token or consent`, async (f) => {
+      const a = await subject(f); const b = await subject(f, 'second'); const c = await client(f);
+      const tx = await pending(f, c, `deadline-${outcome}`, 5);
+      const next = { ...asserted(f, tx, a), status: outcome, expiresAt: outcome === 'awaiting_owner' ? tx.expiresAt + 600 : tx.expiresAt,
+        ...(outcome === 'denied' ? { reason: 'consent_required' as const, terminalAt: f.now() } : {}) };
+      const consent = { handle: a.agent.handle, clientId: c.clientId, scopes: tx.scopes, redirectHost: 'rp.example' };
+      await f.advance(5);
+      await assert.rejects(f.store.updateTransaction(next, tx.version, { now: f.now(), maxSignups: 1, consent,
+        assertionWindow: { notBefore: tx.createdAt - 1, expiresAt: tx.expiresAt } }), isTransactionExpiredError);
+      assert.deepEqual(await f.peer.getTransaction(tx.id), tx, 'a rejected assertion cannot bind identity, change expiry, or consume the challenge');
+      assert.equal(await f.store.getConsent(a.agent.handle, c.clientId), undefined);
+      const expired = await f.peer.readTransaction(tx.id, { now: f.now(), retainFor: 30 });
+      assert.equal(expired?.status, 'expired');
+      assert.equal(expired?.terminalAt, tx.expiresAt);
+      assert.equal((await ready(f, c, b, 'after-deadline')).status, 'ready', 'the rejected assertion reserves no quota');
+    });
+  }
+
+  for (const outcome of ['ready', 'denied', 'completed', 'expired'] as const) {
+    check(`explicit key revocation removes ${outcome} bearer authority and fences stale mutations`, async (f) => {
+      const a = await subject(f); const c = await client(f);
+      let tx = await ready(f, c, a, `bearer-${outcome}`);
+      if (outcome === 'denied') tx = (await f.store.updateTransaction({ ...tx, status: 'denied', reason: 'cancelled' }, tx.version, { now: f.now() }))!;
+      if (outcome === 'completed') { await complete(f, tx); tx = (await f.store.getTransaction(tx.id))!; }
+      if (outcome === 'expired') await f.advance(300);
+      const effective = (await f.store.readTransaction(tx.id, { now: f.now(), retainFor: 30 }))!;
+      await f.peer.revokeKey(a.key.kid, a.key.enrollment, f.now());
+      const revoked = (await f.store.getTransaction(tx.id))!;
+      assert.equal(revoked.transactionTokenHash, undefined);
+      assert.ok(revoked.version > tx.version);
+      assert.equal(revoked.sessionSecretHash, tx.sessionSecretHash);
+      if (outcome !== 'ready') {
+        assert.equal(revoked.status, effective.status);
+        assert.equal(revoked.reason, effective.reason);
+        assert.equal(revoked.terminalAt, effective.terminalAt);
+      }
+      await assert.rejects(f.store.updateTransaction({ ...tx, status: 'ready' }, tx.version,
+        { now: f.now(), transactionTokenHash: tx.transactionTokenHash }), isTransactionTokenError);
+      await assert.rejects(f.store.completeTransaction({ ...tx, status: 'completed' }, tx.version,
+        codeFor(f, tx, 'stale'), f.now(), tx.transactionTokenHash), isTransactionTokenError);
+      assert.equal(await f.store.getCode(codeFor(f, tx, 'stale').hash), undefined);
+      assert.ok(await f.store.readTransaction(tx.id, { now: f.now(), retainFor: 30 }), 'revocation does not remove anonymous terminal readability');
+    });
+  }
+
+  check('legacy retained hashes on explicitly revoked enrollments confer no authority and idempotent revocation repairs them', async (f) => {
+    const a = await subject(f); const c = await client(f);
+    const tx = await ready(f, c, a, 'before-revocation');
+    await f.store.revokeKey(a.key.kid, a.key.enrollment, f.now());
+    // Trusted insertion represents a pre-fix persisted terminal row whose original revocation retained the hash.
+    const legacy = { ...tx, id: 'legacy-terminal', sessionSecretHash: hash('legacy-terminal-session'), status: 'denied' as const, reason: 'cancelled' as const, terminalAt: f.now() - 1 };
+    await f.store.insertTransaction(legacy);
+    const persisted = (await f.store.getTransaction(legacy.id))!;
+    const read = await f.peer.readTransaction(legacy.id, { now: f.now(), retainFor: 30 });
+    assert.equal(read?.transactionTokenHash, undefined);
+    assert.equal(read?.status, legacy.status);
+    assert.equal(read?.terminalAt, legacy.terminalAt);
+    assert.deepEqual(await f.store.getTransaction(legacy.id), persisted, 'legacy suppression is a read-only projection');
+    await assert.rejects(f.peer.updateTransaction({ ...legacy, status: 'ready' }, legacy.version,
+      { now: f.now(), transactionTokenHash: legacy.transactionTokenHash }), isTransactionTokenError);
+    await assert.rejects(f.peer.completeTransaction({ ...legacy, status: 'completed' }, legacy.version,
+      codeFor(f, legacy), f.now(), legacy.transactionTokenHash), isTransactionTokenError);
+    assert.equal((await f.peer.revokeKey(a.key.kid, a.key.enrollment, f.now(), a.authorization))?.status, 'revoked');
+    const { transactionTokenHash: _revoked, ...retained } = persisted;
+    assert.deepEqual(await f.store.getTransaction(legacy.id), { ...retained, version: legacy.version + 1 });
+  });
+
+  for (const removal of ['Agent', 'key'] as const) {
+    check(`removing a revoked ${removal} persists legacy bearer revocation before forgetting its key record`, async (f) => {
+      const a = await subject(f); const c = await client(f);
+      const tx = await ready(f, c, a, 'before-legacy-removal');
+      await f.store.revokeKey(a.key.kid, a.key.enrollment, f.now());
+      const legacy = { ...tx, id: 'legacy-removal', sessionSecretHash: hash('legacy-removal-session'), status: 'denied' as const, reason: 'cancelled' as const, terminalAt: f.now() - 1 };
+      await f.store.insertTransaction(legacy);
+      const persisted = (await f.store.getTransaction(legacy.id))!;
+      const read = () => f.peer.readTransaction(legacy.id, { now: f.now(), retainFor: 30 });
+      assert.equal((await read())?.transactionTokenHash, undefined);
+      assert.equal((await f.store.getTransaction(legacy.id))?.transactionTokenHash, legacy.transactionTokenHash);
+      if (removal === 'Agent') assert.equal(await f.peer.deleteAgent(a.agent.handle, a.agent.sub, f.now()), true);
+      else await f.peer.deleteKey(a.key.kid, a.key.enrollment);
+      assert.equal(await f.store.getKey(a.key.kid, a.agent.handle), undefined);
+      const { transactionTokenHash: _revoked, ...retained } = persisted;
+      assert.deepEqual(await f.store.getTransaction(legacy.id), { ...retained, version: legacy.version + 1 });
+      assert.equal((await read())?.transactionTokenHash, undefined, 'removing the legacy key cannot restore bearer authority');
+      if (removal === 'Agent') {
+        assert.equal(await f.store.putAgent({ ...a.agent, sub: 'replacement-Agent' }), true);
+        assert.equal((await read())?.transactionTokenHash, undefined, 'recreating the handle cannot restore bearer authority');
+      }
+      await assert.rejects(f.peer.updateTransaction({ ...legacy, status: 'ready' }, legacy.version,
+        { now: f.now(), transactionTokenHash: legacy.transactionTokenHash }), isTransactionTokenError);
+      assert.equal((await read())?.terminalAt, legacy.terminalAt);
+    });
+  }
+
+  for (const removal of ['Agent', 'key'] as const) {
+    check(`removing a naturally expired ${removal} does not revoke its retained transaction bearer`, async (f) => {
+      const a = await subject(f); const c = await client(f);
+      const pendingTx = await pending(f, c, 'natural-expiry-removal', 7200);
+      const tx = (await f.store.updateTransaction(asserted(f, pendingTx, a), pendingTx.version, { now: f.now() }))!;
+      await f.advance(3600);
+      const terminal = (await f.store.updateTransaction(tx, tx.version, { now: f.now() }))!;
+      assert.equal(terminal.reason, 'key_revoked');
+      assert.equal(terminal.terminalAt, a.key.expiresAt);
+      assert.equal(terminal.transactionTokenHash, tx.transactionTokenHash);
+      if (removal === 'Agent') assert.equal(await f.peer.deleteAgent(a.agent.handle, a.agent.sub, f.now()), true);
+      else await f.peer.deleteKey(a.key.kid, a.key.enrollment);
+      const retained = await f.store.readTransaction(tx.id, { now: f.now(), retainFor: 30 });
+      assert.equal(retained?.transactionTokenHash, tx.transactionTokenHash);
+      assert.equal(retained?.terminalAt, a.key.expiresAt);
+    });
+  }
+
+  for (const change of ['revoked key', 'expired key', 'replaced key', 'deleted Agent', 'disabled Agent', 're-enabled Agent'] as const) {
+    check(`first assertion rejects a ${change} before identity, token, quota or consent take effect`, async (f) => {
+      const a = await subject(f); const c = await client(f);
+      const tx = await pending(f, c, 'invalid-assertion-authority', 7200);
+      const next = asserted(f, tx, a);
+      if (change === 'revoked key') await f.peer.revokeKey(a.key.kid, a.key.enrollment, f.now());
+      if (change === 'expired key' || change === 'replaced key') await f.advance(3600);
+      if (change === 'replaced key') {
+        const replacement = { ...a.key, enrollment: 'replacement', status: 'pending' as const, createdAt: f.now(), expiresAt: f.now() + 3600,
+          challenge: { value: 'replacement-challenge', expiresAt: f.now() + 60 } };
+        assert.equal(await f.peer.insertKey(replacement, f.now(), a.authorization), 'ok');
+        assert.equal(await f.peer.activateKey(replacement.kid, replacement.enrollment, replacement.challenge.value, f.now()), true);
+      }
+      if (change === 'deleted Agent') await f.peer.deleteAgent(a.agent.handle, a.agent.sub, f.now());
+      if (change === 'disabled Agent' || change === 're-enabled Agent') await f.peer.setAgentEnabled(a.agent.handle, false, a.agent.sub, f.now());
+      if (change === 're-enabled Agent') await f.peer.setAgentEnabled(a.agent.handle, true, a.agent.sub, f.now());
+      const expected = change === 'revoked key' || change === 'expired key' ? 'key_revoked' : 'unknown_key';
+      await assert.rejects(f.store.updateTransaction(next, tx.version, { now: f.now(), maxSignups: 1,
+        consent: { handle: a.agent.handle, clientId: c.clientId, scopes: tx.scopes, redirectHost: 'rp.example' } }),
+        (error) => isAssertionSubjectError(error) && error.error === expected);
+      assert.deepEqual(await f.peer.getTransaction(tx.id), tx);
+      assert.equal(await f.store.getConsent(a.agent.handle, c.clientId), undefined);
+      const b = await subject(f, 'new-authority');
+      assert.equal((await ready(f, c, b, 'after-authority-rejection')).status, 'ready', 'no rejected assertion holds quota');
+    });
+  }
+
+  for (const initial of [true, false]) {
+    check(`first assertion conflicts without effects when share_owner changes from ${initial} before acceptance`, async (f) => {
+      const a = await subject(f); const b = await subject(f, 'second'); const c = await client(f);
+      assert.ok(await f.store.patchKey(a.key.kid, a.key.enrollment, { shareOwner: initial }, a.authorization));
+      const tx = await pending(f, c, 'permission-race');
+      const planned = { ...asserted(f, tx, a), ownerApprovalOutstanding: !initial,
+        status: initial ? 'ready' as const : 'awaiting_owner' as const, expiresAt: initial ? tx.expiresAt : tx.expiresAt + 600 };
+      const consent = { handle: a.agent.handle, clientId: c.clientId, scopes: tx.scopes, redirectHost: 'rp.example' };
+      assert.ok(await f.peer.patchKey(a.key.kid, a.key.enrollment, { shareOwner: !initial }, a.authorization));
+      assert.equal(await f.store.updateTransaction(planned, tx.version, { now: f.now(), expectedShareOwner: initial, maxSignups: 1, consent }), undefined);
+      assert.deepEqual(await f.peer.getTransaction(tx.id), tx);
+      assert.equal(await f.store.getConsent(a.agent.handle, c.clientId), undefined);
+      const other = await ready(f, c, b, 'permission-race-other');
+      assert.equal(other.status, 'ready', 'the failed permission snapshot did not reserve quota');
+      assert.equal((await f.store.updateTransaction({ ...other, status: 'denied', reason: 'cancelled' }, other.version, { now: f.now() }))?.status, 'denied');
+      const recomputed = { ...asserted(f, tx, a), ownerApprovalOutstanding: initial,
+        status: initial ? 'awaiting_owner' as const : 'ready' as const, expiresAt: initial ? tx.expiresAt + 600 : tx.expiresAt };
+      const accepted = await f.store.updateTransaction(recomputed, tx.version, { now: f.now(), expectedShareOwner: !initial, maxSignups: 1, consent });
+      assert.equal(accepted?.status, recomputed.status);
+      assert.equal(accepted?.expiresAt, recomputed.expiresAt, 'only the accepted gate can extend transaction expiry');
+      assert.equal(accepted?.keyEnrollment, a.key.enrollment);
+    });
+  }
 
   check('signed proof expiry is checked atomically without consuming a still-live enrollment challenge', async (f) => {
     const a = await subject(f);

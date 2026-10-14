@@ -54,6 +54,24 @@ test('PostgreSQL cleanup cannot erase a revoked-key tombstone', options, async (
   assert.equal(await f.peer.insertKey(replacement, f.now(), subject.authorization), 'revoked');
 });
 
+test('PostgreSQL cleanup preserves explicit revocation evidence for a retained legacy transaction bearer', options, async (t) => {
+  const f = await fixture(t);
+  const subject = await prepareAgent(f.store, f.now(), 'one');
+  const transaction = await begin(f.store, f.now(), 'one', 'one');
+  assert.ok(await f.store.revokeKey(subject.key.kid, subject.key.enrollment, f.now()));
+  const legacy = { ...transaction, id: 'legacy-retained', status: 'denied' as const, reason: 'cancelled' as const, terminalAt: f.now() };
+  await f.store.insertTransaction(legacy);
+  const before = await f.peer.getTransaction(legacy.id);
+  await f.advance(3_601);
+  await f.store.cleanup({ batchSize: 100, retainFor: 7_200 });
+  assert.equal((await f.peer.getKey(subject.key.kid, subject.key.handle))?.status, 'revoked', 'the enrollment remains the authority source while any transaction retains it');
+  const retained = await f.peer.readTransaction(legacy.id, { now: f.now(), retainFor: 7_200 });
+  assert.equal(retained?.transactionTokenHash, undefined);
+  assert.equal(retained?.status, legacy.status);
+  assert.equal(retained?.terminalAt, legacy.terminalAt);
+  assert.deepEqual(await f.peer.getTransaction(legacy.id), before, 'cleanup neither changes the retained outcome nor restarts retention');
+});
+
 test('PostgreSQL cleanup cannot delete the code behind a concurrently issued token', options, async (t) => {
   let armed = false;
   const inserted = deferred();

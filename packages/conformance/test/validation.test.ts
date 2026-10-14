@@ -3,9 +3,20 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { runConformance } from '../src/index.js';
-import { authorizationRedirectMatches, concurrentAccessTokens, redirectMatches, singleUseContinueError, validateMetadata, validateForbiddenMetadata } from '../src/validation.js';
+import { authorizationRedirectMatches, concurrentAccessTokens, redirectMatches, singleUseContinueError, validateMetadata, validateForbiddenMetadata, validContinueNext } from '../src/validation.js';
 
 const issuer = 'https://issuer.example';
+test('continue URLs obey the discovered endpoint boundary without prescribing secret layout', () => {
+  const endpoint = `${issuer}/transactions/`;
+  const next = (url: string) => ({ action: 'continue', method: 'GET', url });
+  for (const url of [`${issuer}/transactions?ticket=opaque`, `${issuer}/transactions/`, `${issuer}/transactions/id/go?version=2`]) {
+    assert.equal(validContinueNext(next(url), endpoint), true, url);
+  }
+  for (const url of [`${issuer}/transactions-elsewhere`, `${issuer}/other`, `${issuer}/transactions/../other`,
+    `${issuer}/transactions/id#fragment`, 'https://other.example/transactions/id', 'https://user:pass@issuer.example/transactions/id']) {
+    assert.equal(validContinueNext(next(url), endpoint), false, url);
+  }
+});
 const metadata = (base = issuer): Record<string, unknown> => ({
   issuer: base,
   authorization_endpoint: `${base}/authorize`, token_endpoint: `${base}/token`, userinfo_endpoint: `${base}/userinfo`,

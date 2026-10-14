@@ -17,9 +17,9 @@ test('cookie headers prefer longer paths and preserve creation order when replac
 
 for (const entry of ['signIn', 'signInAt'] as const) {
   test(`deadline includes slow discovery for ${entry}`, async () => {
-    let requests = 0;
-    const server = http.createServer((_req, res) => {
-      requests += 1;
+    const requests: string[] = [];
+    const server = http.createServer((req, res) => {
+      requests.push(req.url!);
       const timer = setTimeout(() => res.end('{}'), 400);
       res.on('close', () => clearTimeout(timer));
     });
@@ -33,7 +33,8 @@ for (const entry of ['signIn', 'signInAt'] as const) {
         : al.signInAt(`${url}/login`, { deadlineMs: 60 });
       await assert.rejects(result, (e: unknown) => e instanceof AgentLoginError && e.code === 'timeout');
       assert.ok(performance.now() - started < 250, 'discovery used the overall deadline, not its 10-second request budget');
-      assert.equal(requests, 1, 'only metadata was requested');
+      // Under load the shared deadline can expire during DNS/connection setup, before HTTP reaches the server.
+      assert.ok(requests.length <= 1 && requests.every((url) => url === '/.well-known/openid-configuration'), 'no request beyond discovery started');
     } finally {
       server.closeAllConnections();
       await new Promise<void>((r) => server.close(() => r()));

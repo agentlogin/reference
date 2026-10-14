@@ -2,12 +2,15 @@
 
 Reference issuer for [Agent Login Core 1.0](https://github.com/agentlogin/spec) (draft 0.1): an OpenID Provider that
 signs software agents in with keys they hold. Written against the specification section by section so that the code
-reads as a second description of the protocol; Hono for HTTP, jose for JOSE, an in-memory store behind a small
-`Store` interface, with memory and transactional SQLite adapters. Requires Node.js 22.13 or newer.
+reads as a second description of the protocol; Hono for HTTP and jose for JOSE behind a `Store` interface.
+The production storage target is [`@agentlogin/store-postgres`](../store-postgres/README.md), with normalized
+records and atomic operations across instances. Memory and SQLite remain local reference/test adapters.
+Requires Node.js 22.13 or newer.
 
 ```bash
 npm run issuer            # http://localhost:3000, handle domain localhost, prints a generated ADMIN_TOKEN
-ISSUER=https://issuer.example HANDLE_DOMAINS=example.com,*.agents.example ADMIN_TOKEN=... SIGNING_JWK='{...}' npm run issuer
+DATABASE_URL=postgresql://... npm run issuer:migrate
+DATABASE_URL=postgresql://... ISSUER=https://issuer.example HANDLE_DOMAINS=example.com,*.agents.example ADMIN_TOKEN=... SIGNING_JWK='{...}' npm run issuer
 ```
 
 Endpoints (spec section in brackets): `/.well-known/openid-configuration` and `/.well-known/jwks.json` (2.4, 7.7),
@@ -51,9 +54,9 @@ must commit the full transition, including its preconditions and effects, in one
 | `putAgent` | Insert only when the handle is absent; an existing identity is never overwritten |
 | `resolveManagement`, `readManagementKeys`, `readManagementAccounts` | Read the credential, immutable Agent identity and protected resources in one snapshot; reject stale authorization |
 | `insertKey` | The credential, Owner and immutable Agent subject still match the authorization; enforce Agent-scoped pending uniqueness and revocation history |
-| `activateKey`, `patchKey`, `revokeKey` | Match the exact enrollment; activation rechecks the proof window and claims global active-key exclusivity; revocation also denies transactions and invalidates codes and tokens |
-| `updateTransaction` | Compare the open transaction version, check subject identity, disable versions, assertion expiry and consent reliance, and commit cap admission, reservation and consent effects together |
-| `completeTransaction` | Check the ready version, subject, expiry and reservation; complete, issue the code, update the Account and signup count, and release the reservation together |
+| `activateKey`, `patchKey`, `revokeKey` | Match the exact enrollment; activation rechecks the proof window and claims global active-key exclusivity; explicit revocation also denies open transactions, removes bearer hashes from all matching transactions (including terminal ones), and invalidates codes and tokens |
+| `updateTransaction` | Recheck a supplied transaction bearer before version/terminal checks; compare the open version, check subject identity, disable versions, transaction/assertion expiry and consent reliance, and commit cap admission, reservation and consent effects together |
+| `completeTransaction` | Recheck a supplied transaction bearer before version/terminal checks; check the ready version, subject, expiry and reservation; complete, issue the code, update the Account and signup count, and release the reservation together |
 | `setAgentEnabled`, `setAccountStatus` | Check the authorized Agent identity, increment the persistent disable version, and invalidate dependent records together |
 | `deleteAgent`, `revokeAllKeys` | Check the immutable identity and apply all cleanup in the same transaction |
 | `redeemCode`, `insertAccessToken` | Redeem once; validate lifecycle fences, and refuse token insertion for replayed codes |
@@ -63,6 +66,15 @@ whether a reservation counts or a credential remains valid. `currentTime` suppli
 memory and SQLite use the supplied application clock, while PostgreSQL uses the database clock. Mutations recheck
 expiry and the verified assertion window at acceptance. ID-token `iat` and `exp` come from the persisted access-token
 issuance bounds, including when lock contention moves the database's issuance time past the application's timestamp.
+A first assertion arriving at its original transaction deadline throws `TransactionExpiredError` without persisting
+identity, a token, an extended Owner-approval deadline, consent, or quota. This check precedes the signed assertion's
+window check. A first assertion also rechecks its key and enabled Agent identity/version, throwing
+`AssertionSubjectError` (`unknown_key` or `key_revoked`) without consuming the challenge if authority changed.
+Account denial remains an accepted assertion gate. First assertions also compare `expectedShareOwner` with the
+current permission; a conflict has no effects and the handler recomputes Owner approval for the same verified
+enrollment. Explicit revocation removes transaction bearer authority without changing existing terminal outcomes
+or retention; natural key expiry preserves that bearer until retention ends. Review and completion pass the identified
+bearer's hash to the atomic store operation, which throws `TransactionTokenError` if that authority was revoked.
 
 Agent subjects never change or transfer to a replacement at the same handle. Keys remember the authorizing subject;
 transactions, codes and access tokens retain that subject, their key enrollment, and Agent/Account disable versions.
@@ -85,6 +97,9 @@ cleanup cannot write to a replacement Agent. Previously granted scopes carry for
 client name, terms URI and policy URI remain unchanged; accepting changed terms replaces the scope set. Invalidation
 preserves an expired transaction's original terminal time and never restarts its retention window.
 
+Use PostgreSQL for multi-instance deployments; see its package README for schema migration, connection pools,
+locking and recovery requirements. The following adapters are retained for local reference and testing.
+
 `MemoryStore` implements these operations synchronously within one process. `SQLiteStore` runs that same state machine
 inside `BEGIN IMMEDIATE`/`COMMIT` for mutations, with WAL and `synchronous=FULL`; reads use `BEGIN` and never update the
 snapshot or acquire the writer lock. It uses Node’s built-in `node:sqlite` module (experimental in Node 22). Every
@@ -92,6 +107,8 @@ operation loads the complete fresh snapshot, and mutations serialize it back; no
 determines cross-process ownership. A failed commit rolls
 back the whole operation. Tests exercise separate database connections, independent writer processes, persistence
 across reopen, injected database write failures, and adversarial HTTP lifecycle schedules against both adapters.
+SQLite has a known deadline limitation: it can apply a caller timestamp captured before waiting for the writer
+lock. It is excluded from the PostgreSQL production hardening target and is not a production storage option.
 
 Snapshot format 2 stores scoped key enrollments. Memory and SQLite read version 1 snapshots and convert their
 key map in memory; the next mutation writes version 2. Stop old issuer instances before upgrading, and do not mix
@@ -116,7 +133,7 @@ retention cleanup, capacity planning and operational testing while preserving th
 
 Migration: the `Store` API and stored records have changed. Custom adapters must implement `currentTime`, read-only
 `readTransaction`, the new atomic operations, assertion/proof-window and consent-context checks, persisted token issuance timestamps
-and identity/version fields; do not run old and new issuers against the same store. This adapter creates a new schema;
+the optional transaction-bearer checks and branded assertion-subject and transaction-expiry/token errors, and identity/version fields; do not run old and new issuers against the same store. This adapter creates a new schema;
 there is no migration from third-party stores. The RP handler also now requires explicit shared callback storage
 (see `@agentlogin/rp`). These fixes do not implement rate limiting or a production Owner authentication system, so
 passing the tests is not a deployment approval.

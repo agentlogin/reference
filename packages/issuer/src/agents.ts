@@ -70,7 +70,7 @@ export async function listLiveKeys(ctx: IssuerContext, handle: string, authoriza
 const isActive = (ctx: IssuerContext, k: AgentKey): boolean => k.status === 'active' && ctx.now() < k.expiresAt;
 
 export function keyRecord(ctx: IssuerContext, k: AgentKey): Record<string, unknown> {
-  const status = k.status === 'active' && ctx.now() >= k.expiresAt ? 'expired' : k.status;
+  const status = k.status !== 'revoked' && ctx.now() >= k.expiresAt ? 'expired' : k.status;
   return { kid: k.kid, status, jwk: k.jwk, permissions: k.permissions, name: k.name, created_at: k.createdAt, expires_at: k.expiresAt };
 }
 
@@ -116,7 +116,7 @@ export async function proveKey(ctx: IssuerContext, handle: string, kid: string, 
   // Section 6.7: `unknown_key` (401) when `kid` names no enrolled key of the handle; a pending key that timed out is gone (Section 7.2).
   if (!key || key.handle !== handle) throw new OAuthError(401, 'unknown_key');
   // Section 7.4 table: proofs with a revoked or expired key are refused with `key_revoked`.
-  if (key.status === 'revoked' || key.status === 'expired' || (key.status === 'active' && now >= key.expiresAt)) throw new OAuthError(401, 'key_revoked');
+  if (key.status === 'revoked' || key.status === 'expired' || now >= key.expiresAt) throw new OAuthError(401, 'key_revoked');
   if (!isPlainObject(body) || typeof body.proof !== 'string') throw new OAuthError(400, 'invalid_request', 'proof required');
   // An active key has no unconsumed challenge left, so no proof can satisfy the `nonce` rule of Section 7.2.
   if (key.status !== 'pending' || !key.challenge) throw new OAuthError(400, 'invalid_assertion', 'the key has no unconsumed challenge');
@@ -160,8 +160,10 @@ export async function proveKey(ctx: IssuerContext, handle: string, kid: string, 
     throw error;
   }
   if (!activated) {
+    // A replacement enrollment cannot hide the expiry of the proof's original enrollment.
+    if ((await ctx.store.currentTime(ctx.now())) >= key.expiresAt) throw new OAuthError(401, 'key_revoked');
     const current = await ctx.store.getKey(kid, handle);
-    if (current?.status === 'revoked') throw new OAuthError(401, 'key_revoked');
+    if (current && (current.status === 'revoked' || current.status === 'expired' || (await ctx.store.currentTime(ctx.now())) >= current.expiresAt)) throw new OAuthError(401, 'key_revoked');
     throw new OAuthError(current && current.handle === handle ? 400 : 401, current && current.handle === handle ? 'invalid_assertion' : 'unknown_key', 'the key has no unconsumed challenge');
   }
   return keyRecord(ctx, { ...key, status: 'active', challenge: undefined });

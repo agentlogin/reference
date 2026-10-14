@@ -8,7 +8,7 @@ import { AGENT_KEY_ALGS, OWNER_SCOPES, SCOPES, VERSION } from './constants.js';
 import type { IssuerContext } from './context.js';
 import { OAuthError } from './errors.js';
 import { redirectUriMatches, registerClient, resolveClient, type ClientContext } from './clients.js';
-import type { Client, OwnerVerifiedVia, SessionAuth, Transaction } from './store.js';
+import { isTransactionTokenError, type Client, type OwnerVerifiedVia, type SessionAuth, type Transaction } from './store.js';
 import * as tx from './transactions.js';
 import { authenticateClient, exchangeCode, userinfo } from './tokens.js';
 import * as agents from './agents.js';
@@ -208,8 +208,10 @@ export function createIssuerApp(ctx: IssuerContext): Hono {
   // ---- Section 6: the transaction -----------------------------------------------------------------
   /** Loads the transaction, its client and the viewer; stores status/next for error bodies. */
   async function loadTx(c: Context): Promise<{ t: Transaction; client: Client; viewer: tx.Viewer }> {
-    const t = await tx.loadTransaction(ctx, c.req.param('id') ?? '');
-    const client = (await ctx.store.getClient(t.clientId))!;
+    const initial = await tx.loadTransaction(ctx, c.req.param('id') ?? '');
+    const client = (await ctx.store.getClient(initial.clientId))!;
+    // Client resolution may yield across an explicit key revocation. Identify authority from the final read.
+    const t = await tx.loadTransaction(ctx, initial.id);
     let viewer: tx.Viewer;
     try {
       viewer = tx.identifyViewer(t, parseBearer(c.req.header('authorization')), getCookie(c, 'als') ?? null);
@@ -229,7 +231,12 @@ export function createIssuerApp(ctx: IssuerContext): Hono {
     try {
       return await change();
     } catch (e) {
-      await loadTx(c).catch(() => undefined);
+      let refreshed;
+      try { refreshed = await loadTx(c); } catch (latest) {
+        if (latest instanceof OAuthError && (latest.error === 'invalid_token' || latest.error === 'invalid_transaction')) throw latest;
+      }
+      if (refreshed && tx.isTerminal(refreshed.t.status) && e instanceof OAuthError && !['invalid_transaction', 'invalid_token'].includes(e.error)) throw new OAuthError(410, 'transaction_expired');
+      if (isTransactionTokenError(e)) throw new OAuthError(401, 'invalid_token', undefined, { 'WWW-Authenticate': 'Bearer error="invalid_token"' });
       throw e;
     }
   }

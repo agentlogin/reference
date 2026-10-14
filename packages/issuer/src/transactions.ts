@@ -11,7 +11,7 @@ import { domainServed, handlesEqual, isPlainObject, parseHandle, randomId, rando
 
 export type Viewer =
   | { kind: 'none' }
-  | { kind: 'transaction_token' }
+  | { kind: 'transaction_token'; tokenHash: string }
   | { kind: 'session' };
 
 export interface CreateParams {
@@ -75,7 +75,7 @@ export async function loadTransaction(ctx: IssuerContext, id: string): Promise<T
 }
 
 /** Section 6.1: the Transaction Resource as seen by `viewer`. */
-export function resource(ctx: IssuerContext, tx: Transaction, client: Client, viewer: Viewer): Record<string, unknown> {
+export function resource(ctx: IssuerContext, tx: Transaction, client: Client, viewer: Pick<Viewer, 'kind'>): Record<string, unknown> {
   const base = txUrl(ctx, tx.id);
   const r: Record<string, unknown> = {
     transaction_id: tx.id,
@@ -104,7 +104,7 @@ export function resource(ctx: IssuerContext, tx: Transaction, client: Client, vi
   return r;
 }
 
-function next(ctx: IssuerContext, tx: Transaction, viewer: Viewer): Record<string, unknown> {
+function next(ctx: IssuerContext, tx: Transaction, viewer: Pick<Viewer, 'kind'>): Record<string, unknown> {
   const base = txUrl(ctx, tx.id);
   switch (tx.status) {
     case 'awaiting_agent':
@@ -132,7 +132,7 @@ function next(ctx: IssuerContext, tx: Transaction, viewer: Viewer): Record<strin
 export function identifyViewer(tx: Transaction, bearer: string | null, cookieSecret: string | null): Viewer {
   if (bearer) {
     const h = sha256(bearer);
-    if (tx.transactionTokenHash && h === tx.transactionTokenHash) return { kind: 'transaction_token' };
+    if (tx.transactionTokenHash && h === tx.transactionTokenHash) return { kind: 'transaction_token', tokenHash: h };
     if (tx.sessionSecretHash && h === tx.sessionSecretHash) return { kind: 'session' };
     throw new OAuthError(401, 'invalid_token', undefined, { 'WWW-Authenticate': 'Bearer error="invalid_token"' });
   }
@@ -170,7 +170,7 @@ function transitionEffects(ctx: IssuerContext, tx: Transaction, client: Client, 
  * Section 6.7 precedence: `invalid_transaction` (loading), then `invalid_token`, then `transaction_expired`, then any
  * other error. The two guards below are applied in that order before a request body or the status is looked at.
  */
-export function requireTransactionToken(viewer: Viewer): void {
+export function requireTransactionToken(viewer: Viewer): asserts viewer is Extract<Viewer, { kind: 'transaction_token' }> {
   if (viewer.kind !== 'transaction_token') throw new OAuthError(401, 'invalid_token', undefined, { 'WWW-Authenticate': 'Bearer error="invalid_token"' });
 }
 export function requireOpen(tx: Transaction): void {
@@ -259,6 +259,10 @@ export async function assert(ctx: IssuerContext, loaded: Transaction, client: Cl
     if (current.status !== 'awaiting_agent') throw new OAuthError(409, 'assertion_replayed');
     if (payload.nonce !== current.challenge) throw bad('nonce');
 
+    // Permissions can change while gates are being planned. Each attempt stays bound to the verified enrollment.
+    const currentKey = await ctx.store.getKey(key.kid, key.handle);
+    if (!currentKey || currentKey.enrollment !== key.enrollment || currentKey.agentSub !== key.agentSub) throw new OAuthError(401, 'unknown_key');
+
     // Step 7: the challenge is consumed and the authentication event recorded.
     let next: Transaction = {
       ...current,
@@ -273,8 +277,8 @@ export async function assert(ctx: IssuerContext, loaded: Transaction, client: Cl
     let grantConsent = false;
     // Cap admission and assertion acceptance are a single conditional store operation. A losing assertion owns no cleanup.
     if (account?.status === 'disabled') next = ended(ctx, next, 'denied', 'access_denied');
-    else ({ next, grantConsent } = await gates(ctx, next, client, key.permissions.share_owner, agent.ownerId));
-    if (await commit(ctx, next, current.version, { ...transitionEffects(ctx, next, client, grantConsent), assertionWindow: { notBefore: iat - c.T_SKEW, expiresAt: exp } })) {
+    else ({ next, grantConsent } = await gates(ctx, next, client, currentKey.permissions.share_owner, agent.ownerId));
+    if (await commit(ctx, next, current.version, { ...transitionEffects(ctx, next, client, grantConsent), expectedShareOwner: currentKey.permissions.share_owner, assertionWindow: { notBefore: iat - c.T_SKEW, expiresAt: exp } })) {
       return { tx: next, token };
     }
     current = await loadTransaction(ctx, tx.id);
@@ -312,6 +316,7 @@ async function gates(ctx: IssuerContext, tx: Transaction, client: Client, shareO
 export async function review(ctx: IssuerContext, loaded: Transaction, client: Client, viewer: Viewer, body: unknown): Promise<Transaction> {
   requireTransactionToken(viewer); // the session binding does not authorise this step
   for (let current = loaded; ; ) {
+    if (viewer.tokenHash !== current.transactionTokenHash) throw new OAuthError(401, 'invalid_token', undefined, { 'WWW-Authenticate': 'Bearer error="invalid_token"' });
     requireOpen(current);
     if (current.status !== 'awaiting_consent') throw new OAuthError(400, 'invalid_request', 'no review is outstanding');
     if (!isPlainObject(body) || (body.decision !== 'allow' && body.decision !== 'deny')) throw new OAuthError(400, 'invalid_request', 'decision must be allow or deny');
@@ -319,7 +324,7 @@ export async function review(ctx: IssuerContext, loaded: Transaction, client: Cl
     const next: Transaction = allow
       ? { ...current, reviewOutstanding: false, status: current.ownerApprovalOutstanding ? 'awaiting_owner' : 'ready' }
       : ended(ctx, current, 'denied', 'cancelled');
-    if (await commit(ctx, next, current.version, transitionEffects(ctx, next, client, allow))) {
+    if (await commit(ctx, next, current.version, { ...transitionEffects(ctx, next, client, allow), transactionTokenHash: viewer.tokenHash })) {
       return next;
     }
     current = await reload(ctx, loaded.id);
@@ -355,7 +360,8 @@ export interface ContinueResult { redirect: string }
  * code and the others `transaction_expired`.
  */
 export async function cont(ctx: IssuerContext, loaded: Transaction, secret: string, viewer: Viewer): Promise<ContinueResult> {
-  for (let tx = loaded; ; ) {
+  for (let tx = await loadTransaction(ctx, loaded.id); ; ) {
+    if (viewer.kind === 'transaction_token' && viewer.tokenHash !== tx.transactionTokenHash) throw new OAuthError(401, 'invalid_token', undefined, { 'WWW-Authenticate': 'Bearer error="invalid_token"' });
     const release = viewer.kind === 'transaction_token' || (viewer.kind === 'session' && tx.deliverToSession);
     if (!release) throw new OAuthError(401, 'invalid_token', undefined, { 'WWW-Authenticate': 'Bearer error="invalid_token"' });
     if (secret !== tx.continueSecret) throw new OAuthError(404, 'invalid_transaction');
@@ -379,7 +385,7 @@ export async function cont(ctx: IssuerContext, loaded: Transaction, secret: stri
       handle: next.handle!, kid: next.kid!, keyEnrollment: next.keyEnrollment!,
       agentSub: next.agentSub!, agentVersion: next.agentVersion!, accountVersion: next.accountVersion!,
       authTime: next.assertedAt!, expiresAt: now + ctx.constants.T_CODE, used: false, voided: false,
-    }, now);
+    }, now, viewer.kind === 'transaction_token' ? viewer.tokenHash : undefined);
     if (!completed || completed.status !== 'completed') {
       tx = completed ?? await loadTransaction(ctx, tx.id);
       continue;

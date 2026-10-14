@@ -148,23 +148,25 @@ export function createHandlers(rp: RelyingParty, o: HandlerOptions): Handlers {
       const url = new URL(request.url);
       const state = url.searchParams.get('state') ?? '';
       const name = cookieName(state);
+      let clearName: string | undefined;
       let signIn: SignIn;
       try {
         const cookie = state ? readCookies(request).get(name) : undefined;
         const pending = cookie ? await unseal(rp.options.stateSecret, cookie) : null;
+        const checked = rp.preflightCallback({ params: url.searchParams, pending });
         // Claim before any token exchange. A process crash, uncertain exchange or onSignIn failure must never
-        // release it: retrying a code can revoke the successful request's Access Token at the Issuer.
-        if (pending && state === pending.state) {
-          let claim;
-          try { claim = await o.callbackStore.claim(stateKey(pending.state)); }
-          catch (e) { throw storageFailure(e); }
-          if (claim === 'duplicate') throw new RelyingPartyError('duplicate_callback', 'this sign-in was already completed');
-          if (claim !== 'claimed') throw new RelyingPartyError('invalid_state', 'this sign-in was not started in this session, or it expired');
-        }
-        signIn = await rp.complete({ params: url.searchParams, pending });
+        // release it: retrying a code can revoke the successful request's Access Token at the Issuer. Malformed
+        // or unbound callbacks must not consume state or clear the cookie needed by the legitimate callback.
+        let claim;
+        try { claim = await o.callbackStore.claim(stateKey(checked.pending.state)); }
+        catch (e) { throw storageFailure(e); }
+        clearName = name;
+        if (claim === 'duplicate') throw new RelyingPartyError('duplicate_callback', 'this sign-in was already completed');
+        if (claim !== 'claimed') throw new RelyingPartyError('invalid_state', 'this sign-in was not started in this session, or it expired');
+        signIn = await rp.complete({ params: url.searchParams, pending: checked.pending });
       } catch (e) {
         if (!(e instanceof RelyingPartyError)) throw e;
-        return fail(e, request, state ? name : undefined);
+        return fail(e, request, clearName);
       }
       const res = await o.onSignIn(signIn, request); // the application's own failures are not the kit's to catch
       return withCookies(res, [clear(name)]);

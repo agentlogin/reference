@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import {
-  AssertionWindowError, KeyActivationConflictError, TERMINAL, sameConsentMetadata, consentRecordReason,
+  AssertionWindowError, AssertionSubjectError, TransactionExpiredError, TransactionTokenError, KeyActivationConflictError, TERMINAL, sameConsentMetadata, consentRecordReason,
   type Store, type Owner, type OwnerCode, type Agent, type AgentKey, type Credential, type Client,
   type Transaction, type Code, type AccessToken, type Account, type Consent, type SubjectFilter,
   type ManagementAuthorization, type TransitionEffects, type InsertKeyResult, type RedeemResult,
@@ -20,6 +20,7 @@ const clone = <T>(value: T): T => structuredClone(value);
 const sameRecord = (a: unknown, b: unknown): boolean => a !== undefined && isDeepStrictEqual(a, JSON.parse(JSON.stringify(b)));
 const unknown = { resolved: false as const };
 class WindowElapsed extends Error { constructor(readonly result: 'expired' | 'void') { super('Authorization expired while waiting for a database write'); } }
+class AssertionGateChanged extends Error {}
 
 /** Indexed record storage. Every mutation runs as one retriable SERIALIZABLE database transaction. */
 export class PostgresStore implements Store {
@@ -165,7 +166,7 @@ export class PostgresStore implements Store {
   listConsents(handle: string) { return this.list<Consent>('consents', 'handle=$1', [handle]); }
   signupsEver(ownerId: string, clientId: string) { return this.db.read(async (s) => Number((await s.query<{ count: string }>(`SELECT count FROM ${s.table('quotas')} WHERE owner_id=$1 AND client_id=$2`, [ownerId, clientId])).rows[0]?.count ?? 0)); }
 
-  /** The quota is the sole explicit coordination row. SSI still detects stale snapshots after lock waits. */
+  /** Quota coordination precedes key-permission locks. SSI detects stale snapshots after either wait. */
   private async quota(s: PgSession, ownerId: string, clientId: string) {
     await s.query(`INSERT INTO ${s.table('quotas')}(owner_id,client_id) VALUES($1,$2) ON CONFLICT DO NOTHING`, [ownerId, clientId]);
     await s.query(`SELECT count FROM ${s.table('quotas')} WHERE owner_id=$1 AND client_id=$2 FOR UPDATE`, [ownerId, clientId]);
@@ -187,6 +188,24 @@ export class PostgresStore implements Store {
     const account = await this.one<Account>(s, 'accounts', 'agent_sub=$1 AND client_id=$2', [t.agentSub, t.clientId]);
     if (account?.status === 'disabled' || (account?.authorizationVersion ?? 0) !== t.accountVersion) return 'access_denied';
     return undefined;
+  }
+  private async requireTransactionToken(s: PgSession, tx: Transaction, tokenHash?: string) {
+    if (tokenHash === undefined) return;
+    // Older persisted records may still carry a hash after explicit revocation.
+    // Missing/replaced keys and natural expiry do not end transaction bearer validity.
+    if (tx.transactionTokenHash !== tokenHash || await this.one(s, 'keys', "kid=$1 AND enrollment=$2 AND handle=$3 AND agent_sub=$4 AND status='revoked'",
+      [tx.kid,tx.keyEnrollment,tx.handle,tx.agentSub])) throw new TransactionTokenError();
+  }
+  private async requireAssertionSubject(s: PgSession, tx: Transaction, now: number, lockPermissions = false) {
+    const agent = await this.one<Agent>(s, 'agents', 'handle=$1', [tx.handle]);
+    if (!agent || agent.sub !== tx.agentSub || !agent.enabled || agent.authorizationVersion !== tx.agentVersion) throw new AssertionSubjectError('unknown_key');
+    // A mutable permission must stay fixed until assertion acceptance. A snapshot
+    // older than a committed patch retries; a later patch waits for this assertion.
+    const key = await this.one<AgentKey>(s, 'keys', `kid=$1 AND enrollment=$2 AND handle=$3${lockPermissions ? ' FOR SHARE' : ''}`, [tx.kid,tx.keyEnrollment,tx.handle]);
+    if (!key || key.agentSub !== tx.agentSub) throw new AssertionSubjectError('unknown_key');
+    if (key.status !== 'active' || now >= key.expiresAt) throw new AssertionSubjectError('key_revoked');
+    // Account authorization is a post-acceptance gate, not an assertion validation failure.
+    return key;
   }
   private async invalidate(s: PgSession, filter: SubjectFilter, reason: DenyReason, now: number) {
     const f = this.filter(filter, true, 2, 't.');
@@ -214,6 +233,13 @@ export class PostgresStore implements Store {
     const f = this.filter(filter);
     await s.query(`UPDATE ${s.table('access_tokens')} SET data=data || '{"revoked":true}'::jsonb WHERE NOT revoked AND ${f.where}`, f.values);
   }
+  private async revokeTransactionTokens(s: PgSession, filter: SubjectFilter) {
+    const f = this.filter(filter, true);
+    // Explicit key revocation ends bearer authority even for retained terminal records.
+    // State and terminalAt remain unchanged, and natural key expiry never calls this.
+    await s.query(`UPDATE ${s.table('transactions')} SET data=(data-'transactionTokenHash') || jsonb_build_object('version',version+1)
+      WHERE data ? 'transactionTokenHash' AND ${f.where}`, f.values);
+  }
   setAgentEnabled(handle: string, enabled: boolean, agentSub: string, _now: number) {
     return this.db.mutate('setAgentEnabled', async (s) => {
       await this.subjectQuotas(s, { handle });
@@ -231,6 +257,9 @@ export class PostgresStore implements Store {
       await this.subjectQuotas(s, { handle });
       if (!await this.one(s, 'agents', 'handle=$1 AND sub=$2', [handle, agentSub])) return false;
       await this.invalidate(s, { handle }, 'access_denied', await s.now());
+      for (const key of await this.many<AgentKey>(s, 'keys', "agent_sub=$1 AND status='revoked'", [agentSub])) {
+        await this.revokeTransactionTokens(s, { kid: key.kid, keyEnrollment: key.enrollment });
+      }
       await s.query(`INSERT INTO ${s.table('revoked_keys')}(handle,kid) SELECT handle,kid FROM ${s.table('keys')} WHERE agent_sub=$1 ON CONFLICT DO NOTHING`, [agentSub]);
       for (const table of ['keys','accounts','consents'] as const) await s.query(`DELETE FROM ${s.table(table)} WHERE agent_sub=$1`, [agentSub]);
       await s.query(`DELETE FROM ${s.table('credentials')} WHERE handle=$1 AND kind='delegated'`, [handle]);
@@ -294,13 +323,18 @@ export class PostgresStore implements Store {
       // An explicit revocation must record the reuse ban even after another activation retired this enrollment.
       if (!key) return undefined;
       if (auth && (key.agentSub !== auth.agentSub || !await this.authorized(s,key.handle,auth))) return undefined;
-      if (key.status === 'revoked') return auth ? key : undefined;
+      if (key.status === 'revoked') {
+        // Also repair bearer hashes retained by stores written before this invalidation rule.
+        await this.revokeTransactionTokens(s, { kid, keyEnrollment: enrollment });
+        return auth ? key : undefined;
+      }
       await s.checkpoint('management_key_authorized');
       const now = await s.now();
       const revoked: AgentKey = { ...key, status: 'revoked', revokedAt: now, challenge: undefined };
       await this.replace(s, 'keys', 'enrollment', enrollment, revoked);
       await s.query(`INSERT INTO ${s.table('revoked_keys')}(handle,kid) VALUES($1,$2) ON CONFLICT DO NOTHING`, [key.handle,kid]);
       await this.invalidate(s, { kid, keyEnrollment: enrollment }, 'key_revoked', now);
+      await this.revokeTransactionTokens(s, { kid, keyEnrollment: enrollment });
       return revoked;
     });
   }
@@ -314,6 +348,7 @@ export class PostgresStore implements Store {
         await this.replace(s, 'keys', 'enrollment', key.enrollment, { ...key,status:'revoked',revokedAt:now,challenge:undefined });
         await s.query(`INSERT INTO ${s.table('revoked_keys')}(handle,kid) VALUES($1,$2) ON CONFLICT DO NOTHING`, [handle,key.kid]);
         await this.invalidate(s, { kid:key.kid,keyEnrollment:key.enrollment }, 'key_revoked', now);
+        await this.revokeTransactionTokens(s, { kid:key.kid,keyEnrollment:key.enrollment });
       }
       if (auth.kind === 'owner') await s.query(`DELETE FROM ${s.table('credentials')} WHERE handle=$1 AND kind='delegated'`, [handle]);
       return true;
@@ -342,6 +377,8 @@ export class PostgresStore implements Store {
       }
       if (target !== undefined) {
         if (pendingExpiredAt === undefined) {
+          const key = await this.one<AgentKey>(s, 'keys', "kid=$1 AND enrollment=$2 AND status='revoked'", [kid,target]);
+          if (key) await this.revokeTransactionTokens(s, { kid, keyEnrollment: target });
           await s.query(`DELETE FROM ${s.table('keys')} WHERE kid=$1 AND enrollment=$2`, [kid,target]);
         } else {
           const now = await s.now();
@@ -356,7 +393,7 @@ export class PostgresStore implements Store {
   readTransaction(id: string, options: { now: number; retainFor: number }): Promise<Transaction | undefined> {
     return this.db.read(async (s) => {
       const result = await s.query<DataRow<Transaction>>(`WITH clock AS MATERIALIZED (SELECT ${identifier(this.db.schema)}.app_now()::bigint AS now),
-      facts AS (SELECT t.data,t.status,t.expires_at,t.terminal_at,c.now,
+      facts AS (SELECT CASE WHEN k.status='revoked' AND k.agent_sub=t.agent_sub THEN t.data-'transactionTokenHash' ELSE t.data END AS data,t.status,t.expires_at,t.terminal_at,c.now,
         CASE WHEN k.enrollment=t.key_enrollment AND k.agent_sub=t.agent_sub AND k.status<>'pending' THEN k.expires_at ELSE 9223372036854775807 END AS key_expiry,
         CASE WHEN t.kid IS NULL THEN NULL
           WHEN k.kid IS NULL OR k.enrollment<>t.key_enrollment OR k.agent_sub<>t.agent_sub OR k.status<>'active' THEN 'key_revoked'
@@ -421,14 +458,24 @@ export class PostgresStore implements Store {
       produced = undefined;
       if (supplied.ownerId) await this.quota(s,supplied.ownerId,supplied.clientId);
       const cur = await this.one<Transaction>(s,'transactions','id=$1',[supplied.id]);
+      if (cur) await this.requireTransactionToken(s,cur,effects.transactionTokenHash);
       if (!cur || cur.version !== expectedVersion || TERMINAL.has(cur.status) || supplied.status === 'completed') return undefined;
-      const now = await s.now();
+      let now = await s.now();
+      const firstAssertion = cur.status === 'awaiting_agent' && !!supplied.kid;
+      const expired = await this.expiration(s,cur,now);
+      if (firstAssertion && expired) throw new TransactionExpiredError();
+      const assertionKey = firstAssertion ? await this.requireAssertionSubject(s,supplied,now,effects.expectedShareOwner !== undefined) : undefined;
+      if (assertionKey && effects.expectedShareOwner !== undefined) {
+        now = await s.now();
+        if (now >= cur.expiresAt) throw new TransactionExpiredError();
+        if (now >= assertionKey.expiresAt) throw new AssertionSubjectError('key_revoked');
+      }
       if (effects.assertionWindow && (now < effects.assertionWindow.notBefore || now >= effects.assertionWindow.expiresAt)) throw new AssertionWindowError();
+      if (assertionKey && effects.expectedShareOwner !== undefined && assertionKey.permissions.share_owner !== effects.expectedShareOwner) return undefined;
       let next = clone(supplied);
       if (next.status === 'denied') next.terminalAt = now;
-      const expired = await this.expiration(s,cur,now);
       const dead = next.kid ? await this.subject(s,next,now) : undefined;
-      if (expired) next = { ...next,status:expired.status,reason:expired.reason,terminalAt:expired.terminalAt,challenge:undefined };
+      if (expired) next = expired;
       else if (dead) next = { ...next,status:'denied',reason:dead,terminalAt:now,challenge:undefined };
       else if (cur.status === 'awaiting_agent' && next.kid) {
         next.assertedAt = now;
@@ -457,20 +504,24 @@ export class PostgresStore implements Store {
         if (next.agentSub) await this.consentEffects(s,next,effects,now);
       }
       const acceptedAt = await s.now();
+      if (firstAssertion && acceptedAt >= cur.expiresAt) throw new TransactionExpiredError();
+      const acceptedKey = firstAssertion ? await this.requireAssertionSubject(s,next,acceptedAt) : undefined;
       if (effects.assertionWindow && (acceptedAt < effects.assertionWindow.notBefore || acceptedAt >= effects.assertionWindow.expiresAt)) throw new AssertionWindowError();
+      if (acceptedKey && effects.expectedShareOwner !== undefined && acceptedKey.permissions.share_owner !== effects.expectedShareOwner) throw new AssertionGateChanged();
       if (!TERMINAL.has(next.status) && (acceptedAt >= next.expiresAt || await this.subject(s,next,acceptedAt))) throw new WindowElapsed('expired');
       produced = next;
       return next;
     }, async (s) => {
       const stored = await this.one<Transaction>(s,'transactions','id=$1',[supplied.id]);
       return produced && isDeepStrictEqual(stored,JSON.parse(JSON.stringify(produced))) ? {resolved:true,value:stored} : unknown;
-    }).catch((error) => { if (error instanceof WindowElapsed) return undefined; throw error; });
+    }).catch((error) => { if (error instanceof WindowElapsed || error instanceof AssertionGateChanged) return undefined; throw error; });
   }
-  completeTransaction(input: Transaction, expectedVersion: number, inputCode: Code, suppliedNow: number): Promise<Transaction | undefined> {
+  completeTransaction(input: Transaction, expectedVersion: number, inputCode: Code, suppliedNow: number, transactionTokenHash?: string): Promise<Transaction | undefined> {
     const supplied = clone(input), code = clone(inputCode);
     return this.db.mutate('completeTransaction', async (s) => {
       if (supplied.ownerId) await this.quota(s,supplied.ownerId,supplied.clientId);
       const cur = await this.one<Transaction>(s,'transactions','id=$1',[supplied.id]);
+      if (cur) await this.requireTransactionToken(s,cur,transactionTokenHash);
       if (!cur || cur.version !== expectedVersion || cur.status !== 'ready') return undefined;
       const now = await s.now();
       const dead = await this.subject(s,cur,now);

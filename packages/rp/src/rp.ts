@@ -278,35 +278,49 @@ export class RelyingParty {
   }
 
   /**
-   * Sections 5.4 to 5.7: validate the redirect, exchange the code, validate the ID Token. Low-level callers must
-   * atomically consume their server-side pending state before calling; createHandlers does this for you.
+   * Section 5.7 step 1: validate response members and the session/Issuer binding without consuming state or
+   * contacting the Issuer. Low-level callers must call this before atomically consuming pending state, then
+   * call `complete` even for an error response. Unrelated redirect_uri query parameters are left alone.
    */
-  async complete(p: { params: URLSearchParams; pending: PendingSignIn | null }): Promise<SignIn> {
+  preflightCallback(p: { params: URLSearchParams; pending: PendingSignIn | null }): {
+    pending: PendingSignIn; code?: string; error?: string; errorDescription?: string;
+  } {
     const { params, pending } = p;
-    const one = (k: string) => {
-      const all = params.getAll(k);
-      if (all.length > 1) throw new RelyingPartyError('invalid_request', `repeated parameter ${k}`);
-      return all[0];
-    };
+    for (const name of ['state', 'iss', 'code', 'error', 'error_description', 'error_uri']) {
+      if (params.getAll(name).length > 1) throw new RelyingPartyError('invalid_request', `repeated parameter ${name}`);
+    }
     // Step 1 (R-2): `state` bound to this session, `iss` equal to the Issuer recorded for it.
-    const state = one('state');
+    const state = params.get('state');
     if (!pending || !state || !sameString(state, pending.state)) throw new RelyingPartyError('invalid_state', 'this sign-in was not started in this session, or it expired');
-    const iss = one('iss');
+    const iss = params.get('iss');
     if (!iss || iss !== pending.issuer) throw new RelyingPartyError('issuer_mismatch', 'the response did not come from the Issuer the request was sent to');
     if (!this.issuers.has(pending.issuer) && this.o.federation !== 'any') throw new RelyingPartyError('issuer_not_accepted', 'this application does not accept that Issuer');
-    const error = one('error');
+    const code = params.get('code');
+    const error = params.get('error');
+    if ((code !== null && error !== null) || (!code && !error) ||
+        (code !== null && (params.has('error_description') || params.has('error_uri')))) {
+      throw new RelyingPartyError('invalid_request', 'the response must contain either a non-empty code or a non-empty error');
+    }
+    return { pending, code: code ?? undefined, error: error ?? undefined, errorDescription: params.get('error_description') ?? undefined };
+  }
+
+  /**
+   * Sections 5.4 to 5.7: validate the redirect, exchange the code, validate the ID Token. Low-level callers must
+   * call `preflightCallback`, then atomically consume server-side pending state before calling this method;
+   * createHandlers does this for you. A failed or uncertain exchange must never release the consumed state.
+   */
+  async complete(p: { params: URLSearchParams; pending: PendingSignIn | null }): Promise<SignIn> {
+    const { pending, code, error, errorDescription } = this.preflightCallback(p);
     if (error) {
       const known = (ISSUER_ERROR_CODES as readonly string[]).includes(error);
-      throw new RelyingPartyError(known ? (error as RelyingPartyErrorCode) : 'issuer_error', known ? `the Issuer answered ${error}` : 'the Issuer answered with an error', one('error_description')?.slice(0, 500));
+      throw new RelyingPartyError(known ? (error as RelyingPartyErrorCode) : 'issuer_error', known ? `the Issuer answered ${error}` : 'the Issuer answered with an error', errorDescription?.slice(0, 500));
     }
-    const code = one('code');
-    if (!code) throw new RelyingPartyError('invalid_request', 'no code in the response');
 
     await this.checkRelayConfiguration();
     // Token Request, only to the recorded Issuer's Token Endpoint (Section 5.6).
     const m = await this.metadata(pending.issuer);
     const { clientId, clientSecret } = this.clientFor(pending.issuer);
-    const form = new URLSearchParams({ grant_type: 'authorization_code', code, redirect_uri: this.o.redirectUri, code_verifier: pending.verifier });
+    const form = new URLSearchParams({ grant_type: 'authorization_code', code: code!, redirect_uri: this.o.redirectUri, code_verifier: pending.verifier });
     const headers: Record<string, string> = { 'content-type': 'application/x-www-form-urlencoded' };
     if (clientSecret) headers.authorization = `Basic ${Buffer.from(`${encodeURIComponent(clientId)}:${encodeURIComponent(clientSecret)}`).toString('base64')}`;
     else form.set('client_id', clientId);
@@ -325,13 +339,16 @@ export class RelyingParty {
     }
     if (typeof tok.id_token !== 'string' || typeof tok.access_token !== 'string' || String(tok.token_type).toLowerCase() !== 'bearer') throw new RelyingPartyError('token_request_failed', 'malformed token response');
 
-    const claims = await this.validateIdToken(tok.id_token, { issuer: pending.issuer, nonce: pending.nonce, clientId, metadata: m });
+    const claims = await this.validateIdToken(tok.id_token, { issuer: pending.issuer, nonce: pending.nonce, clientId, metadata: m, expectedHandle: pending.loginHint });
     const expiresIn = typeof tok.expires_in === 'number' && tok.expires_in > 0 ? Math.min(tok.expires_in, 3600) : 600;
     return { ...this.identityOf(claims), claims, issuer: pending.issuer, accessToken: tok.access_token, accessTokenExpiresAt: Math.floor(Date.now() / 1000) + expiresIn, returnTo: pending.returnTo };
   }
 
-  /** Section 5.7 steps 2 to 7 (R-3, R-4, R-14). Nothing from a token that fails is returned. */
-  async validateIdToken(idToken: string, x: { issuer: string; nonce: string; clientId: string; metadata?: IssuerMetadata }): Promise<JWTPayload> {
+  /**
+   * Section 5.7 steps 2 to 7 (R-3, R-4, R-14). `expectedHandle` must come from the pending sign-in bound to
+   * state, never from callback parameters. Nothing from a token that fails is returned.
+   */
+  async validateIdToken(idToken: string, x: { issuer: string; nonce: string; clientId: string; metadata?: IssuerMetadata; expectedHandle?: string }): Promise<JWTPayload> {
     const bad = (why: string, cause?: unknown) => new RelyingPartyError('invalid_id_token', `ID Token rejected: ${why}`, undefined, { cause });
     let header;
     try {
@@ -358,6 +375,18 @@ export class RelyingParty {
     if (payload.actor_type !== 'agent') throw bad('actor_type is not agent'); // step 6
 
     // Step 7, Section 2.5: the handle-to-Issuer binding.
+    const expectedHandle = x.expectedHandle === undefined ? undefined : parseHandle(x.expectedHandle);
+    if (expectedHandle === null) throw new RelyingPartyError('handle_binding_failed', 'the expected handle is invalid');
+    let returnedHandle;
+    if (payload.email !== undefined) {
+      if (typeof payload.email !== 'string' || payload.email_verified !== true) throw bad('email without email_verified true');
+      returnedHandle = parseHandle(payload.email);
+      if (!returnedHandle) throw bad('email is not an Agent Handle');
+      // parseHandle preserves local-part octets and lowercases the A-label domain (Section 2.1).
+      if (expectedHandle && returnedHandle.handle !== expectedHandle.handle) {
+        throw new RelyingPartyError('handle_binding_failed', 'the returned handle does not match the expected handle bound to this sign-in');
+      }
+    }
     const homeIss = payload.home_iss;
     if (homeIss !== undefined) {
       const cfg = this.issuers.get(x.issuer);
@@ -366,11 +395,12 @@ export class RelyingParty {
       const ok = Array.isArray(accepted) && ((accepted.length === 1 && accepted[0] === '*') || accepted.includes(homeIss));
       if (!ok) throw new RelyingPartyError('handle_binding_failed', "home_iss is not among the Relay's home_issuers");
       if (this.issuers.has(homeIss)) throw new RelyingPartyError('configuration_error', 'this Home Issuer is accepted directly and through the Relay; per-owner caps would be counted twice (Section 9 item 10)');
+      if (!returnedHandle && !expectedHandle) throw new RelyingPartyError('handle_binding_failed', 'a Relay token requires a returned or pre-bound handle');
     }
-    if (payload.email !== undefined) {
-      if (typeof payload.email !== 'string' || payload.email_verified !== true) throw bad('email without email_verified true');
+    const bindingHandle = returnedHandle ?? (homeIss !== undefined ? expectedHandle : undefined);
+    if (bindingHandle) {
       const expected = typeof homeIss === 'string' ? homeIss : x.issuer;
-      const discovered = await this.resolve(payload.email);
+      const discovered = await this.resolve(bindingHandle.handle);
       if (discovered !== expected) throw new RelyingPartyError('handle_binding_failed', "the handle's domain does not designate this Issuer");
       if (expected !== x.issuer) await this.metadata(expected); // Section 2.2: the designated Issuer's metadata names itself
     }

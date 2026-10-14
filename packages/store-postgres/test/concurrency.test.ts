@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
+import { isAssertionSubjectError, isTransactionExpiredError, isTransactionTokenError } from '../../issuer/src/store.js';
 import { asserted, begin, codeFor, connectionString, deferred, eventually, fixture, pending, prepareAgent, quote, skipPostgres, tokenFor } from './helpers.js';
 
 const options = { skip: skipPostgres, timeout: 30_000 };
@@ -138,6 +139,344 @@ test('PostgreSQL rechecks assertion expiry after a quota lock wait using fresh d
     assert.match(String(result.error), /assertion|expir/i);
     assert.equal((await f.peer.getTransaction(transaction.id))?.status, 'awaiting_agent');
     assert.equal(Number((await f.admin.query(`SELECT count(*) FROM ${quote(f.schema)}.reservations`)).rows[0].count), 0);
+  } finally { await blocker.query('ROLLBACK'); blocker.release(); }
+});
+
+test('PostgreSQL rejects an assertion at the transaction deadline after a quota lock wait without accepting its identity', options, async (t) => {
+  let capture = false;
+  const started = deferred<number>();
+  const f = await fixture(t, { async onCheckpoint(event) {
+    if (capture && event.operation === 'updateTransaction' && event.phase === 'afterBegin') {
+      started.resolve(Number((await event.client.query('SELECT pg_backend_pid() AS pid')).rows[0].pid));
+    }
+  } });
+  await prepareAgent(f.store, f.now(), 'one');
+  const transaction = await pending(f.store, f.now(), 'deadline', 'client', 5);
+  const before = await f.peer.getTransaction(transaction.id);
+  await f.admin.query(`INSERT INTO ${quote(f.schema)}.quotas (owner_id, client_id) VALUES ('owner', 'client')`);
+  const blocker = await f.admin.connect();
+  try {
+    await blocker.query('BEGIN');
+    await blocker.query(`SELECT 1 FROM ${quote(f.schema)}.quotas WHERE owner_id='owner' AND client_id='client' FOR UPDATE`);
+    capture = true;
+    const startTime = f.now();
+    const mutation = f.store.updateTransaction({ ...asserted(transaction, 'one', startTime), transactionTokenHash: 'new-assertion-bearer' }, 0, {
+      now: startTime, maxSignups: 1, assertionWindow: { notBefore: startTime - 1, expiresAt: startTime + 5 },
+      consent: { handle: 'one@example.com', clientId: 'client', scopes: ['openid'], redirectHost: 'rp.example' },
+    });
+    const outcome = mutation.then((value) => ({ value }), (error: unknown) => ({ error }));
+    const pid = await started.promise;
+    await eventually(async () => (await f.admin.query('SELECT wait_event_type FROM pg_stat_activity WHERE pid=$1', [pid])).rows[0]?.wait_event_type === 'Lock', 'assertion did not wait on quota');
+    await f.advance(5);
+    await blocker.query('COMMIT');
+    const result = await outcome;
+    assert.ok('error' in result && isTransactionExpiredError(result.error), 'transaction expiry takes precedence over signed-assertion expiry');
+    assert.deepEqual(await f.peer.getTransaction(transaction.id), before);
+    assert.equal((await f.peer.readTransaction(transaction.id, { now: startTime, retainFor: 300 }))?.status, 'expired');
+    assert.equal(await f.peer.getConsent('one@example.com', 'client'), undefined);
+    assert.equal(Number((await f.admin.query(`SELECT count(*) FROM ${quote(f.schema)}.reservations`)).rows[0].count), 0);
+  } finally { await blocker.query('ROLLBACK'); blocker.release(); }
+});
+
+for (const status of ['ready', 'denied', 'awaiting_owner'] as const) {
+  test(`PostgreSQL rolls back a ${status} assertion that reaches its deadline during an implicit transaction-row lock wait`, options, async (t) => {
+    let capture = false;
+    const started = deferred<number>();
+    const attempts: number[] = [];
+    const f = await fixture(t, { async onCheckpoint(event) {
+      if (capture && event.operation === 'updateTransaction' && event.phase === 'afterBegin') {
+        attempts.push(event.attempt);
+        started.resolve(Number((await event.client.query('SELECT pg_backend_pid() AS pid')).rows[0].pid));
+      }
+    } });
+    await prepareAgent(f.store, f.now(), 'one');
+    const transaction = await pending(f.store, f.now(), `deadline-${status}`, 'client', 5);
+    const before = await f.peer.getTransaction(transaction.id);
+    const blocker = await f.admin.connect();
+    try {
+      await blocker.query('BEGIN');
+      await blocker.query(`SELECT 1 FROM ${quote(f.schema)}.transactions WHERE id=$1 FOR UPDATE`, [transaction.id]);
+      capture = true;
+      const startTime = f.now();
+      const proposed = { ...asserted(transaction, 'one', startTime), status, transactionTokenHash: 'new-assertion-bearer',
+        expiresAt: status === 'awaiting_owner' ? startTime + 600 : transaction.expiresAt,
+        reason: status === 'denied' ? 'consent_required' as const : undefined };
+      const mutation = f.store.updateTransaction(proposed, 0, { now: startTime, maxSignups: 1,
+        assertionWindow: { notBefore: startTime - 1, expiresAt: startTime + 100 },
+        consent: { handle: 'one@example.com', clientId: 'client', scopes: ['openid'], redirectHost: 'rp.example' },
+      });
+      const outcome = mutation.then((value) => ({ value }), (error: unknown) => ({ error }));
+      const pid = await started.promise;
+      await eventually(async () => (await f.admin.query('SELECT wait_event_type FROM pg_stat_activity WHERE pid=$1', [pid])).rows[0]?.wait_event_type === 'Lock', 'assertion did not reach its implicit row-lock wait');
+      await f.advance(5);
+      await blocker.query('COMMIT');
+      const result = await outcome;
+      assert.ok('error' in result && isTransactionExpiredError(result.error), 'the original transaction deadline must reject even a terminal outcome or proposed extension');
+      assert.deepEqual(attempts, [0], 'the final deadline check must not depend on a serialization retry');
+      assert.deepEqual(await f.peer.getTransaction(transaction.id), before);
+      assert.equal(await f.peer.getConsent('one@example.com', 'client'), undefined);
+      assert.equal(Number((await f.admin.query(`SELECT count(*) FROM ${quote(f.schema)}.reservations`)).rows[0].count), 0);
+    } finally { await blocker.query('ROLLBACK'); blocker.release(); }
+  });
+}
+
+test('PostgreSQL retry after the transaction deadline rolls back assertion authority, capacity and consent', options, async (t) => {
+  let advance: (() => Promise<void>) | undefined;
+  const attempts: number[] = [];
+  const f = await fixture(t, { async onCheckpoint(event) {
+    if (event.operation !== 'updateTransaction') return;
+    if (event.phase === 'afterBegin') attempts.push(event.attempt);
+    if (event.phase === 'beforeCommit' && event.attempt === 0) {
+      await advance!();
+      throw Object.assign(new Error('retry at transaction deadline'), { code: '40001' });
+    }
+  } });
+  await prepareAgent(f.store, f.now(), 'one');
+  const transaction = await pending(f.store, f.now(), 'retry-deadline', 'client', 5);
+  const before = await f.peer.getTransaction(transaction.id);
+  const startTime = f.now();
+  advance = () => f.advance(5);
+  await assert.rejects(f.store.updateTransaction({ ...asserted(transaction, 'one', startTime), transactionTokenHash: 'new-assertion-bearer' }, 0, {
+    now: startTime, maxSignups: 1, assertionWindow: { notBefore: startTime - 1, expiresAt: startTime + 100 },
+    consent: { handle: 'one@example.com', clientId: 'client', scopes: ['openid'], redirectHost: 'rp.example' },
+  }), isTransactionExpiredError);
+  assert.deepEqual(attempts, [0, 1]);
+  assert.deepEqual(await f.peer.getTransaction(transaction.id), before);
+  assert.equal(await f.peer.getConsent('one@example.com', 'client'), undefined);
+  assert.equal(Number((await f.admin.query(`SELECT count(*) FROM ${quote(f.schema)}.reservations`)).rows[0].count), 0);
+});
+
+for (const operation of ['updateTransaction', 'completeTransaction'] as const) {
+  test(`PostgreSQL ${operation} retries its stale snapshot after explicit key revocation and rejects the old bearer`, options, async (t) => {
+    let armed = false;
+    const snapshotTaken = deferred();
+    const release = deferred();
+    const attempts: number[] = [];
+    const f = await fixture(t, { async onCheckpoint(event) {
+      if (!armed || event.operation !== operation) return;
+      if (event.phase === 'afterBegin') attempts.push(event.attempt);
+      if (event.phase === 'quota_locked' && event.attempt === 0) {
+        snapshotTaken.resolve();
+        await release.promise;
+      }
+    } });
+    const subject = await prepareAgent(f.store, f.now(), 'one');
+    const transaction = await begin(f.store, f.now(), 'one', `revoke-${operation}`);
+    armed = true;
+    const mutation = operation === 'updateTransaction'
+      ? f.store.updateTransaction({ ...transaction, status: 'denied', reason: 'cancelled' }, transaction.version, { now: f.now(), transactionTokenHash: transaction.transactionTokenHash })
+      : f.store.completeTransaction(transaction, transaction.version, codeFor(transaction, f.now()), f.now(), transaction.transactionTokenHash);
+    const outcome = mutation.then((value) => ({ value }), (error: unknown) => ({ error }));
+    await snapshotTaken.promise;
+    try {
+      assert.ok(await f.peer.revokeKey(subject.key.kid, subject.key.enrollment, f.now()));
+    } finally { release.resolve(); }
+    const result = await outcome;
+    assert.ok('error' in result && isTransactionTokenError(result.error), 'revoked authority must be checked before stale version and terminal state');
+    assert.deepEqual(attempts, [0, 1]);
+    const revoked = await f.peer.getTransaction(transaction.id);
+    assert.equal(revoked?.status, 'denied');
+    assert.equal(revoked?.reason, 'key_revoked');
+    assert.equal(revoked?.transactionTokenHash, undefined);
+    assert.equal(await f.peer.getCode(`code-${transaction.id}`), undefined);
+    assert.equal(await f.peer.getAccount('one@example.com', 'client'), undefined);
+    assert.equal(await f.peer.signupsEver('owner', 'client'), 0);
+  });
+}
+
+for (const lifecycle of ['revoked', 'disabled', 'deleted'] as const) {
+  test(`PostgreSQL retries and rejects a first assertion whose subject became ${lifecycle} after its snapshot`, options, async (t) => {
+    let armed = false;
+    const snapshotTaken = deferred();
+    const release = deferred();
+    const attempts: number[] = [];
+    const f = await fixture(t, { async onCheckpoint(event) {
+      if (!armed || event.operation !== 'updateTransaction') return;
+      if (event.phase === 'afterBegin') attempts.push(event.attempt);
+      if (event.phase === 'quota_locked' && event.attempt === 0) {
+        snapshotTaken.resolve();
+        await release.promise;
+      }
+    } });
+    const subject = await prepareAgent(f.store, f.now(), 'one');
+    const transaction = await pending(f.store, f.now(), `assertion-subject-${lifecycle}`);
+    const before = await f.peer.getTransaction(transaction.id);
+    armed = true;
+    const mutation = f.store.updateTransaction({ ...asserted(transaction, 'one', f.now()), transactionTokenHash: 'new-assertion-bearer' }, 0, {
+      now: f.now(), maxSignups: 1,
+      consent: { handle: subject.agent.handle, clientId: 'client', scopes: ['openid'], redirectHost: 'rp.example' },
+    });
+    const outcome = mutation.then((value) => ({ value }), (error: unknown) => ({ error }));
+    await snapshotTaken.promise;
+    try {
+      if (lifecycle === 'revoked') assert.ok(await f.peer.revokeKey(subject.key.kid, subject.key.enrollment, f.now()));
+      else if (lifecycle === 'disabled') assert.ok(await f.peer.setAgentEnabled(subject.agent.handle, false, subject.agent.sub, f.now()));
+      else assert.equal(await f.peer.deleteAgent(subject.agent.handle, subject.agent.sub, f.now()), true);
+    } finally { release.resolve(); }
+    const result = await outcome;
+    assert.ok('error' in result && isAssertionSubjectError(result.error));
+    assert.equal(result.error.error, lifecycle === 'revoked' ? 'key_revoked' : 'unknown_key');
+    assert.deepEqual(attempts, [0, 1]);
+    assert.deepEqual(await f.peer.getTransaction(transaction.id), before, 'a failed assertion cannot bind identity or consume the challenge');
+    assert.equal(await f.peer.getConsent(subject.agent.handle, 'client'), undefined);
+    assert.equal(Number((await f.admin.query(`SELECT count(*) FROM ${quote(f.schema)}.reservations`)).rows[0].count), 0);
+  });
+}
+
+for (const status of ['ready', 'denied'] as const) {
+  test(`PostgreSQL rejects a ${status} first assertion whose key expires during its transaction-row lock wait`, options, async (t) => {
+    let capture = false;
+    const started = deferred<number>();
+    const attempts: number[] = [];
+    const f = await fixture(t, { async onCheckpoint(event) {
+      if (capture && event.operation === 'updateTransaction' && event.phase === 'afterBegin') {
+        attempts.push(event.attempt);
+        started.resolve(Number((await event.client.query('SELECT pg_backend_pid() AS pid')).rows[0].pid));
+      }
+    } });
+    const subject = await prepareAgent(f.store, f.now(), 'one');
+    const key = { ...subject.key, kid: 'short-lived-key', enrollment: 'short-lived-enrollment', expiresAt: f.now() + 5 };
+    assert.equal(await f.store.insertKey(key, f.now(), subject.authorization), 'ok');
+    assert.equal(await f.store.activateKey(key.kid, key.enrollment, key.challenge!.value, f.now()), true);
+    const transaction = await pending(f.store, f.now(), `key-deadline-${status}`);
+    const before = await f.peer.getTransaction(transaction.id);
+    const blocker = await f.admin.connect();
+    try {
+      await blocker.query('BEGIN');
+      await blocker.query(`SELECT 1 FROM ${quote(f.schema)}.transactions WHERE id=$1 FOR UPDATE`, [transaction.id]);
+      capture = true;
+      const startTime = f.now();
+      const mutation = f.store.updateTransaction({ ...asserted(transaction, 'one', startTime), status, kid: key.kid, keyEnrollment: key.enrollment,
+        transactionTokenHash: 'new-assertion-bearer', reason: status === 'denied' ? 'consent_required' : undefined }, 0, {
+        now: startTime, maxSignups: 1,
+        consent: { handle: subject.agent.handle, clientId: 'client', scopes: ['openid'], redirectHost: 'rp.example' },
+      });
+      const outcome = mutation.then((value) => ({ value }), (error: unknown) => ({ error }));
+      const pid = await started.promise;
+      await eventually(async () => (await f.admin.query('SELECT wait_event_type FROM pg_stat_activity WHERE pid=$1', [pid])).rows[0]?.wait_event_type === 'Lock', 'assertion did not reach its implicit row-lock wait');
+      await f.advance(5);
+      await blocker.query('COMMIT');
+      const result = await outcome;
+      assert.ok('error' in result && isAssertionSubjectError(result.error));
+      assert.equal(result.error.error, 'key_revoked');
+      assert.deepEqual(attempts, [0]);
+      assert.deepEqual(await f.peer.getTransaction(transaction.id), before);
+      assert.equal(await f.peer.getConsent(subject.agent.handle, 'client'), undefined);
+      assert.equal(Number((await f.admin.query(`SELECT count(*) FROM ${quote(f.schema)}.reservations`)).rows[0].count), 0);
+    } finally { await blocker.query('ROLLBACK'); blocker.release(); }
+  });
+}
+
+for (const scenario of [
+  { name: 'true to false', before: true, after: false, prompt: undefined, expected: 'awaiting_owner' },
+  { name: 'false to true', before: false, after: true, prompt: undefined, expected: 'ready' },
+  { name: 'true to false with prompt=none', before: true, after: false, prompt: 'none' as const, expected: 'denied' },
+] as const) {
+  test(`PostgreSQL first assertion retries a share_owner change ${scenario.name} before accepting its gates`, options, async (t) => {
+    let armed = false;
+    const snapshotTaken = deferred();
+    const release = deferred();
+    const attempts: number[] = [];
+    const f = await fixture(t, { async onCheckpoint(event) {
+      if (!armed || event.operation !== 'updateTransaction') return;
+      if (event.phase === 'afterBegin') attempts.push(event.attempt);
+      if (event.phase === 'quota_locked' && event.attempt === 0) {
+        snapshotTaken.resolve();
+        await release.promise;
+      }
+    } });
+    const subject = await prepareAgent(f.store, f.now(), 'one');
+    assert.ok(await f.store.patchKey(subject.key.kid, subject.key.enrollment, { shareOwner: scenario.before }, subject.authorization));
+    const seed = await pending(f.store, f.now(), 'permission-fixture');
+    const transaction = { ...seed, id: 'permission-race', prompt: scenario.prompt, scopes: ['openid', 'owner_profile'] as ('openid' | 'owner_profile')[], transactionTokenHash: undefined };
+    await f.store.insertTransaction(transaction);
+    const before = await f.peer.getTransaction(transaction.id);
+    const planned = { ...asserted(transaction, 'one', f.now()), status: scenario.before ? 'ready' as const : 'awaiting_owner' as const,
+      ownerApprovalOutstanding: !scenario.before, expiresAt: scenario.before ? transaction.expiresAt : f.now() + 600, transactionTokenHash: 'accepted-bearer' };
+    const consent = { handle: subject.agent.handle, clientId: 'client', scopes: transaction.scopes, redirectHost: 'rp.example' };
+    armed = true;
+    const mutation = f.store.updateTransaction(planned, 0, { now: f.now(), maxSignups: 1, consent, expectedShareOwner: scenario.before });
+    const outcome = mutation.then((value) => ({ value }), (error: unknown) => ({ error }));
+    await snapshotTaken.promise;
+    try {
+      assert.ok(await f.peer.patchKey(subject.key.kid, subject.key.enrollment, { shareOwner: scenario.after }, subject.authorization));
+    } finally { release.resolve(); }
+    assert.deepEqual(await outcome, { value: undefined }, 'a stale permission plan must retry without accepting an assertion');
+    assert.deepEqual(attempts, [0, 1], 'the locked key read must refresh a snapshot predating a committed permission change');
+    assert.deepEqual(await f.peer.getTransaction(transaction.id), before);
+    assert.equal(await f.peer.getConsent(subject.agent.handle, 'client'), undefined);
+    assert.equal(Number((await f.admin.query(`SELECT count(*) FROM ${quote(f.schema)}.reservations`)).rows[0].count), 0);
+    armed = false;
+    const fresh = { ...planned, status: scenario.expected, ownerApprovalOutstanding: !scenario.after,
+      reason: scenario.expected === 'denied' ? 'interaction_required' as const : undefined,
+      expiresAt: scenario.expected === 'awaiting_owner' ? f.now() + 600 : transaction.expiresAt };
+    const accepted = await f.store.updateTransaction(fresh, 0, { now: f.now(), maxSignups: 1,
+      consent: scenario.expected === 'denied' ? undefined : consent, expectedShareOwner: scenario.after });
+    assert.equal(accepted?.status, scenario.expected);
+    assert.equal(accepted?.ownerApprovalOutstanding, !scenario.after);
+    assert.equal(accepted?.expiresAt, fresh.expiresAt);
+    assert.equal(accepted?.reason, fresh.reason);
+  });
+}
+
+test('PostgreSQL transaction expiry wins over a stale share_owner plan after contention', options, async (t) => {
+  let armed = false;
+  const snapshotTaken = deferred();
+  const release = deferred();
+  const f = await fixture(t, { async onCheckpoint(event) {
+    if (armed && event.operation === 'updateTransaction' && event.phase === 'quota_locked' && event.attempt === 0) {
+      snapshotTaken.resolve();
+      await release.promise;
+    }
+  } });
+  const subject = await prepareAgent(f.store, f.now(), 'one');
+  const transaction = await pending(f.store, f.now(), 'permission-deadline', 'client', 5);
+  const before = await f.peer.getTransaction(transaction.id);
+  armed = true;
+  const mutation = f.store.updateTransaction({ ...asserted(transaction, 'one', f.now()), status: 'awaiting_owner', expiresAt: f.now() + 600,
+    ownerApprovalOutstanding: true, transactionTokenHash: 'new-assertion-bearer' }, 0, { now: f.now(), expectedShareOwner: false, maxSignups: 1 });
+  const outcome = mutation.then((value) => ({ value }), (error: unknown) => ({ error }));
+  await snapshotTaken.promise;
+  try {
+    assert.ok(await f.peer.patchKey(subject.key.kid, subject.key.enrollment, { shareOwner: true }, subject.authorization));
+    await f.advance(5);
+  } finally { release.resolve(); }
+  const result = await outcome;
+  assert.ok('error' in result && isTransactionExpiredError(result.error));
+  assert.deepEqual(await f.peer.getTransaction(transaction.id), before);
+  assert.equal(Number((await f.admin.query(`SELECT count(*) FROM ${quote(f.schema)}.reservations`)).rows[0].count), 0);
+});
+
+test('PostgreSQL checks transaction expiry after its key-permission read lock before returning a gate conflict', options, async (t) => {
+  let capture = false;
+  const started = deferred<number>();
+  const attempts: number[] = [];
+  const f = await fixture(t, { async onCheckpoint(event) {
+    if (capture && event.operation === 'updateTransaction' && event.phase === 'afterBegin') {
+      attempts.push(event.attempt);
+      started.resolve(Number((await event.client.query('SELECT pg_backend_pid() AS pid')).rows[0].pid));
+    }
+  } });
+  const subject = await prepareAgent(f.store, f.now(), 'one');
+  const transaction = await pending(f.store, f.now(), 'permission-lock-deadline', 'client', 5);
+  const before = await f.peer.getTransaction(transaction.id);
+  const blocker = await f.admin.connect();
+  try {
+    await blocker.query('BEGIN');
+    await blocker.query(`SELECT 1 FROM ${quote(f.schema)}.keys WHERE enrollment=$1 FOR UPDATE`, [subject.key.enrollment]);
+    capture = true;
+    const startTime = f.now();
+    const mutation = f.store.updateTransaction(asserted(transaction, 'one', startTime), 0, { now: startTime,
+      expectedShareOwner: true, assertionWindow: { notBefore: startTime - 1, expiresAt: startTime + 5 } });
+    const outcome = mutation.then((value) => ({ value }), (error: unknown) => ({ error }));
+    const pid = await started.promise;
+    await eventually(async () => (await f.admin.query('SELECT wait_event_type FROM pg_stat_activity WHERE pid=$1', [pid])).rows[0]?.wait_event_type === 'Lock', 'assertion did not wait on the key-permission read lock');
+    await f.advance(5);
+    await blocker.query('COMMIT');
+    const result = await outcome;
+    assert.ok('error' in result && isTransactionExpiredError(result.error));
+    assert.deepEqual(attempts, [0], 'fresh expiry does not depend on a database serialization failure');
+    assert.deepEqual(await f.peer.getTransaction(transaction.id), before);
   } finally { await blocker.query('ROLLBACK'); blocker.release(); }
 });
 

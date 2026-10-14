@@ -63,9 +63,9 @@ await rp.recheck(session.live);
 | Requirement | Where |
 | --- | --- |
 | `state`, `nonce`, PKCE `S256` on every request; `login_hint` when the handle is known (5.1, 9) | `begin` |
-| The issuer recorded per `state`; `iss` on the redirect checked; code sent only to that issuer; one callback per sign-in (5.7 step 1) | `complete`, `callback` |
+| Callback members and session/issuer binding checked before state consumption; code sent only to the recorded issuer; one callback per sign-in (5.7 step 1) | `preflightCallback`, `complete`, `callback` |
 | ID Token: pinned algorithm (ES256), key by `kid`, `iss`, `aud`, required `exp`, `iat`, `nonce`, `actor_type` (5.7) | `validateIdToken` |
-| Handle-to-issuer binding; `home_iss` only from the configured Relay and within its `home_issuers` (2.5) | `validateIdToken` |
+| Returned handle matches the expected handle bound to state; handle-to-issuer binding; `home_iss` only from the configured Relay and within its `home_issuers` (2.5) | `validateIdToken` |
 | No Relay beside a Home Issuer it relays, judged by the Relay's metadata as it is now (9 item 10) | `begin`, `complete`, `validateIdToken` |
 | Discovery only for presented handles, cached per the response; address filtering, 64 KiB and 10 s limits on every fetched endpoint (2.2, 9) | `resolve` |
 | UserInfo live check, `sub` equality, `401` as revocation (9) | `recheck` |
@@ -99,7 +99,9 @@ Whatever your `onSignIn` throws is not caught.
 ## Callback state and deployment
 
 `createHandlers` requires a `callbackStore`. Login registers a state before returning its cookie; the callback
-atomically consumes it before contacting the issuer. Every handler instance and application replica must use the
+validates protocol response members and session/issuer binding, then atomically consumes state before contacting
+the issuer. Malformed or unbound responses preserve the pending state and cookie. A valid issuer error consumes
+state without a token request. Every handler instance and application replica must use the
 same store. A consumed state stays consumed even when token exchange times out, ID Token validation fails, or
 `onSignIn` throws: the caller must start a new sign-in. Re-exchanging a code can revoke an earlier successful
 session at the issuer, so retrying an uncertain exchange is unsafe.
@@ -114,9 +116,16 @@ records fail closed; losing the store ends pending sign-ins instead of allowing 
 
 `MemoryCallbackStateStore` is for development and single-process tests; share the same instance between handlers.
 It has a configurable capacity (default 10,000 states) and refuses new sign-ins when full instead of evicting live
-records. Storage failures return `state_store_failed` (HTTP 500), without exchanging a code. Low-level callers of
-`rp.complete` must implement the same atomic consumption before calling it; only `createHandlers` manages this
-automatically.
+records. Storage failures return `state_store_failed` (HTTP 500), without exchanging a code. Low-level callers must
+call `rp.preflightCallback({ params, pending })`, atomically consume their server-side pending state, then call
+`rp.complete({ params, pending })`, including for error responses. `complete` repeats the same preflight checks but
+does not manage consumption; only `createHandlers` manages this automatically.
+
+Keep a known handle in `pending.loginHint`; `begin` binds it to state and sends it as `login_hint`. Completion
+compares any returned `email` with that handle, preserving local-part case and ignoring A-label domain case.
+Callback parameters cannot replace the bound handle. Relay tokens without `email` require a pre-bound handle
+whose discovery designates `home_iss`. Callers using `validateIdToken` directly must pass the bound handle as
+`expectedHandle` when known.
 
 ## Limits to know
 

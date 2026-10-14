@@ -11,6 +11,7 @@ export interface PendingSignIn {
   verifier: string;
   /** Issuer Identifier the Authentication Request was sent to (Section 5.7 step 1). */
   issuer: string;
+  /** Expected handle sent as login_hint, bound to this state and checked against returned email (Section 2.5). */
   loginHint?: string;
   /** Where the application wants the user sent after sign-in (same-origin path only). */
   returnTo?: string;

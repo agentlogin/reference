@@ -2,7 +2,7 @@
 // subjects, key enrollment IDs and monotonic Agent/Account disable versions keep delayed reads and writes from
 // becoming valid again after a deletion, re-enrollment, or disable/re-enable cycle.
 import type { IssuerContext } from './context.js';
-import { isAssertionWindowError, TERMINAL, type DenyReason, type SubjectFilter, type Transaction, type TransitionEffects } from './store.js';
+import { isAssertionSubjectError, isAssertionWindowError, isTransactionExpiredError, isTransactionTokenError, TERMINAL, type DenyReason, type SubjectFilter, type Transaction, type TransitionEffects } from './store.js';
 import { OAuthError } from './errors.js';
 
 /** The transaction as it stands now. Expiry is a function of time, not a stored status (Section 6.2). */
@@ -23,6 +23,9 @@ export async function commit(ctx: IssuerContext, next: Transaction, expectedVers
     updated = await ctx.store.updateTransaction(next, expectedVersion, { ...effects, now: ctx.now() });
   } catch (error) {
     // An external adapter can load a separate copy of the issuer package (including source vs dist in tests).
+    if (isAssertionSubjectError(error)) throw new OAuthError(401, error.error);
+    if (isTransactionExpiredError(error)) throw new OAuthError(410, 'transaction_expired');
+    if (isTransactionTokenError(error)) throw new OAuthError(401, 'invalid_token', undefined, { 'WWW-Authenticate': 'Bearer error="invalid_token"' });
     if (isAssertionWindowError(error)) {
       throw new OAuthError(400, 'invalid_assertion', 'assertion expired while awaiting acceptance');
     }

@@ -834,7 +834,9 @@ class Harness {
       const c2 = new URL(obj((await this.cont(a2.next.url, a2.transaction_token)).json).redirect);
       const del = await call(`${m.agents_endpoint}/${encodeURIComponent(fresh.handle)}/keys`, { method: 'DELETE', headers: { authorization: `Bearer ${this.credential}` } });
       expect(del.status === 204, 'revoke all');
-      const after = obj((await this.get(open.tx, a.transaction_token)).json);
+      const revokedRead = await this.get(open.tx, a.transaction_token);
+      expect(revokedRead.status === 401 && obj(revokedRead.json).error === 'invalid_token' && !obj(revokedRead.json).next?.url, 'revocation invalidates the transaction bearer and withholds the continue URL');
+      const after = obj((await this.get(open.tx)).json);
       expect(after.status === 'denied' && after.reason === 'key_revoked', `open transaction → ${after.status} ${after.reason}`);
       const ex = await this.exchange(this.client, c2.searchParams.get('code')!, s2.verifier);
       expect(ex.status === 400 && obj(ex.json).error === 'invalid_grant', `unredeemed code → ${ex.status}`);
@@ -857,7 +859,9 @@ class Harness {
       const acct = `${m.agents_endpoint}/${encodeURIComponent(fresh.handle)}/accounts/${encodeURIComponent(this.client.client_id)}`;
       const dis = await call(acct, { method: 'PATCH', headers: { authorization: `Bearer ${this.credential}` }, json: { status: 'disabled' } });
       expect(dis.status === 200 && obj(dis.json).status === 'disabled', `disable → ${dis.status}`);
-      const after = obj((await this.get(open.tx, a.transaction_token)).json);
+      const deniedRead = await this.get(open.tx, a.transaction_token);
+      expect(deniedRead.status === 200 && validContinueNext(obj(deniedRead.json).next, m.transaction_endpoint), 'Account disable retains the transaction bearer for the denial continuation');
+      const after = obj(deniedRead.json);
       expect(after.status === 'denied' && after.reason === 'access_denied', `open → ${after.status} ${after.reason}`);
       const later = obj((await this.assert((await this.start()).tx, fresh)).json);
       expect(later.status === 'denied' && later.reason === 'access_denied', `later → ${later.status}`);

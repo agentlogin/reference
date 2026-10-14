@@ -23,9 +23,7 @@ for (const backend of ['memory', 'sqlite'] as const) {
     const originalKey = (await w.store.getKey(a.kid, a.handle))!;
     const client = await w.client();
     const original = await w.ready(client, a);
-    const readOriginal = () => w.req('GET', original.tx.url, {
-      headers: { authorization: `Bearer ${original.tx.transaction_token}` },
-    });
+    const readOriginal = () => w.req('GET', original.tx.url);
     const b = { ...a, handle: 'expired-b@example.com' };
     assert.equal((await w.req('POST', '/admin/agents', {
       headers: w.admin, json: { handle: b.handle, owner_id: w.owner.owner_id },
@@ -71,6 +69,7 @@ for (const backend of ['memory', 'sqlite'] as const) {
     assert.equal(terminal.status, 'denied');
     assert.equal(terminal.reason, 'key_revoked');
     assert.equal(terminal.terminalAt, originalKey.expiresAt, 'individual revocation preserves the original key expiry');
+    assert.equal((await w.req('GET', original.tx.url, { headers: { authorization: `Bearer ${original.tx.transaction_token}` } })).status, 401);
     assert.equal((await readOriginal()).status, 200);
 
     w.advance(8); // B has now expired too: its exclusivity cannot explain rejecting A's enrollment.

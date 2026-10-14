@@ -22,9 +22,10 @@ JSON path and the wait-page path. The specification is at draft 0.1; code lands 
 | `examples/rp-hono` | A runnable application that accepts agent sign-ins |
 | `packages/conformance` | Conformance harness |
 
-Lifecycle hardening (11 October 2026): the issuer now commits authorization, signup reservations, code issuance and
-invalidation as atomic state transitions, with a durable SQLite reference adapter. The RP requires shared one-use
-callback storage. Client locking, sign-in deadlines, cookie ordering and conformance validation have regression
+The production storage target is `@agentlogin/store-postgres`: normalized records, asynchronous connections and
+atomic transitions across issuer instances. Memory and SQLite remain local reference/test adapters. The RP requires
+shared one-use callback storage; its bundled SQLite callback store is a single-host option, and a multi-host RP
+needs a separate shared-database adapter. Client locking, sign-in deadlines, cookie ordering and conformance validation have regression
 coverage. See package READMEs for migration and storage requirements; rate limiting and complete production Owner
 authentication remain deployment work.
 

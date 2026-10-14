@@ -392,7 +392,9 @@ export class AgentLogin {
     const a = await ask(tx.next.url, { method: 'POST', body: { assertion } });
     if (a.status !== 200) {
       const code = (a.json as { error?: string } | undefined)?.error;
-      if (code === 'key_revoked' || code === 'unknown_key') await this.keystore.put({ ...key, status: 'revoked' }); // the Issuer no longer accepts this key
+      // unknown_key can reflect interrupted Agent authority (for example disable/re-enable), not revocation
+      // of this enrollment. Keep the key available for a fresh sign-in unless revocation is explicit.
+      if (code === 'key_revoked') await this.keystore.put({ ...key, status: 'revoked' });
       throw this.error('assertion refused', a);
     }
     const asserted = parseResource(a.json);
@@ -552,8 +554,11 @@ export class AgentLogin {
   /** A-3: the resource must come from this Agent's Issuer and point into its transaction endpoint; the client must be the one the agent set out to sign in to. */
   private check(tx: TransactionResource, issuer: string, m: IssuerMetadata, o: SignInOptions) {
     if (tx.iss !== issuer) throw new AgentLoginError(`transaction iss ${tx.iss} is not ${issuer}`, 'wrong_issuer', undefined, tx);
+    const action = { awaiting_agent: 'assert', awaiting_owner: 'await_owner', awaiting_consent: 'review', ready: 'continue',
+      completed: 'none', denied: 'continue', expired: 'continue' }[tx.status];
+    if (!action || tx.next?.action !== action) throw new AgentLoginError('transaction status and next action disagree', 'protocol_error', undefined, tx);
     this.assertUnder(tx.url, m.transaction_endpoint);
-    if (tx.next?.url) this.assertUnder(tx.next.url, m.transaction_endpoint);
+    if (tx.next?.url && tx.next.action !== 'none') this.assertUnder(tx.next.url, m.transaction_endpoint);
     if (typeof tx.client?.redirect_host !== 'string') throw new AgentLoginError('transaction without client.redirect_host', 'protocol_error');
     if (!o.unsafeSkipHostCheck) {
       const ok = [o.expectedHost!, ...(o.acceptHosts ?? [])].map((h) => h.toLowerCase());
@@ -570,7 +575,7 @@ export class AgentLogin {
     }
     const b = new URL(base);
     const basePath = b.pathname.replace(/\/$/, '');
-    if (u.origin !== b.origin || u.username || u.password || !(u.pathname === basePath || u.pathname.startsWith(`${basePath}/`))) {
+    if (u.origin !== b.origin || u.username || u.password || u.hash || !(u.pathname === basePath || u.pathname.startsWith(`${basePath}/`))) {
       throw new AgentLoginError(`a URL from the Issuer is not under ${base}`, 'wrong_issuer');
     }
     if (u.protocol !== 'https:' && !this.opts.allowInsecure) throw new AgentLoginError('non-https URL from the Issuer', 'insecure_url');

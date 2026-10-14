@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { UncertainCommitError } from '../src/runtime.js';
-import { begin, codeFor, connectionString, deferred, eventually, fixture, prepareAgent, quote, skipPostgres, tokenFor } from './helpers.js';
+import { asserted, begin, codeFor, connectionString, deferred, eventually, fixture, pending, prepareAgent, quote, skipPostgres, tokenFor } from './helpers.js';
 
 const options = { skip: skipPostgres, timeout: 30_000 };
 
@@ -57,6 +57,54 @@ test('PostgreSQL destructive owner-code consumption fails closed after an uncert
   assert.equal(attempts, 1, 'an uncertain destructive operation is never retried');
   assert.equal(await f.peer.takeOwnerCode('owner'), undefined, 'the committed consumption stays consumed');
 });
+
+test('PostgreSQL reconciles one accepted assertion after its commit acknowledgement is lost', options, async (t) => {
+  const attempts: number[] = [];
+  const f = await fixture(t, { onCheckpoint(event) {
+    if (event.operation !== 'updateTransaction') return;
+    if (event.phase === 'afterBegin') attempts.push(event.attempt);
+    if (event.phase === 'afterCommit') throw new Error('lost assertion acknowledgement');
+  } });
+  await prepareAgent(f.store, f.now(), 'one');
+  const transaction = await pending(f.store, f.now(), 'assertion-ack');
+  const accepted = await f.store.updateTransaction({ ...asserted(transaction, 'one', f.now()), transactionTokenHash: 'accepted-bearer' }, 0, {
+    now: f.now(), maxSignups: 1,
+    consent: { handle: 'one@example.com', clientId: 'client', scopes: ['openid'], redirectHost: 'rp.example' },
+  });
+  assert.equal(accepted?.status, 'ready');
+  assert.equal(accepted?.transactionTokenHash, 'accepted-bearer');
+  assert.deepEqual(attempts, [0], 'reconciliation must not replay assertion effects');
+  assert.equal(Number((await f.admin.query(`SELECT count(*) FROM ${quote(f.schema)}.reservations`)).rows[0].count), 1);
+  assert.equal((await f.peer.getConsent('one@example.com', 'client'))?.lastUsedAt, f.now());
+});
+
+for (const operation of ['updateTransaction', 'completeTransaction'] as const) {
+  test(`PostgreSQL cannot reconcile ${operation} as a bearer success after concurrent revocation`, options, async (t) => {
+    let revoke: (() => Promise<void>) | undefined;
+    const attempts: number[] = [];
+    const f = await fixture(t, { async onCheckpoint(event) {
+      if (!revoke || event.operation !== operation) return;
+      if (event.phase === 'afterBegin') attempts.push(event.attempt);
+      if (event.phase === 'afterCommit') {
+        await revoke();
+        throw new Error('lost acknowledgement after key revocation');
+      }
+    } });
+    const subject = await prepareAgent(f.store, f.now(), 'one');
+    const transaction = await begin(f.store, f.now(), 'one', `revoked-ack-${operation}`, 'client', 1);
+    revoke = async () => { assert.ok(await f.peer.revokeKey(subject.key.kid, subject.key.enrollment, f.now())); };
+    const mutation = operation === 'updateTransaction'
+      ? f.store.updateTransaction({ ...transaction, status: 'denied', reason: 'cancelled' }, transaction.version, { now: f.now(), transactionTokenHash: transaction.transactionTokenHash })
+      : f.store.completeTransaction(transaction, transaction.version, codeFor(transaction, f.now()), f.now(), transaction.transactionTokenHash);
+    await assert.rejects(mutation, (error: unknown) => error instanceof UncertainCommitError && error.operation === operation);
+    assert.deepEqual(attempts, [0], 'uncertain committed transitions are never retried');
+    const stored = await f.peer.getTransaction(transaction.id);
+    assert.equal(stored?.transactionTokenHash, undefined);
+    assert.equal(stored?.status, operation === 'completeTransaction' ? 'completed' : 'denied');
+    assert.equal(stored?.terminalAt, f.now());
+    assert.equal(await f.peer.signupsEver('owner', 'client'), operation === 'completeTransaction' ? 1 : 0);
+  });
+}
 
 for (const phase of ['beforeCommit', 'afterCommit']) {
   test(`PostgreSQL process death ${phase} preserves an atomic completion`, options, async (t) => {

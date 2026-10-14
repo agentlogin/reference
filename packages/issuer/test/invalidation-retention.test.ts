@@ -39,9 +39,7 @@ for (const backend of ['memory', 'sqlite'] as const) {
       const afterExpiry = 7;
       w.advance(DEFAULT_CONSTANTS.T_TXN + afterExpiry);
       const live = await w.ready(client, agent);
-      const read = (tx: typeof old.tx) => w.req('GET', tx.url, {
-        headers: { authorization: `Bearer ${tx.transaction_token}` },
-      });
+      const read = (tx: typeof old.tx) => w.req('GET', tx.url);
       const hidden = await read(old.tx);
       assert.equal(hidden.status, 404, hidden.text);
       assert.equal(hidden.json.error, 'invalid_transaction');
@@ -85,11 +83,17 @@ for (const backend of ['memory', 'sqlite'] as const) {
       assert.equal(afterChange.json.status, 'expired');
       assert.equal(afterChange.json.reason, undefined);
       const continuation = await w.cont(recent.tx);
-      assert.equal(continuation.status, 200, continuation.text);
-      const redirect = new URL(continuation.json.redirect);
-      assert.equal(redirect.searchParams.get('code'), null, 'the expired transaction cannot issue a code');
-      assert.equal(redirect.searchParams.get('error'), 'access_denied');
-      assert.equal(redirect.searchParams.get('error_description'), 'transaction_expired');
+      if (change === 'revoke key') {
+        assert.equal(continuation.status, 401, continuation.text);
+        assert.equal(continuation.json.error, 'invalid_token');
+        assert.equal(continuation.json.next.url, undefined);
+      } else {
+        assert.equal(continuation.status, 200, continuation.text);
+        const redirect = new URL(continuation.json.redirect);
+        assert.equal(redirect.searchParams.get('code'), null, 'the expired transaction cannot issue a code');
+        assert.equal(redirect.searchParams.get('error'), 'access_denied');
+        assert.equal(redirect.searchParams.get('error_description'), 'transaction_expired');
+      }
 
       const invalidated = (await w.store.getTransaction(live.tx.transaction_id))!;
       assert.equal(invalidated.status, 'denied', 'the same lifecycle change must still invalidate a live transaction');

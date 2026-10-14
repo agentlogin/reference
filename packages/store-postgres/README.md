@@ -92,11 +92,26 @@ pairs in a consistent order. This protects admission even before an account exis
 The lock localizes deliberate waiting to the affected pair; it does **not** eliminate
 serialization failures because the transaction's snapshot can predate its wait.
 
+A first assertion carrying an `expectedShareOwner` gate decision then reads its exact
+key enrollment `FOR SHARE`, after quota coordination. A permission patch that already
+changed that row forces a stale snapshot to retry; a later patch waits until assertion
+acceptance finishes. If the current permission differs from the proposed decision,
+the store returns a conflict without assertion, reservation, or consent effects so
+the issuer can recompute the Owner gate. No network or cryptographic work runs while
+this key lock is held. Expiry is rechecked after the lock and after mutation writes.
+
 Authorization checked before a transaction is only a candidate: relevant identity,
 key, credential, and disable versions are checked again inside it. Revocation performs
 indexed invalidation of dependent transactions, codes, tokens, and reservations.
 Authoritative lifecycle checks remain necessary at later transitions and UserInfo.
 Background deletion never determines whether a credential is valid.
+
+Explicit key revocation also removes transaction bearer hashes from retained terminal
+records without changing their outcome or terminal time. Legacy hashes associated with
+an explicitly revoked enrollment are suppressed on reads and removed before that key
+record is deleted. Natural key expiry alone does not invalidate a retained transaction
+bearer. First assertions that lose their transaction lifetime or asserting-key authority
+are rejected without consuming the challenge or persisting their proposed identity.
 
 Polling uses `READ COMMITTED READ ONLY` and computes effective status without writing.
 Management resolution and protected reads join the credential, Agent identity and requested records in one

@@ -276,15 +276,27 @@ for (const backend of ['memory', 'sqlite'] as const) {
       });
       const rejected = await w.assertOn(pending.tx, agent);
       assert.ok(changed, 'the competing instance changed status between subject read and assertion commit');
-      assert.equal(rejected.status, 200, rejected.text);
-      assert.equal(rejected.json.status, 'denied');
-      assert.equal(rejected.json.reason, 'access_denied');
+      assert.equal(rejected.status, target === 'agent' ? 401 : 200, rejected.text);
+      if (target === 'agent') {
+        assert.equal(rejected.json.error, 'unknown_key');
+        assert.equal(rejected.json.status, 'awaiting_agent');
+        assert.equal(rejected.json.transaction_token, undefined);
+      } else {
+        assert.equal(rejected.json.status, 'denied');
+        assert.equal(rejected.json.reason, 'access_denied');
+        assert.equal(typeof rejected.json.transaction_token, 'string', 'Account denial is an accepted assertion gate');
+      }
       const afterRejection = await secondStore.getAccount(agent.handle, client.client_id);
       assert.equal(afterRejection?.signInCount, before?.signInCount, 'the stale assertion creates no Account or sign-in');
       assert.equal(await secondStore.signupsEver(w.owner.owner_id, client.client_id), target === 'account' ? 1 : 0);
       const persisted = (await secondStore.getTransaction(pending.tx.transaction_id))!;
-      assert.equal(persisted.status, 'denied');
+      assert.equal(persisted.status, target === 'agent' ? 'awaiting_agent' : 'denied');
       assert.equal(persisted.codeIssued, false);
+      if (target === 'agent') {
+        assert.equal(persisted.challenge, pending.tx.challenge);
+        assert.equal(persisted.handle, undefined);
+        assert.equal(persisted.transactionTokenHash, undefined);
+      }
 
       const fresh = await w.codeFor(client, agent);
       assert.equal((await w.token(client, fresh.code, fresh.verifier, 1)).status, 200, 'fresh assertion uses the new authorization version');

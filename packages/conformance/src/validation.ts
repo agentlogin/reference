@@ -125,8 +125,10 @@ export function validContinueNext(value: unknown, transactionEndpoint: string): 
   const url = new URL(next.url);
   const endpoint = new URL(transactionEndpoint);
   const local = endpoint.protocol === 'http:' && url.origin === endpoint.origin && (endpoint.hostname === 'localhost' || endpoint.hostname === '[::1]' || /^127\.(?:\d{1,3}\.){2}\d{1,3}$/.test(endpoint.hostname));
-  // The current continue URL may rotate; do not impose URL stability or a path layout on the issuer.
-  return url.origin === endpoint.origin && (url.protocol === 'https:' || local) && !url.username && !url.password && !url.hash;
+  const basePath = endpoint.pathname.replace(/\/$/, '');
+  // Core 6.1 fixes the endpoint boundary, while allowing query secrets, arbitrary descendant routes and rotation.
+  return url.origin === endpoint.origin && (url.pathname === basePath || url.pathname.startsWith(`${basePath}/`)) &&
+    (url.protocol === 'https:' || local) && !url.username && !url.password && !url.hash;
 }
 
 /** Section 5.6 requires at most one success: replay detection may invalidate even the first request before delivery. */

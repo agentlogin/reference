@@ -223,6 +223,10 @@ export interface TransitionEffects {
   now: number;
   /** Already verified signed assertion window, rechecked by the store at its atomic acceptance point. */
   assertionWindow?: { notBefore: number; expiresAt: number };
+  /** Review bearer, checked against current authority before version or terminal checks. */
+  transactionTokenHash?: string;
+  /** Key permission used to plan first-assertion Owner approval; mismatch returns a conflict without effects. */
+  expectedShareOwner?: boolean;
   maxSignups?: number;
   consent?: Omit<Consent, 'createdAt' | 'lastUsedAt'>;
   /** The disclosure whose existing consent a transition relies on; revalidated atomically before acceptance. */
@@ -237,6 +241,31 @@ export class AssertionWindowError extends Error {
 /** Stable across separate copies of this package loaded by an external adapter. */
 export function isAssertionWindowError(error: unknown): error is AssertionWindowError {
   return error instanceof Error && 'code' in error && error.code === 'ASSERTION_WINDOW';
+}
+/** Step 2 authority is rechecked atomically before consuming a first assertion. */
+export class AssertionSubjectError extends Error {
+  readonly code = 'ASSERTION_SUBJECT';
+  constructor(readonly error: 'unknown_key' | 'key_revoked') { super('The asserting key or Agent is no longer authorized'); this.name = 'AssertionSubjectError'; }
+}
+export function isAssertionSubjectError(error: unknown): error is AssertionSubjectError {
+  return error instanceof Error && 'code' in error && error.code === 'ASSERTION_SUBJECT' &&
+    'error' in error && (error.error === 'unknown_key' || error.error === 'key_revoked');
+}
+/** First assertions cannot take effect at or after the transaction deadline. */
+export class TransactionExpiredError extends Error {
+  readonly code = 'TRANSACTION_EXPIRED';
+  constructor() { super('The transaction expired before assertion acceptance'); this.name = 'TransactionExpiredError'; }
+}
+export function isTransactionExpiredError(error: unknown): error is TransactionExpiredError {
+  return error instanceof Error && 'code' in error && error.code === 'TRANSACTION_EXPIRED';
+}
+/** A previously identified transaction bearer no longer has authority. */
+export class TransactionTokenError extends Error {
+  readonly code = 'TRANSACTION_TOKEN';
+  constructor() { super('The transaction bearer is no longer valid'); this.name = 'TransactionTokenError'; }
+}
+export function isTransactionTokenError(error: unknown): error is TransactionTokenError {
+  return error instanceof Error && 'code' in error && error.code === 'TRANSACTION_TOKEN';
 }
 /** The public key is already active for another Agent; pending enrollments confer no exclusivity. */
 export class KeyActivationConflictError extends Error {
@@ -325,14 +354,19 @@ export interface Store {
    * identity/lifecycle and expiry, admit the signup cap on the FIRST assertion, and commit the transaction,
    * reservation, and consent effects together. Existing consent relied on must still cover the supplied context;
    * otherwise return a review state (or denial for prompt=none). Return the actual state (which may be denied/expired). Completion
-   * must use completeTransaction. A losing caller never creates or releases a reservation.
+   * must use completeTransaction. A losing caller never creates or releases a reservation. A first assertion whose
+   * original transaction expired throws TransactionExpiredError without any write, before assertion-window checks.
+   * First assertions with invalid key/Agent authority throw AssertionSubjectError without consuming the challenge;
+   * Account denial remains an accepted gate. A changed expectedShareOwner returns a conflict with no effects,
+   * so the caller can recompute gates using the same enrollment's current permission. A supplied transactionTokenHash is checked before version/terminal checks and throws TransactionTokenError
+   * if explicit revocation removed its authority.
    */
   updateTransaction(t: Transaction, expectedVersion: number, effects: TransitionEffects): Promise<Transaction | undefined>;
   /** Transactions whose stored status is not terminal (an expired one may still be listed; callers look at `expiresAt`). */
   listOpenTransactions(filter: SubjectFilter): Promise<Transaction[]>;
 
   /** ATOMIC. Validate subject, reservation and expiry; complete, insert code, count Account and release reservation together. */
-  completeTransaction(t: Transaction, expectedVersion: number, code: Code, now: number): Promise<Transaction | undefined>;
+  completeTransaction(t: Transaction, expectedVersion: number, code: Code, now: number, transactionTokenHash?: string): Promise<Transaction | undefined>;
 
   // ---- codes and Access Tokens (Section 5) ----
   getCode(hash: string): Promise<Code | undefined>;
@@ -519,6 +553,7 @@ export class StoreState implements SyncStore {
     if (!a || a.sub !== agentSub) return false;
     this.invalidate({ handle }, 'access_denied', now);
     for (const [index, k] of this.keys) if (k.handle === handle && k.agentSub === agentSub) {
+      if (k.status === 'revoked') this.revokeTransactionTokens(k.kid, k.enrollment);
       this.revoked.add(`${handle}\u0000${k.kid}`);
       this.keys.delete(index);
     }
@@ -573,6 +608,14 @@ export class StoreState implements SyncStore {
       return { ...t, status: 'expired', terminalAt: t.expiresAt, reason: undefined, challenge: undefined };
     }
     if (now >= keyExpiry) return { ...t, status: 'denied', reason: 'key_revoked', terminalAt: keyExpiry, challenge: undefined };
+    return undefined;
+  }
+  private assertionSubjectReason(tx: Transaction, now: number): 'unknown_key' | 'key_revoked' | undefined {
+    const agent = tx.handle && this.agents.get(tx.handle);
+    if (!agent || agent.sub !== tx.agentSub || !agent.enabled || agent.authorizationVersion !== tx.agentVersion) return 'unknown_key';
+    const key = tx.kid && tx.keyEnrollment ? this.enrollmentKey(tx.kid, tx.keyEnrollment) : undefined;
+    if (!key || key.handle !== tx.handle || key.agentSub !== tx.agentSub) return 'unknown_key';
+    if (key.status !== 'active' || now >= key.expiresAt) return 'key_revoked';
     return undefined;
   }
   private subjectReason(s: { handle?: string; kid?: string; keyEnrollment?: string; agentSub?: string; agentVersion?: number; accountVersion?: number; clientId: string }, now: number): 'key_revoked' | 'access_denied' | undefined {
@@ -639,13 +682,28 @@ export class StoreState implements SyncStore {
     if (authorization && (!k || k.agentSub !== authorization.agentSub || !this.managementCurrent(k.handle, authorization))) return undefined;
     // Individual revocation also forbids reuse after expiry, including an enrollment retired by another Agent.
     if (!k) return undefined;
-    if (k.status === 'revoked') return authorization ? copy(k) : undefined;
+    if (k.status === 'revoked') {
+      this.revokeTransactionTokens(kid, enrollment);
+      return authorization ? copy(k) : undefined;
+    }
     k.status = 'revoked';
     k.revokedAt = now;
     k.challenge = undefined;
     this.revoked.add(`${k.handle}\u0000${k.kid}`);
     this.invalidate({ kid, keyEnrollment: enrollment }, 'key_revoked', now);
+    this.revokeTransactionTokens(kid, enrollment);
     return copy(k);
+  }
+  private revokeTransactionTokens(kid: string, enrollment: string) {
+    // Explicit revocation ends bearer authority even for retained terminal transactions. Natural expiry does not.
+    for (const tx of this.transactions.values()) if (tx.kid === kid && tx.keyEnrollment === enrollment && tx.transactionTokenHash !== undefined) {
+      delete tx.transactionTokenHash;
+      tx.version += 1;
+    }
+  }
+  private transactionTokenRevoked(tx: Transaction): boolean {
+    const key = tx.kid && tx.keyEnrollment ? this.enrollmentKey(tx.kid, tx.keyEnrollment) : undefined;
+    return key?.status === 'revoked' && key.handle === tx.handle && key.agentSub === tx.agentSub;
   }
   revokeAllKeys(handle: string, authorization: ManagementAuthorization, now: number) {
     if (!this.managementCurrent(handle, authorization)) return false;
@@ -665,6 +723,8 @@ export class StoreState implements SyncStore {
   deleteKey(kid: string, enrollment?: string, pendingExpiredAt?: number) {
     const k = enrollment === undefined ? this.getKey(kid) : this.enrollmentKey(kid, enrollment);
     if (!k || (pendingExpiredAt !== undefined && (k.status !== 'pending' || (k.challenge && pendingExpiredAt < k.challenge.expiresAt)))) return;
+    // Persist legacy revocation before its key record disappears; missing/expired enrollments alone revoke no bearer.
+    if (k.status === 'revoked') this.revokeTransactionTokens(k.kid, k.enrollment);
     this.keys.delete(this.keyIndex(k.agentSub, kid));
   }
   wasRevoked(handle: string, kid: string) { return this.revoked.has(`${handle}\u0000${kid}`); }
@@ -681,6 +741,8 @@ export class StoreState implements SyncStore {
     const stored = this.transactions.get(id);
     if (!stored) return undefined;
     let tx = copy(stored);
+    // Older snapshots may retain hashes after revocation; deny that exact enrollment without a polling write.
+    if (this.transactionTokenRevoked(tx)) delete tx.transactionTokenHash;
     if (!TERMINAL.has(tx.status)) {
       const expired = this.expiredTransaction(tx, now);
       if (expired) tx = expired;
@@ -693,13 +755,20 @@ export class StoreState implements SyncStore {
   }
   updateTransaction(t: Transaction, expectedVersion: number, effects: TransitionEffects) {
     const cur = this.transactions.get(t.id);
+    if (cur && effects.transactionTokenHash !== undefined && (effects.transactionTokenHash !== cur.transactionTokenHash || this.transactionTokenRevoked(cur))) throw new TransactionTokenError();
     if (!cur || cur.version !== expectedVersion || TERMINAL.has(cur.status) || t.status === 'completed') return undefined;
-    if (effects.assertionWindow && (effects.now < effects.assertionWindow.notBefore || effects.now >= effects.assertionWindow.expiresAt)) throw new AssertionWindowError();
-    const next = copy(t);
-    const deny = (reason: DenyReason) => { next.status = 'denied'; next.reason = reason; next.terminalAt = effects.now; next.challenge = undefined; };
     const expired = this.expiredTransaction(cur, effects.now);
-    if (expired) { next.status = expired.status; next.reason = expired.reason; next.terminalAt = expired.terminalAt; next.challenge = undefined; }
-    else if (next.kid) {
+    if (cur.status === 'awaiting_agent' && t.kid) {
+      if (expired) throw new TransactionExpiredError();
+      const reason = this.assertionSubjectReason(t, effects.now);
+      if (reason) throw new AssertionSubjectError(reason);
+    }
+    if (effects.assertionWindow && (effects.now < effects.assertionWindow.notBefore || effects.now >= effects.assertionWindow.expiresAt)) throw new AssertionWindowError();
+    if (cur.status === 'awaiting_agent' && t.kid && effects.expectedShareOwner !== undefined &&
+      this.enrollmentKey(t.kid, t.keyEnrollment!)?.permissions.share_owner !== effects.expectedShareOwner) return undefined;
+    const next = copy(expired ?? t);
+    const deny = (reason: DenyReason) => { next.status = 'denied'; next.reason = reason; next.terminalAt = effects.now; next.challenge = undefined; };
+    if (!expired && next.kid) {
       const reason = this.subjectReason(next, effects.now);
       if (reason) deny(reason);
       else if (cur.status === 'awaiting_agent' && !this.accounts.has(`${next.handle}\u0000${next.clientId}`) && effects.maxSignups !== undefined) {
@@ -735,8 +804,9 @@ export class StoreState implements SyncStore {
     }
     return copy(next);
   }
-  completeTransaction(t: Transaction, expectedVersion: number, code: Code, now: number) {
+  completeTransaction(t: Transaction, expectedVersion: number, code: Code, now: number, transactionTokenHash?: string) {
     const cur = this.transactions.get(t.id);
+    if (cur && transactionTokenHash !== undefined && (transactionTokenHash !== cur.transactionTokenHash || this.transactionTokenRevoked(cur))) throw new TransactionTokenError();
     if (!cur || cur.version !== expectedVersion || cur.status !== 'ready') return undefined;
     const dead = this.subjectReason(cur, now);
     const reservation = cur.ownerId && this.reservations.get(`${cur.ownerId}\u0000${cur.clientId}`)?.get(cur.id);
