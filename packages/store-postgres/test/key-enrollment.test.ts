@@ -91,7 +91,9 @@ test('PostgreSQL activation retires expired proof after a quota wait at its orig
     assert.equal(denied?.reason, 'key_revoked');
     assert.equal(denied?.terminalAt, a.expiresAt);
     assert.equal(Number((await f.admin.query(`SELECT count(*) FROM ${quote(f.schema)}.reservations`)).rows[0].count), 0);
-    assert.equal(await f.store.revokeKey(a.kid, a.enrollment, f.now()), undefined);
+    assert.equal((await f.store.revokeKey(a.kid, a.enrollment, f.now()))?.status, 'revoked');
+    assert.equal(await f.peer.wasRevoked(a.handle, a.kid), true);
+    assert.equal((await f.peer.getTransaction(tx.id))?.terminalAt, a.expiresAt);
     assert.equal((await f.peer.getKey(b.kid, b.handle))?.status, 'active');
   } finally { await blocker.query('ROLLBACK'); blocker.release(); }
 });

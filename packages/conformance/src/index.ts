@@ -598,7 +598,7 @@ class Harness {
       const r = new URL(obj(c.json).redirect);
       expect(c.status === 200 && authorizationRedirectMatches(r, this.client.redirect_uri, s.params.state, iss, 'code'), `continue → ${c.status} ${c.text.slice(0, 160)}`);
       const twice = await this.cont(a.next.url, a.transaction_token);
-      expect(twice.status === 410 && singleUseContinueError(twice.json, 'completed'), `second continue → ${twice.status}`);
+      expect(twice.status === 410 && singleUseContinueError(twice.json, 'completed', m.transaction_endpoint), `second continue → ${twice.status}`);
       // deliver_to_session path, HTML redirect
       const s2 = await this.start();
       const a2 = obj((await this.assert(s2.tx, this.agent, { accept_disclosure: true, deliver_to_session: true })).json);

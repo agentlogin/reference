@@ -155,11 +155,45 @@ export function registerStoreContract(name: string, factory: StoreContractFactor
     assert.equal(await f.peer.insertKey(refreshed, f.now(), b.authorization), 'ok');
     assert.equal(await f.peer.activateKey(refreshed.kid, refreshed.enrollment, 'fresh-proof', f.now()), true);
     assert.equal(await f.store.activateKey(replacement.kid, replacement.enrollment, 'proof', f.now()), false);
-    assert.equal(await f.store.revokeKey(a.key.kid, a.key.enrollment, f.now()), undefined);
+    assert.equal((await f.store.revokeKey(a.key.kid, a.key.enrollment, f.now()))?.status, 'revoked');
+    assert.equal(await f.peer.wasRevoked(a.agent.handle, a.key.kid), true);
     await f.store.deleteKey(a.key.kid, replacement.enrollment);
     await f.store.deleteKey(a.key.kid, a.key.enrollment);
     assert.equal((await f.store.getKey(a.key.kid, b.agent.handle))?.enrollment, refreshed.enrollment);
     assert.equal((await f.store.getKey(a.key.kid))?.status, 'active');
+  });
+
+  check('individual revocation of a retired expired enrollment prevents reuse without changing other enrollments or retention', async (f) => {
+    const a = await subject(f); const b = await subject(f, 'second'); const c = await client(f);
+    const tx = await pending(f, c, 'retired-enrollment', 7200);
+    assert.equal((await f.store.updateTransaction(asserted(f, tx, a), tx.version, { now: f.now(), maxSignups: 1 }))?.status, 'ready');
+    await f.advance(3601);
+    const replacement: AgentKey = { ...a.key, handle: b.agent.handle, agentSub: b.agent.sub, enrollment: 'other-agent-enrollment',
+      status: 'pending', challenge: { value: 'proof', expiresAt: f.now() + 60 }, expiresAt: f.now() + 3600 };
+    assert.equal(await f.peer.insertKey(replacement, f.now(), b.authorization), 'ok');
+    assert.equal(await f.peer.activateKey(replacement.kid, replacement.enrollment, 'proof', f.now()), true);
+    assert.equal((await f.store.getKey(a.key.kid, a.agent.handle))?.status, 'expired');
+    const terminal = await f.store.getTransaction(tx.id);
+    assert.equal(terminal?.status, 'denied');
+    assert.equal(terminal?.reason, 'key_revoked');
+    assert.equal(terminal?.terminalAt, a.key.expiresAt);
+
+    // Bulk revocation names pending/active keys; an explicit individual revocation also covers this expired record.
+    assert.equal(await f.store.revokeAllKeys(a.agent.handle, a.authorization, f.now()), true);
+    assert.equal(await f.peer.wasRevoked(a.agent.handle, a.key.kid), false);
+    await f.advance(300);
+    assert.equal(await f.peer.readTransaction(tx.id, { now: f.now(), retainFor: 300 }), undefined);
+    const revoked = await f.store.revokeKey(a.key.kid, a.key.enrollment, f.now());
+    assert.equal(revoked?.status, 'revoked');
+    assert.equal(revoked?.enrollment, a.key.enrollment);
+    assert.equal(await f.peer.wasRevoked(a.agent.handle, a.key.kid), true);
+    assert.equal(await f.peer.wasRevoked(b.agent.handle, a.key.kid), false);
+    assert.deepEqual(await f.peer.getTransaction(tx.id), terminal, 'revocation cannot restart the terminal retention window');
+    assert.equal(await f.peer.readTransaction(tx.id, { now: f.now(), retainFor: 300 }), undefined);
+    assert.equal((await f.peer.getKey(a.key.kid, b.agent.handle))?.status, 'active');
+    assert.equal((await f.peer.getKey(a.key.kid, b.agent.handle))?.enrollment, replacement.enrollment);
+    assert.equal(await f.store.insertKey({ ...replacement, handle: a.agent.handle, agentSub: a.agent.sub,
+      enrollment: 'revoked-reuse', challenge: { value: 'reuse', expiresAt: f.now() + 60 } }, f.now(), a.authorization), 'revoked');
   });
 
   check('revoking or deleting an unproved enrollment cannot affect another Agent using the same key', async (f) => {

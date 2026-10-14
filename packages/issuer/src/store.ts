@@ -291,12 +291,12 @@ export interface Store {
    */
   activateKey(kid: string, enrollment: string, challenge: string, now: number, assertionWindow?: { notBefore: number; expiresAt: number }): Promise<boolean>;
   /**
-   * ATOMIC. A `pending` or `active` key becomes `revoked` and is remembered as revoked for its handle. Returns the
+   * ATOMIC. A `pending`, `active` or `expired` key becomes `revoked` and is remembered as revoked for its handle. Returns the
    * key when this call revoked it, nothing when there was nothing to revoke. Requires the same enrollment and
    * invalidates its transactions, codes and tokens in the same atomic operation.
    */
   revokeKey(kid: string, enrollment: string, now: number): Promise<AgentKey | undefined>;
-  /** ATOMIC. Revoke all keys and, for an Owner request, delegated credentials of the authorized Agent identity. */
+  /** ATOMIC. Revoke pending/active keys and, for an Owner request, delegated credentials of the authorized Agent identity. */
   revokeAllKeys(handle: string, authorization: ManagementAuthorization, now: number): Promise<boolean>;
   /** ATOMIC. Changes the label or permissions of this enrollment without touching its status. */
   patchKey(kid: string, enrollment: string, patch: { name?: string; shareOwner?: boolean }): Promise<AgentKey | undefined>;
@@ -610,7 +610,8 @@ export class StoreState implements SyncStore {
   }
   revokeKey(kid: string, enrollment: string, now: number) {
     const k = this.enrollmentKey(kid, enrollment);
-    if (!k || (k.status !== 'pending' && k.status !== 'active')) return undefined;
+    // Individual revocation also forbids reuse after expiry, including an enrollment retired by another Agent.
+    if (!k || k.status === 'revoked') return undefined;
     k.status = 'revoked';
     k.revokedAt = now;
     k.challenge = undefined;
@@ -620,7 +621,7 @@ export class StoreState implements SyncStore {
   }
   revokeAllKeys(handle: string, authorization: ManagementAuthorization, now: number) {
     if (!this.managementCurrent(handle, authorization)) return false;
-    for (const k of this.keys.values()) if (k.handle === handle && k.agentSub === authorization.agentSub) this.revokeKey(k.kid, k.enrollment, now);
+    for (const k of this.keys.values()) if (k.handle === handle && k.agentSub === authorization.agentSub && (k.status === 'pending' || k.status === 'active')) this.revokeKey(k.kid, k.enrollment, now);
     if (authorization.kind === 'owner') for (const [hash, c] of this.credentials) if (c.handle === handle && c.kind === 'delegated') this.credentials.delete(hash);
     return true;
   }

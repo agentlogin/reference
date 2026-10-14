@@ -252,7 +252,8 @@ export class PostgresStore implements Store {
     return this.db.mutate('revokeKey', async (s) => {
       await this.subjectQuotas(s, { kid, keyEnrollment: enrollment });
       const key = await this.one<AgentKey>(s, 'keys', 'kid=$1 AND enrollment=$2', [kid, enrollment]);
-      if (!key || !['active','pending'].includes(key.status)) return undefined;
+      // An explicit revocation must record the reuse ban even after another activation retired this enrollment.
+      if (!key || key.status === 'revoked') return undefined;
       const now = await s.now();
       const revoked: AgentKey = { ...key, status: 'revoked', revokedAt: now, challenge: undefined };
       await this.replace(s, 'keys', 'enrollment', enrollment, revoked);

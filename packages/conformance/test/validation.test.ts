@@ -148,8 +148,27 @@ test('single-use continuation errors retain the terminal status and its required
       ...['/relative', 'https://attacker.example/continue', `${url}#fragment`, 'https://user:password@issuer.example/continue', 'http://issuer.example/continue'].map((url) => ({ next: { ...body.next, url } })),
     ]) assert.equal(singleUseContinueError({ ...body, ...mutation }, status, endpoint), false, JSON.stringify(mutation));
   }
-  assert.equal(singleUseContinueError({ error: 'transaction_expired', status: 'completed', next: { action: 'none' } }, 'completed'), true);
-  assert.equal(singleUseContinueError({ error: 'transaction_expired', status: 'completed', next: { action: 'none', url } }, 'completed'), false);
+});
+
+test('completed continuation errors permit well-formed optional next method and URL members', () => {
+  const url = 'https://issuer.example/transactions/txn';
+  const body = { error: 'transaction_expired', status: 'completed', next: { action: 'none' } };
+  for (const optional of [{}, { method: 'GET' }, { method: 'POST' }, { method: 'CUSTOM-METHOD' }, { url }, { method: 'GET', url },
+    { url: `${url}#fragment` }, { url: 'https://user:password@issuer.example/transactions/txn' }]) {
+    assert.equal(singleUseContinueError({ ...body, next: { ...body.next, ...optional } }, 'completed'), true, JSON.stringify(optional));
+  }
+  assert.equal(singleUseContinueError({ ...body, next: { ...body.next, url } }, 'completed', 'https://other.example/transactions'), true, 'action none does not require a same-origin URL');
+  const local = { ...body, next: { ...body.next, method: 'GET', url: 'http://127.0.0.1:4321/transactions/txn' } };
+  assert.equal(singleUseContinueError(local, 'completed', 'http://127.0.0.1:4321/transactions'), true);
+  assert.equal(singleUseContinueError(local, 'completed', 'http://127.0.0.1:4322/transactions'), false);
+  assert.equal(singleUseContinueError(local, 'completed', 'https://issuer.example/transactions'), false);
+  for (const mutation of [
+    { error: undefined }, { error: 'invalid_transaction' }, { status: undefined }, { status: 'denied' }, { status: 'expired' },
+    { next: undefined }, { next: null }, { next: [] }, { next: {} }, { next: { action: 'continue', method: 'GET', url } },
+    ...[null, 1, true, {}, [], '', 'GET POST', 'GET\r\n'].map((method) => ({ next: { ...body.next, method } })),
+    ...[null, 1, true, {}, [], '', '/relative', 'http://issuer.example/transactions/txn', 'http://127.0.0.1/transactions/txn',
+      'javascript:alert(1)'].map((url) => ({ next: { ...body.next, url } })),
+  ]) assert.equal(singleUseContinueError({ ...body, ...mutation }, 'completed'), false, JSON.stringify(mutation));
 });
 
 test('concurrent redemption permits zero or one success, but never two successes or tokens in an error', () => {

@@ -7,7 +7,7 @@ import { serve } from '@hono/node-server';
 import { createIssuer } from '../../issuer/src/index.js';
 import { runConformance } from '../src/index.js';
 
-type Mode = 'single-use' | 'single-use-rotated-url' | 'repeatable' | 'malformed' | 'missing-terminal-state' |
+type Mode = 'single-use' | 'single-use-rotated-url' | 'completed-next-fields' | 'repeatable' | 'malformed' | 'missing-terminal-state' |
   'duplicate-state' | 'duplicate-iss' | 'duplicate-error' | 'duplicate-error_description' | 'duplicate-error_uri';
 
 async function alternativeIssuer(mode: Mode) {
@@ -21,7 +21,7 @@ async function alternativeIssuer(mode: Mode) {
   const consumedErrors = new Map<string, string>();
   const rotatedContinues = new Map<string, string>();
   const redeemed = new Map<string, string>();
-  const observed = { loopbackRefusals: 0, repeatedErrors: 0, replays: 0 };
+  const observed = { loopbackRefusals: 0, repeatedErrors: 0, completedNextFields: 0, replays: 0 };
   const json = (body: unknown, status: number, extra: Record<string, string> = {}) => Response.json(body, {
     status, headers: { 'cache-control': 'no-store', pragma: 'no-cache', ...extra },
   });
@@ -87,6 +87,14 @@ async function alternativeIssuer(mode: Mode) {
       } finally { release(); }
     }
     const response = await app.fetch(request);
+    if (mode === 'completed-next-fields' && url.pathname.includes('/continue/') && response.status === 410) {
+      const body = await response.clone().json() as { status?: string; next?: { action?: string } };
+      if (body.status === 'completed' && body.next?.action === 'none') {
+        observed.completedNextFields += 1;
+        // These optional members describe no action and are never followed by the harness.
+        return json({ ...body, next: { ...body.next, method: 'GET', url: request.url } }, 410);
+      }
+    }
     if (url.pathname === '/register' && response.status === 201) {
       const registration = await response.clone().json() as { client_id: string; redirect_uris: string[] };
       registrations.set(registration.client_id, registration.redirect_uris);
@@ -101,13 +109,14 @@ async function alternativeIssuer(mode: Mode) {
   return { issuer, observed, close: () => new Promise<void>((resolve) => server.close(() => resolve())) };
 }
 
-for (const mode of ['single-use', 'single-use-rotated-url', 'repeatable'] as const) test(`optional behavior stays optional with ${mode} denied continuations`, async () => {
+for (const mode of ['single-use', 'single-use-rotated-url', 'completed-next-fields', 'repeatable'] as const) test(`optional behavior stays optional with ${mode} continuations`, async () => {
   const fixture = await alternativeIssuer(mode);
   try {
     const report = await runConformance({ issuer: fixture.issuer, adminToken: 'admin' });
     assert.equal(report.failed, 0, report.results.filter((r) => r.outcome === 'fail').map((r) => `${r.id}: ${r.detail}`).join('\n'));
     assert.ok(fixture.observed.loopbackRefusals >= 2, 'the harness actually tried different IPv4 and IPv6 ports');
     assert.ok(fixture.observed.repeatedErrors > 0, 'the harness actually repeated a denied continuation');
+    if (mode === 'completed-next-fields') assert.ok(fixture.observed.completedNextFields > 0, 'the harness actually received optional next members after completion');
     assert.ok(fixture.observed.replays > 0, 'the harness actually replayed a successful redemption');
     assert.equal(report.results.find((r) => r.id === 'I-17')?.outcome, 'pass');
     assert.equal(report.results.find((r) => r.id === 'I-40')?.outcome, 'pass');

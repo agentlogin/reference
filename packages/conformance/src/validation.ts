@@ -104,13 +104,19 @@ export function singleUseContinueError(body: unknown, status: 'completed' | 'den
   const fields = body as Record<string, unknown>;
   if (fields.error !== 'transaction_expired' || fields.status !== status || !fields.next || typeof fields.next !== 'object' || Array.isArray(fields.next)) return false;
   const next = fields.next as Record<string, unknown>;
-  if (status === 'completed') return next.action === 'none' && next.method === undefined && next.url === undefined;
-  if (next.action !== 'continue' || next.method !== 'GET' || typeof next.url !== 'string' || !URL.canParse(next.url) || !transactionEndpoint) return false;
+  if (status === 'completed') {
+    // Section 6.1 makes method and url optional for action none, rather than prohibiting them.
+    if (next.action !== 'none' || (next.method !== undefined && (typeof next.method !== 'string' || !/^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/.test(next.method)))) return false;
+    if (next.url === undefined) return true;
+  } else if (next.action !== 'continue' || next.method !== 'GET' || !transactionEndpoint) return false;
+  if (typeof next.url !== 'string' || !URL.canParse(next.url)) return false;
   const url = new URL(next.url);
-  const endpoint = new URL(transactionEndpoint);
-  const local = endpoint.protocol === 'http:' && (endpoint.hostname === 'localhost' || endpoint.hostname === '[::1]' || /^127\.(?:\d{1,3}\.){2}\d{1,3}$/.test(endpoint.hostname));
+  const endpoint = transactionEndpoint ? new URL(transactionEndpoint) : undefined;
+  const local = endpoint?.protocol === 'http:' && url.origin === endpoint.origin && (endpoint.hostname === 'localhost' || endpoint.hostname === '[::1]' || /^127\.(?:\d{1,3}\.){2}\d{1,3}$/.test(endpoint.hostname));
+  // The optional URL for action none is never followed; Section 6.1 only requires absolute HTTPS.
+  if (status === 'completed') return url.protocol === 'https:' || local;
   // The current continue URL may rotate; do not impose URL stability or a path layout on the issuer.
-  return url.origin === endpoint.origin && (url.protocol === 'https:' || local) && !url.username && !url.password && !url.hash;
+  return url.origin === endpoint?.origin && (url.protocol === 'https:' || local) && !url.username && !url.password && !url.hash;
 }
 
 /** Section 5.6 requires at most one success: replay detection may invalidate even the first request before delivery. */
