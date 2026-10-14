@@ -77,7 +77,7 @@ for (const backend of ['memory', 'sqlite'] as const) {
     const key = await w.newKey();
     const { en } = await w.enroll(agent.handle, key);
     assert.equal(en.status, 201, en.text);
-    after('getKey', async () => {
+    after('readManagementKeys', async () => {
       await proveOnSecond(w, agent.handle, key, en);
       w.advance(DEFAULT_CONSTANTS.T_ASSERT);
     });
@@ -99,7 +99,7 @@ for (const backend of ['memory', 'sqlite'] as const) {
       assert.equal(original.en.status, 201, original.en.text);
       const firstEnrollment = (await secondStore.getKey(key.kid, agent.handle))!.enrollment;
       let replacementEnrollment = '';
-      after('getKey', async () => {
+      after('readManagementKeys', async () => {
         w.advance(DEFAULT_CONSTANTS.T_ASSERT);
         const replacement = await other('POST', `/agents/${encodeURIComponent(agent.handle)}/keys`, {
           json: { jwk: key.jwk, name: 'replacement' }, headers: w.cred,
@@ -153,7 +153,7 @@ for (const backend of ['memory', 'sqlite'] as const) {
     assert.equal(newOwner.status, 201);
     const key = await w.newKey();
     let changed = false;
-    after('getAgent', async () => {
+    after('resolveManagement', async () => {
       assert.equal((await other('DELETE', `/admin/agents/${encodeURIComponent(handle)}`, { headers: w.admin })).status, 204);
       assert.equal((await other('POST', '/admin/agents', { json: { handle, owner_id: newOwner.json.owner_id }, headers: w.admin })).status, 201);
       changed = true;
@@ -219,7 +219,7 @@ for (const backend of ['memory', 'sqlite'] as const) {
     assert.equal(newOwner.status, 201);
     assert.equal((await other('POST', '/admin/agents', { json: { handle, owner_id: newOwner.json.owner_id }, headers: w.admin })).status, 201);
     let newEnrollment = '';
-    after('getKey', async () => {
+    after('readManagementKeys', async () => {
       w.advance(51);
       const fresh = await other('POST', `/agents/${encodeURIComponent(handle)}/keys`, {
         json: { jwk: oldAgent.jwk }, headers: { authorization: `Bearer ${newOwner.json.credential}` },

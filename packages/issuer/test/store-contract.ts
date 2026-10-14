@@ -123,6 +123,61 @@ export function registerStoreContract(name: string, factory: StoreContractFactor
     assert.equal((await f.store.getTransaction(tx.id))?.nonce, tx.nonce);
   });
 
+  check('management snapshots and individual key mutations reject revoked credentials and permission downgrades', async (f) => {
+    const a = await subject(f); const b = await subject(f, 'second'); const c = await client(f);
+    await complete(f, await ready(f, c, a, 'management-account'));
+    const credential = { hash: hash('delegated'), ownerId: a.owner.id, kind: 'delegated' as const, handle: a.agent.handle, createdAt: f.now() };
+    await f.store.putCredential(credential);
+    assert.equal(await f.peer.resolveManagement('missing', a.agent.handle), 'invalid_token');
+    assert.equal(await f.peer.resolveManagement(credential.hash, b.agent.handle), 'not_found');
+    const authorization = await f.peer.resolveManagement(credential.hash, a.agent.handle);
+    assert.ok(typeof authorization !== 'string');
+    assert.equal(authorization.agentSub, a.agent.sub);
+    assert.equal((await f.peer.readManagementKeys(a.agent.handle, authorization, a.key.kid))?.[0]?.enrollment, a.key.enrollment);
+    assert.equal((await f.peer.readManagementAccounts(a.agent.handle, authorization))?.[0]?.clientId, c.clientId);
+    assert.equal(await f.peer.readManagementKeys(b.agent.handle, authorization), undefined);
+    assert.deepEqual(await f.peer.readManagementKeys(a.agent.handle, authorization, 'unknown-key'), []);
+    assert.equal(await f.store.patchKey(a.key.kid, a.key.enrollment, { shareOwner: true }, authorization), undefined, 'delegated credentials never grant Owner disclosure');
+    await f.peer.deleteCredential(credential.hash);
+    assert.equal(await f.store.resolveManagement(credential.hash, a.agent.handle), 'invalid_token');
+    assert.equal(await f.store.readManagementKeys(a.agent.handle, authorization), undefined);
+    assert.equal(await f.store.readManagementAccounts(a.agent.handle, authorization), undefined);
+    assert.equal(await f.store.patchKey(a.key.kid, a.key.enrollment, { name: 'stale' }, authorization), undefined);
+    assert.equal(await f.store.revokeKey(a.key.kid, a.key.enrollment, f.now(), authorization), undefined);
+    assert.deepEqual(await f.peer.getKey(a.key.kid, a.agent.handle), a.key);
+
+    await f.peer.putCredential({ ...a.authorization, sessionAuth: 'email_only' });
+    assert.equal(await f.store.patchKey(a.key.kid, a.key.enrollment, { shareOwner: true }, a.authorization), undefined);
+    assert.equal(await f.store.readManagementKeys(a.agent.handle, a.authorization), undefined, 'changed session authorization invalidates the old snapshot');
+    const weaker = await f.store.resolveManagement(a.authorization.hash, a.agent.handle);
+    assert.ok(typeof weaker !== 'string');
+    assert.equal(await f.store.patchKey(a.key.kid, a.key.enrollment, { shareOwner: true }, weaker), undefined);
+    assert.equal((await f.store.patchKey(a.key.kid, a.key.enrollment, { name: 'fresh' }, weaker))?.name, 'fresh');
+    assert.equal((await f.store.revokeKey(a.key.kid, a.key.enrollment, f.now(), weaker))?.status, 'revoked');
+    assert.equal((await f.store.revokeKey(a.key.kid, a.key.enrollment, f.now(), weaker))?.status, 'revoked', 'an authorized repeat remains idempotent');
+  });
+
+  check('management authorization cannot be rebound across Agent replacement even under the same Owner', async (f) => {
+    const a = await subject(f);
+    const authorization = await f.store.resolveManagement(a.authorization.hash, a.agent.handle);
+    assert.ok(typeof authorization !== 'string');
+    assert.equal(await f.peer.deleteAgent(a.agent.handle, a.agent.sub, f.now()), true);
+    const replacement = { ...a.agent, sub: 'replacement-identity' };
+    assert.equal(await f.peer.putAgent(replacement), true);
+    const fresh = await f.peer.resolveManagement(a.authorization.hash, a.agent.handle);
+    assert.ok(typeof fresh !== 'string');
+    assert.equal(fresh.agentSub, replacement.sub);
+    const key: AgentKey = { ...a.key, kid: hash('replacement-management-key'), agentSub: replacement.sub,
+      enrollment: 'replacement-management-enrollment', status: 'pending', challenge: { value: 'proof', expiresAt: f.now() + 60 } };
+    assert.equal(await f.peer.insertKey(key, f.now(), fresh), 'ok');
+    assert.equal(await f.store.readManagementKeys(a.agent.handle, authorization), undefined);
+    assert.equal(await f.store.readManagementAccounts(a.agent.handle, authorization), undefined);
+    assert.equal(await f.store.patchKey(key.kid, key.enrollment, { name: 'stale' }, authorization), undefined);
+    assert.equal(await f.store.revokeKey(key.kid, key.enrollment, f.now(), authorization), undefined);
+    assert.deepEqual(await f.peer.getKey(key.kid, a.agent.handle), key);
+    assert.equal((await f.store.readManagementKeys(a.agent.handle, fresh))?.[0]?.enrollment, key.enrollment);
+  });
+
   check('pending public keys do not reserve exclusivity and concurrent proofs activate only one Agent', async (f) => {
     const a = await subject(f); const b = await subject(f, 'second');
     const kid = hash('shared-unproved-key');

@@ -36,7 +36,8 @@ transaction or grant `share_owner` (Sections 6.6, 7.8); a caller that omits it g
 credential with no recorded session does not qualify either. `owner_verified_via` reports the strongest method among
 `verified_via` and the sessions stated (7.5). All with `Authorization: Bearer ADMIN_TOKEN`.
 
-Status: passes every check of `@agentlogin/conformance` (`npm test`). Not yet implemented: Ed25519 agent keys,
+Status: passes the automated probes in `@agentlogin/conformance` (`npm test`); the report keeps evidence gaps,
+including unverified entropy generation, explicit. Not yet implemented: Ed25519 agent keys,
 `private_key_jwt`, rate limits (6.7), Owner authentication by passkey, OIDC or domain (credentials from such sessions
 are issued by the bootstrap API on the operator's word) and the HTML pages for Owner sign-in and approval,
 Relay profile (8), the `pairwise` subject type. Development mode (`INSECURE_DEV=1`, or an
@@ -48,6 +49,7 @@ must commit the full transition, including its preconditions and effects, in one
 | Operation | Atomic guarantee |
 | --- | --- |
 | `putAgent` | Insert only when the handle is absent; an existing identity is never overwritten |
+| `resolveManagement`, `readManagementKeys`, `readManagementAccounts` | Read the credential, immutable Agent identity and protected resources in one snapshot; reject stale authorization |
 | `insertKey` | The credential, Owner and immutable Agent subject still match the authorization; enforce Agent-scoped pending uniqueness and revocation history |
 | `activateKey`, `patchKey`, `revokeKey` | Match the exact enrollment; activation rechecks the proof window and claims global active-key exclusivity; revocation also denies transactions and invalidates codes and tokens |
 | `updateTransaction` | Compare the open transaction version, check subject identity, disable versions, assertion expiry and consent reliance, and commit cap admission, reservation and consent effects together |
@@ -64,6 +66,12 @@ issuance bounds, including when lock contention moves the database's issuance ti
 
 Agent subjects never change or transfer to a replacement at the same handle. Keys remember the authorizing subject;
 transactions, codes and access tokens retain that subject, their key enrollment, and Agent/Account disable versions.
+Management authorization resolves the credential and Agent together. Protected reads validate that authorization
+with the returned records; protocol key mutations revalidate the credential, session permissions and Agent identity
+inside the write. A delegated request cannot acquire a replacement Agent's identity after its credential was deleted.
+The optional authorization arguments of `patchKey` and `revokeKey` are mandatory for protocol callers; omission is
+reserved for trusted internal lifecycle operations. Custom adapters must implement the three management snapshot
+methods and honor these mutation preconditions; the stored format does not change.
 Unproved pending enrollments are scoped to the Agent: an attacker knowing only a public key cannot reserve it
 against another Agent. Only successful proof activation claims the one active enrollment for that key across the
 issuer. Conflicting valid proofs fail with `400 invalid_request`; other enrollments remain untouched. Store callers

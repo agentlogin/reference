@@ -7,7 +7,7 @@ import {
   type ManagementAuthorization, type TransitionEffects, type InsertKeyResult, type RedeemResult,
   type DenyReason,
 } from '@agentlogin/issuer';
-import type { TableName } from './schema.js';
+import { identifier, type TableName } from './schema.js';
 import { PgDatabase, type PgOptions, type PgSession } from './runtime.js';
 
 export interface PostgresStoreOptions extends PgOptions {
@@ -88,6 +88,46 @@ export class PostgresStore implements Store {
   listAgentsByOwner(ownerId: string) { return this.list<Agent>('agents', 'owner_id=$1', [ownerId]); }
   putCredential(c: Credential) { return this.put('putCredential', 'credentials', 'hash', c.hash, c); }
   getCredential(hash: string) { return this.get<Credential>('credentials', 'hash=$1', [hash]); }
+  /** Credential and immutable Agent identity must come from the same statement snapshot. */
+  resolveManagement(hash: string, handle: string): Promise<ManagementAuthorization | 'invalid_token' | 'not_found'> {
+    return this.db.read(async (s) => {
+      const row = (await s.query<{ credential: Credential; agent_sub: string | null }>(
+        `SELECT c.data AS credential,a.sub AS agent_sub FROM ${s.table('credentials')} c
+         LEFT JOIN ${s.table('agents')} a ON a.handle=$2 AND a.owner_id=c.owner_id
+           AND (c.kind='owner' OR c.handle=$2) WHERE c.hash=$1`, [hash,handle],
+      )).rows[0];
+      await s.checkpoint('management_resolved');
+      if (!row) return 'invalid_token';
+      if (row.agent_sub === null) return 'not_found';
+      return { ...row.credential,agentSub:row.agent_sub };
+    });
+  }
+  private managementQuery(s: PgSession) {
+    return `SELECT a.handle,a.sub FROM ${s.table('agents')} a JOIN ${s.table('credentials')} c
+      ON c.hash=$2 AND c.owner_id=a.owner_id AND c.kind=$4
+      AND c.handle IS NOT DISTINCT FROM $6::text AND c.data->>'sessionAuth' IS NOT DISTINCT FROM $7::text
+      AND c.data->>'createdAt'=$8::text
+      WHERE a.handle=$1 AND a.sub=$3 AND a.owner_id=$5 AND (c.kind='owner' OR c.handle=a.handle)`;
+  }
+  private managementValues(handle: string, auth: ManagementAuthorization): unknown[] {
+    return [handle,auth.hash,auth.agentSub,auth.kind,auth.ownerId,auth.handle ?? null,auth.sessionAuth ?? null,auth.createdAt];
+  }
+  /** A valid authorization with no resources returns []; an obsolete authorization returns undefined. */
+  private readManagement<T>(table: 'keys' | 'accounts', handle: string, authorization: ManagementAuthorization, kid?: string): Promise<T[] | undefined> {
+    const auth = clone(authorization);
+    return this.db.read(async (s) => {
+      const values = this.managementValues(handle,auth);
+      if (table === 'keys') values.push(kid ?? null);
+      const row = (await s.query<{ records: T[] }>(`WITH authorized AS (${this.managementQuery(s)})
+        SELECT COALESCE(jsonb_agg(r.data) FILTER (WHERE r.data IS NOT NULL),'[]'::jsonb) AS records
+        FROM authorized a LEFT JOIN ${s.table(table)} r ON r.agent_sub=a.sub AND r.handle=a.handle
+          ${table === 'keys' ? 'AND ($9::text IS NULL OR r.kid=$9)' : ''} GROUP BY a.sub`, values)).rows[0];
+      await s.checkpoint(`management_${table}_read`);
+      return row?.records;
+    });
+  }
+  readManagementKeys(handle: string, authorization: ManagementAuthorization, kid?: string) { return this.readManagement<AgentKey>('keys',handle,authorization,kid); }
+  readManagementAccounts(handle: string, authorization: ManagementAuthorization) { return this.readManagement<Account>('accounts',handle,authorization); }
   listCredentials(f: { ownerId?: string; handle?: string; kind?: 'owner' | 'delegated' }) {
     const values: unknown[] = [];
     const columns = { ownerId: 'owner_id', handle: 'handle', kind: 'kind' };
@@ -137,9 +177,7 @@ export class PostgresStore implements Store {
     for (const p of pairs.rows) await this.quota(s, p.owner_id, p.client_id);
   }
   private async authorized(s: PgSession, handle: string, auth: ManagementAuthorization) {
-    const a = await this.one<Agent>(s, 'agents', 'handle=$1', [handle]);
-    const c = await this.one<Credential>(s, 'credentials', 'hash=$1', [auth.hash]);
-    return a?.sub === auth.agentSub && a.ownerId === auth.ownerId && c?.ownerId === auth.ownerId && c.kind === auth.kind && (c.kind === 'owner' || c.handle === handle);
+    return (await s.query(this.managementQuery(s),this.managementValues(handle,auth))).rowCount === 1;
   }
   private async subject(s: PgSession, t: Partial<Subject>, now: number): Promise<'key_revoked' | 'access_denied' | undefined> {
     const k = t.kid ? await this.one<AgentKey>(s, 'keys', 'kid=$1 AND enrollment=$2 AND handle=$3', [t.kid,t.keyEnrollment,t.handle]) : undefined;
@@ -248,12 +286,16 @@ export class PostgresStore implements Store {
       throw error;
     });
   }
-  revokeKey(kid: string, enrollment: string, _now: number) {
+  revokeKey(kid: string, enrollment: string, _now: number, authorization?: ManagementAuthorization) {
+    const auth = authorization && clone(authorization);
     return this.db.mutate('revokeKey', async (s) => {
       await this.subjectQuotas(s, { kid, keyEnrollment: enrollment });
       const key = await this.one<AgentKey>(s, 'keys', 'kid=$1 AND enrollment=$2', [kid, enrollment]);
       // An explicit revocation must record the reuse ban even after another activation retired this enrollment.
-      if (!key || key.status === 'revoked') return undefined;
+      if (!key) return undefined;
+      if (auth && (key.agentSub !== auth.agentSub || !await this.authorized(s,key.handle,auth))) return undefined;
+      if (key.status === 'revoked') return auth ? key : undefined;
+      await s.checkpoint('management_key_authorized');
       const now = await s.now();
       const revoked: AgentKey = { ...key, status: 'revoked', revokedAt: now, challenge: undefined };
       await this.replace(s, 'keys', 'enrollment', enrollment, revoked);
@@ -277,10 +319,14 @@ export class PostgresStore implements Store {
       return true;
     });
   }
-  patchKey(kid: string, enrollment: string, patch: { name?: string; shareOwner?: boolean }) {
+  patchKey(kid: string, enrollment: string, input: { name?: string; shareOwner?: boolean }, authorization?: ManagementAuthorization) {
+    const patch = clone(input), auth = authorization && clone(authorization);
     return this.db.mutate('patchKey', async (s) => {
       const key = await this.one<AgentKey>(s, 'keys', 'kid=$1 AND enrollment=$2', [kid,enrollment]);
       if (!key) return undefined;
+      if (auth && (key.agentSub !== auth.agentSub || !await this.authorized(s,key.handle,auth))) return undefined;
+      if (auth && patch.shareOwner !== undefined && (auth.kind !== 'owner' || !['passkey','oidc','domain','email_factor'].includes(auth.sessionAuth ?? ''))) return undefined;
+      await s.checkpoint('management_key_authorized');
       if (patch.name !== undefined) key.name = patch.name;
       if (patch.shareOwner !== undefined) key.permissions.share_owner = patch.shareOwner;
       await this.replace(s, 'keys', 'enrollment', enrollment, key);
@@ -309,7 +355,7 @@ export class PostgresStore implements Store {
   /** One read-only SQL snapshot computes lifecycle status; polling never writes or renews retention. */
   readTransaction(id: string, options: { now: number; retainFor: number }): Promise<Transaction | undefined> {
     return this.db.read(async (s) => {
-      const result = await s.query<DataRow<Transaction>>(`WITH clock AS MATERIALIZED (SELECT ${this.db.schema}.app_now()::bigint AS now),
+      const result = await s.query<DataRow<Transaction>>(`WITH clock AS MATERIALIZED (SELECT ${identifier(this.db.schema)}.app_now()::bigint AS now),
       facts AS (SELECT t.data,t.status,t.expires_at,t.terminal_at,c.now,
         CASE WHEN k.enrollment=t.key_enrollment AND k.agent_sub=t.agent_sub AND k.status<>'pending' THEN k.expires_at ELSE 9223372036854775807 END AS key_expiry,
         CASE WHEN t.kid IS NULL THEN NULL

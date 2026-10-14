@@ -53,6 +53,11 @@ from this list have no dedicated probes.
 Optional behavior is not required to pass: I-40 accepts either an exact-match-only policy or the permitted port
 exception for registered loopback IP redirects, while rejecting other URI differences. I-17 accepts repeatable or
 single-use denied continuations. Both checks still validate the returned protocol response.
+Assertion probes use the advertised assertion URL, and continue probes accept valid URLs that rotate between
+responses or carry their secret in a query. I-43 follows the latest released URL with the releasing credential
+and verifies continuation reuse rules. I-9 checks the capacity of visible identifier and token encodings and
+anonymous credential disclosure separately from entropy generation, which reports skip: encoded length cannot
+prove randomness, and the protocol does not prescribe where or how a continue URL encodes its secret.
 
 The concurrent code-redemption check requires a fresh sequential exchange to succeed and permits at most one
 successful concurrent response. Replay detection may invalidate the first request before it returns tokens, so

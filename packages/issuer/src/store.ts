@@ -270,6 +270,11 @@ export interface Store {
   getCredential(hash: string): Promise<Credential | undefined>;
   listCredentials(filter: { ownerId?: string; handle?: string; kind?: 'owner' | 'delegated' }): Promise<Credential[]>;
   deleteCredential(hash: string): Promise<void>;
+  /** Read the credential and current Agent in one snapshot; never derive a new identity from a stale credential. */
+  resolveManagement(hash: string, handle: string): Promise<ManagementAuthorization | 'invalid_token' | 'not_found'>;
+  /** Protected reads validate the supplied authorization and return resources from the same snapshot. */
+  readManagementKeys(handle: string, authorization: ManagementAuthorization, kid?: string): Promise<AgentKey[] | undefined>;
+  readManagementAccounts(handle: string, authorization: ManagementAuthorization): Promise<Account[] | undefined>;
 
   // ---- keys (Section 7) ----
   /** Lookup is scoped to the current Agent at handle. Legacy unscoped lookup returns the active or sole record; ambiguous pending records return undefined. */
@@ -292,14 +297,15 @@ export interface Store {
   activateKey(kid: string, enrollment: string, challenge: string, now: number, assertionWindow?: { notBefore: number; expiresAt: number }): Promise<boolean>;
   /**
    * ATOMIC. A `pending`, `active` or `expired` key becomes `revoked` and is remembered as revoked for its handle. Returns the
-   * key when this call revoked it, nothing when there was nothing to revoke. Requires the same enrollment and
-   * invalidates its transactions, codes and tokens in the same atomic operation.
+   * key when this call revoked it (or an authorized repeat finds it already revoked), otherwise nothing. Requires the same enrollment and
+   * invalidates its transactions, codes and tokens in the same atomic operation. Protocol callers supply authorization,
+   * which is revalidated with the enrollment; omission is reserved for trusted internal lifecycle operations.
    */
-  revokeKey(kid: string, enrollment: string, now: number): Promise<AgentKey | undefined>;
+  revokeKey(kid: string, enrollment: string, now: number, authorization?: ManagementAuthorization): Promise<AgentKey | undefined>;
   /** ATOMIC. Revoke pending/active keys and, for an Owner request, delegated credentials of the authorized Agent identity. */
   revokeAllKeys(handle: string, authorization: ManagementAuthorization, now: number): Promise<boolean>;
-  /** ATOMIC. Changes the label or permissions of this enrollment without touching its status. */
-  patchKey(kid: string, enrollment: string, patch: { name?: string; shareOwner?: boolean }): Promise<AgentKey | undefined>;
+  /** ATOMIC. Changes this enrollment, validating authorization and permission when supplied by a protocol caller. */
+  patchKey(kid: string, enrollment: string, patch: { name?: string; shareOwner?: boolean }, authorization?: ManagementAuthorization): Promise<AgentKey | undefined>;
   /** Deletes the selected record, requiring enrollment when supplied. With pendingExpiredAt, deletes only a
    * still-pending challenge expired by that time; database adapters recheck their authoritative clock. */
   deleteKey(kid: string, enrollment?: string, pendingExpiredAt?: number): Promise<void>;
@@ -376,6 +382,9 @@ export const STORE_METHODS: readonly (keyof Store)[] = Object.freeze(Object.keys
   getCredential: true,
   listCredentials: true,
   deleteCredential: true,
+  resolveManagement: true,
+  readManagementKeys: true,
+  readManagementAccounts: true,
   getKey: true,
   listKeys: true,
   insertKey: true,
@@ -413,6 +422,7 @@ export const STORE_METHODS: readonly (keyof Store)[] = Object.freeze(Object.keys
 export const READ_METHODS: ReadonlySet<keyof Store> = new Set<keyof Store>([
   'currentTime', 'getOwner', 'getOwnerByEmail', 'getAgent', 'listAgentsByOwner', 'getCredential',
   'listCredentials', 'getKey', 'listKeys', 'wasRevoked', 'getClient', 'getTransaction', 'readTransaction',
+  'resolveManagement', 'readManagementKeys', 'readManagementAccounts',
   'listOpenTransactions', 'getCode', 'getAccessToken', 'getConsent', 'listConsents', 'getAccount',
   'listAccounts', 'signupsEver',
 ]);
@@ -522,7 +532,23 @@ export class StoreState implements SyncStore {
     const agent = this.agents.get(handle);
     const credential = this.credentials.get(auth.hash);
     return agent?.sub === auth.agentSub && agent.ownerId === auth.ownerId && credential?.ownerId === auth.ownerId &&
-      credential.kind === auth.kind && (credential.kind === 'owner' || credential.handle === handle);
+      credential.kind === auth.kind && credential.sessionAuth === auth.sessionAuth && credential.createdAt === auth.createdAt &&
+      credential.handle === auth.handle && (credential.kind === 'owner' || credential.handle === handle);
+  }
+  resolveManagement(hash: string, handle: string): ManagementAuthorization | 'invalid_token' | 'not_found' {
+    const credential = this.credentials.get(hash);
+    if (!credential) return 'invalid_token';
+    const agent = this.agents.get(handle);
+    if (!agent || agent.ownerId !== credential.ownerId || (credential.kind === 'delegated' && credential.handle !== handle)) return 'not_found';
+    return copy({ ...credential, agentSub: agent.sub });
+  }
+  readManagementKeys(handle: string, authorization: ManagementAuthorization, kid?: string) {
+    if (!this.managementCurrent(handle, authorization)) return undefined;
+    return copy([...this.keys.values()].filter((key) => key.agentSub === authorization.agentSub && key.handle === handle && (kid === undefined || key.kid === kid)));
+  }
+  readManagementAccounts(handle: string, authorization: ManagementAuthorization) {
+    if (!this.managementCurrent(handle, authorization)) return undefined;
+    return this.listAccounts(handle);
   }
   private invalidate(filter: SubjectFilter, reason: DenyReason, now: number) {
     for (const t of this.transactions.values()) if (!TERMINAL.has(t.status) && matches({ ...t, txnId: t.id }, filter)) {
@@ -608,10 +634,12 @@ export class StoreState implements SyncStore {
     k.challenge = undefined;
     return true;
   }
-  revokeKey(kid: string, enrollment: string, now: number) {
+  revokeKey(kid: string, enrollment: string, now: number, authorization?: ManagementAuthorization) {
     const k = this.enrollmentKey(kid, enrollment);
+    if (authorization && (!k || k.agentSub !== authorization.agentSub || !this.managementCurrent(k.handle, authorization))) return undefined;
     // Individual revocation also forbids reuse after expiry, including an enrollment retired by another Agent.
-    if (!k || k.status === 'revoked') return undefined;
+    if (!k) return undefined;
+    if (k.status === 'revoked') return authorization ? copy(k) : undefined;
     k.status = 'revoked';
     k.revokedAt = now;
     k.challenge = undefined;
@@ -625,9 +653,11 @@ export class StoreState implements SyncStore {
     if (authorization.kind === 'owner') for (const [hash, c] of this.credentials) if (c.handle === handle && c.kind === 'delegated') this.credentials.delete(hash);
     return true;
   }
-  patchKey(kid: string, enrollment: string, patch: { name?: string; shareOwner?: boolean }) {
+  patchKey(kid: string, enrollment: string, patch: { name?: string; shareOwner?: boolean }, authorization?: ManagementAuthorization) {
     const k = this.enrollmentKey(kid, enrollment);
     if (!k) return undefined;
+    if (authorization && (k.agentSub !== authorization.agentSub || !this.managementCurrent(k.handle, authorization) ||
+      (patch.shareOwner !== undefined && (authorization.kind !== 'owner' || !['passkey', 'oidc', 'domain', 'email_factor'].includes(authorization.sessionAuth ?? ''))))) return undefined;
     if (patch.name !== undefined) k.name = patch.name;
     if (patch.shareOwner !== undefined) k.permissions.share_owner = patch.shareOwner;
     return copy(k);

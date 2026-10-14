@@ -39,6 +39,26 @@ test('schema verification accepts only the matching installed migration version'
   assert.equal((await f.admin.query(`SELECT version FROM ${quote(f.schema)}.schema_migrations`)).rows[0].version, SCHEMA_VERSION + 1);
 });
 
+test('PostgreSQL lifecycle reads quote a reserved-word schema name', { skip: skipPostgres }, async (t) => {
+  const f = await fixture(t);
+  // The fixture requires an explicit test database. Never replace or drop an existing schema.
+  assert.equal((await f.admin.query("SELECT 1 FROM pg_namespace WHERE nspname='select'")).rowCount, 0, 'reserved-word schema regression requires an unused select schema');
+  const reserved = new PostgresStore({ pool: f.admin, schema: 'select' });
+  let created = false;
+  try {
+    await reserved.migrate();
+    created = true;
+    await reserved.db.verifySchema();
+    const now = await reserved.currentTime(0);
+    const tx = await pending(reserved, now, 'reserved-schema');
+    assert.deepEqual(await reserved.readTransaction(tx.id, { now, retainFor: 300 }), tx);
+    assert.equal(await reserved.readTransaction('unknown', { now, retainFor: 300 }), undefined);
+  } finally {
+    await reserved.close();
+    if (created) await f.admin.query('DROP SCHEMA "select" CASCADE');
+  }
+});
+
 test('schema version 2 upgrades existing key enrollments and their authorizations without loss', { skip: skipPostgres }, async (t) => {
   const f = await fixture(t);
   const subject = await prepareAgent(f.store, f.now(), 'existing');

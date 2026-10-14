@@ -88,7 +88,12 @@ export async function conformanceRun(store?: Store): Promise<void> {
     });
     for (const r of report.results) if (r.outcome !== 'pass') console.log(`${r.outcome.toUpperCase()} ${r.id} ${r.title}: ${r.detail ?? ''}`);
     assert.equal(report.failed, 0, `failed checks: ${report.results.filter((r) => r.outcome === 'fail').map((r) => `${r.id}: ${r.detail}`).join('\n')}`);
-    assert.equal(report.results.filter((r) => r.outcome === 'skip' && !r.title.includes('(SHOULD,')).length, 0, 'every mandatory probe ran; an advisory revocation probe may have no returned token to inspect');
+    const entropy = report.results.filter((r) => r.id === 'I-9' && r.title === 'Entropy generation for identifiers, challenges, tokens and continue URLs');
+    assert.equal(entropy.length, 1, 'the report identifies the entropy evidence gap once');
+    assert.equal(entropy[0]!.outcome, 'skip', 'black-box checks cannot prove random generation');
+    assert.equal(report.results.find((r) => r.id === 'I-9' && r.title.startsWith('Identifier and token encodings'))?.outcome, 'pass');
+    assert.equal(report.results.filter((r) => r.outcome === 'skip' && !r.title.includes('(SHOULD,') && r !== entropy[0]).length, 0,
+      'all automated mandatory probes ran; only unobservable entropy and unavailable advisory evidence may be skipped');
     assert.ok(report.passed >= 20, `only ${report.passed} checks passed`);
     for (let i = 38; i <= 49; i += 1) assert.equal(report.results.find((r) => r.id === `I-${i}`)?.outcome, 'pass', `I-${i}`);
   } finally {
@@ -97,4 +102,3 @@ export async function conformanceRun(store?: Store): Promise<void> {
     await relay.close();
   }
 }
-

@@ -99,6 +99,8 @@ Authoritative lifecycle checks remain necessary at later transitions and UserInf
 Background deletion never determines whether a credential is valid.
 
 Polling uses `READ COMMITTED READ ONLY` and computes effective status without writing.
+Management resolution and protected reads join the credential, Agent identity and requested records in one
+statement snapshot. Individual key mutations revalidate the retained authorization inside their serializable write.
 An unmaterialized expiry is exposed with its original expiry as terminal time, rather
 than restarting retention when a reader or later revocation first notices it. A raw
 transaction lookup is also available for compare-and-swap transitions.

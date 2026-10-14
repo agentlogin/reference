@@ -16,7 +16,7 @@ test('a stale account-list request cannot read a replacement Agent accounts', as
       ? (await w.req('POST', '/admin/owners', { headers: w.admin, json: { email: 'next-owner@example.org', name: 'Next Owner' } })).json
       : w.owner;
     let replacementClientId = '';
-    h.after('getAgent', async () => {
+    h.after('resolveManagement', async () => {
       assert.equal((await w.req('DELETE', `/admin/agents/${encodeURIComponent(handle)}`, { headers: w.admin })).status, 204);
       assert.equal((await w.req('POST', '/admin/agents', { headers: w.admin, json: { handle, owner_id: nextOwner.owner_id } })).status, 201);
       const key = await w.newKey();

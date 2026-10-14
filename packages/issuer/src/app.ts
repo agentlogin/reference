@@ -326,12 +326,12 @@ export function createIssuerApp(ctx: IssuerContext): Hono {
   app.get('/agents/:handle/keys', async (c) => {
     const handle = handleOf(c);
     const cred = await agents.authorizeManagement(ctx, c.req.header('authorization'), handle, true);
-    return c.json({ keys: (await agents.listLiveKeys(ctx, handle)).filter((k) => k.agentSub === cred.agentSub).map((k) => agents.keyRecord(ctx, k)) }, 200, NO_STORE);
+    return c.json({ keys: (await agents.listLiveKeys(ctx, handle, cred)).map((k) => agents.keyRecord(ctx, k)) }, 200, NO_STORE);
   });
   app.get('/agents/:handle/keys/:kid', async (c) => {
     const handle = handleOf(c);
     const cred = await agents.authorizeManagement(ctx, c.req.header('authorization'), handle, true);
-    const k = await agents.getLiveKey(ctx, (c.req.param('kid') ?? ''), handle);
+    const k = await agents.getLiveKey(ctx, (c.req.param('kid') ?? ''), handle, cred);
     if (!k || k.handle !== handle || k.agentSub !== cred.agentSub) throw new OAuthError(404, 'not_found');
     return c.json(agents.keyRecord(ctx, k), 200, NO_STORE);
   });
@@ -340,7 +340,7 @@ export function createIssuerApp(ctx: IssuerContext): Hono {
     const body = await jsonBody(c);
     const wantsPermissions = isPlainObject(body) && body.permissions !== undefined;
     const cred = await agents.authorizeManagement(ctx, c.req.header('authorization'), handle, !wantsPermissions);
-    const k = await agents.getLiveKey(ctx, (c.req.param('kid') ?? ''), handle);
+    const k = await agents.getLiveKey(ctx, (c.req.param('kid') ?? ''), handle, cred);
     if (!k || k.handle !== handle || k.agentSub !== cred.agentSub) throw new OAuthError(404, 'not_found');
     if (!isPlainObject(body)) throw new OAuthError(400, 'invalid_request');
     const patch: { name?: string; shareOwner?: boolean } = {};
@@ -352,16 +352,16 @@ export function createIssuerApp(ctx: IssuerContext): Hono {
     }
     if (typeof body.name === 'string') patch.name = body.name.slice(0, 200);
     // One atomic field update on this enrollment: it cannot bring back a key that is being revoked at the same time.
-    const patched = await ctx.store.patchKey(k.kid, k.enrollment, patch);
+    const patched = await ctx.store.patchKey(k.kid, k.enrollment, patch, cred);
     if (!patched) throw new OAuthError(404, 'not_found');
     return c.json(agents.keyRecord(ctx, patched), 200, NO_STORE);
   });
   app.delete('/agents/:handle/keys/:kid', async (c) => {
     const handle = handleOf(c);
     const cred = await agents.authorizeManagement(ctx, c.req.header('authorization'), handle, true);
-    const k = await agents.getLiveKey(ctx, (c.req.param('kid') ?? ''), handle);
+    const k = await agents.getLiveKey(ctx, (c.req.param('kid') ?? ''), handle, cred);
     if (!k || k.handle !== handle || k.agentSub !== cred.agentSub) throw new OAuthError(404, 'not_found');
-    await agents.revokeKeyEffects(ctx, k);
+    await agents.revokeKeyEffects(ctx, k, cred);
     return c.body(null, 204, NO_STORE);
   });
   app.delete('/agents/:handle/keys', async (c) => {
@@ -373,19 +373,15 @@ export function createIssuerApp(ctx: IssuerContext): Hono {
   app.get('/agents/:handle/accounts', async (c) => {
     const handle = handleOf(c);
     const cred = await agents.authorizeManagement(ctx, c.req.header('authorization'), handle, true);
-    const accounts = await ctx.store.listAccounts(handle);
-    // Account records belong to the immutable Agent, so a handle replacement during the read cannot disclose
-    // its new Owner's accounts to a request authorized for the previous Agent.
-    const current = await ctx.store.getAgent(handle);
-    if (!current || current.sub !== cred.agentSub || current.ownerId !== cred.ownerId) throw new OAuthError(404, 'not_found');
+    const accounts = await ctx.store.readManagementAccounts(handle, cred);
+    if (!accounts) throw new OAuthError(404, 'not_found');
     return c.json({ accounts: accounts.map(agents.accountRecord) }, 200, NO_STORE);
   });
   app.patch('/agents/:handle/accounts/:client_id', async (c) => {
     const handle = handleOf(c);
-    await agents.authorizeManagement(ctx, c.req.header('authorization'), handle, true);
+    const cred = await agents.authorizeManagement(ctx, c.req.header('authorization'), handle, true);
     const body = await jsonBody(c);
     if (!isPlainObject(body) || (body.status !== 'enabled' && body.status !== 'disabled')) throw new OAuthError(400, 'invalid_request', 'status must be enabled or disabled');
-    const cred = await agents.authorizeManagement(ctx, c.req.header('authorization'), handle, true);
     if (cred.kind === 'delegated' && body.status === 'enabled') throw new OAuthError(403, 'insufficient_permission', 'a Delegated Credential may only disable', { 'WWW-Authenticate': 'Bearer error="insufficient_scope"' });
     return c.json(await agents.setAccountStatus(ctx, handle, (c.req.param('client_id') ?? ''), body.status, cred), 200, NO_STORE);
   });

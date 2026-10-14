@@ -78,20 +78,36 @@ export class SqliteCallbackStateStore implements CallbackStateStore {
   }
 
   async register(key: string, expiresAt: number): Promise<boolean> {
-    const now = this.now();
-    checkRegistration(key, expiresAt, now);
-    this.db.prepare('DELETE FROM agentlogin_rp_callbacks WHERE expires_at <= ?').run(now);
-    const result = this.db.prepare('INSERT INTO agentlogin_rp_callbacks (key, expires_at) VALUES (?, ?) ON CONFLICT(key) DO NOTHING').run(key, expiresAt);
-    return result.changes === 1;
+    return this.write(() => {
+      const now = this.now();
+      checkRegistration(key, expiresAt, now);
+      this.db.prepare('DELETE FROM agentlogin_rp_callbacks WHERE expires_at <= ?').run(now);
+      const result = this.db.prepare('INSERT INTO agentlogin_rp_callbacks (key, expires_at) VALUES (?, ?) ON CONFLICT(key) DO NOTHING').run(key, expiresAt);
+      return result.changes === 1;
+    });
   }
 
   async claim(key: string): Promise<CallbackClaim> {
-    const now = this.now();
-    // This single conditional write is the linearization point, including across processes and restarts.
-    const result = this.db.prepare('UPDATE agentlogin_rp_callbacks SET used = 1 WHERE key = ? AND used = 0 AND expires_at > ?').run(key, now);
-    if (result.changes === 1) return 'claimed';
-    const row = this.db.prepare('SELECT used FROM agentlogin_rp_callbacks WHERE key = ? AND expires_at > ?').get(key, now);
-    return row ? 'duplicate' : 'missing';
+    return this.write(() => {
+      const now = this.now();
+      const result = this.db.prepare('UPDATE agentlogin_rp_callbacks SET used = 1 WHERE key = ? AND used = 0 AND expires_at > ?').run(key, now);
+      if (result.changes === 1) return 'claimed';
+      const row = this.db.prepare('SELECT used FROM agentlogin_rp_callbacks WHERE key = ? AND expires_at > ?').get(key, now);
+      return row ? 'duplicate' : 'missing';
+    });
+  }
+
+  private write<T>(operation: () => T): T {
+    // Wait for other writers before sampling expiry time, even if their transaction changes no rows.
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const result = operation();
+      this.db.exec('COMMIT');
+      return result;
+    } catch (error) {
+      try { this.db.exec('ROLLBACK'); } catch { /* Preserve the original failure. */ }
+      throw error;
+    }
   }
 
   close(): void { this.db.close(); }

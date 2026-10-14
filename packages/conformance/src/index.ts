@@ -3,7 +3,7 @@ import { calculateJwkThumbprint, createRemoteJWKSet, decodeProtectedHeader, jwtV
 import { createHash, randomBytes } from 'node:crypto';
 import { AgentClient, rnd } from './agent.js';
 import { call, callContext, obj, type CallContext, type Exchange, type Res } from './http.js';
-import { authorizationRedirectMatches, concurrentAccessTokens, redirectMatches, singleUseContinueError, validateMetadata, validateForbiddenMetadata } from './validation.js';
+import { authorizationRedirectMatches, concurrentAccessTokens, redirectMatches, singleUseContinueError, validContinueNext, validateMetadata, validateForbiddenMetadata } from './validation.js';
 
 export interface HarnessOptions {
   issuer: string;
@@ -148,7 +148,7 @@ class Harness {
     const redirect = new URL(obj(c.json).redirect);
     const code = redirect.searchParams.get('code')!;
     const token = await this.exchange(client, code, s.verifier);
-    return { ...s, tx, redirect, code, token: obj(token.json), tokenRes: token };
+    return { ...s, tx, assertUrl: s.tx.next.url, redirect, code, token: obj(token.json), tokenRes: token };
   }
   async exchange(client: RegisteredClient, code: string, verifier: string, over: Record<string, string> = {}) {
     const form = { grant_type: 'authorization_code', code, redirect_uri: client.redirect_uri, code_verifier: verifier, ...over };
@@ -417,16 +417,17 @@ class Harness {
       const csp = wait.headers.get('content-security-policy') ?? '';
       expect(/frame-ancestors 'none'/.test(csp) && /script-src/.test(csp) && !/unsafe-inline[^;]*;?/.test(csp.split('script-src')[1]?.split(';')[0] ?? ''), `CSP: ${csp}`);
     });
-    await this.check('I-9', 'Identifiers, challenges and tokens have at least 128 bits', async () => {
+    await this.check('I-9', 'Identifier and token encodings can hold 128 bits; the identifier alone discloses no credential', async () => {
       const s = await this.start();
       for (const [k, v] of [['transaction_id', s.tx.transaction_id], ['challenge', s.tx.challenge], ['session_token', s.tx.session_token]] as const) expect(entropyBits(v) >= 128, `${k}: at most ${entropyBits(v)} bits`);
       const a = await this.assert(s.tx, this.agent, { accept_disclosure: true });
       const t = obj(a.json);
       expect(entropyBits(t.transaction_token) >= 128, `transaction_token: at most ${entropyBits(t.transaction_token)} bits`);
-      const secret = typeof t.next?.url === 'string' ? new URL(t.next.url).pathname.split('/').pop() : undefined;
-      expect(entropyBits(secret) >= 128, `continue URL secret: at most ${entropyBits(secret)} bits`);
       const anon = await this.get(s.tx);
       expect(anon.status === 200 && obj(anon.json).transaction_token === undefined && obj(anon.json).session_token === undefined && obj(anon.json).next?.url === undefined, 'GET with the identifier alone reveals a credential or the continue URL');
+    });
+    await this.check('I-9', 'Entropy generation for identifiers, challenges, tokens and continue URLs', async () => {
+      throw new Skip('not observable black-box: encoding length does not establish entropy, and the continue URL secret has no prescribed location or encoding');
     });
     await this.check('I-10', 'Every response carries iss, url, status and next; errors on an existing transaction carry status and next', async () => {
       const s = await this.start();
@@ -1003,7 +1004,7 @@ class Harness {
       const r = await this.signIn();
       const g = await this.get(r.tx, r.tx.transaction_token);
       expect(g.status === 200 && obj(g.json).status === 'completed' && obj(g.json).next?.action === 'none', `GET completed → ${g.status} ${g.text.slice(0, 120)}`);
-      const post = await call(`${r.tx.url}/assertion`, { method: 'POST', json: { assertion: await this.agent.assertion(iss, { transaction_id: r.tx.transaction_id, challenge: rnd() }) } });
+      const post = await call(r.assertUrl, { method: 'POST', json: { assertion: await this.agent.assertion(iss, { transaction_id: r.tx.transaction_id, challenge: rnd() }) } });
       expect(post.status === 410 && obj(post.json).error === 'transaction_expired' && obj(post.json).status === 'completed', `POST after completion → ${post.status} ${post.text.slice(0, 120)}`);
     });
     await this.check('I-38', 'Authentication Request by GET and POST; request, request_uri, response_mode and response_type refused on the JSON, HTML and POST paths; state and nonce never rejected on length', async () => {
@@ -1186,7 +1187,7 @@ class Harness {
       expect(swapped.status === 400 && obj(swapped.json).error === 'invalid_assertion', `assertion typ on an enrollment proof → ${swapped.status} ${obj(swapped.json).error}`);
     });
     await this.check('I-43', 'Bodies of an existing transaction carry next.url for continue only for the credential that releases it (ready and denied); error precedence invalid_transaction, invalid_token, transaction_expired, then any other', async () => {
-      interface T { tx: Record<string, any>; assertUrl: string; reviewUrl: string; token: string; session: string; continueUrl: string; status: string }
+      interface T { tx: Record<string, any>; assertUrl: string; reviewUrl: string; token: string; session: string; continueUrl: string; status: string; state: string | undefined }
       const auth = (t?: string): Record<string, string> => (t ? { authorization: `Bearer ${t}` } : {});
       /** A transaction taken through the review step, which makes its assertion and review URLs known; `allow` leaves it ready, `deny` denied. */
       const through = async (decision: 'allow' | 'deny', deliver: boolean): Promise<T> => {
@@ -1195,8 +1196,8 @@ class Harness {
         expect(a.status === 'awaiting_consent' && typeof a.next?.url === 'string' && typeof a.transaction_token === 'string', `prompt=consent → ${a.status} ${a.reason ?? ''}`);
         const d = await call(a.next.url, { method: 'POST', headers: auth(a.transaction_token), json: { decision } });
         const t = obj(d.json);
-        expect(d.status === 200 && t.status === (decision === 'allow' ? 'ready' : 'denied') && typeof t.next?.url === 'string', `${decision} → ${d.status} ${t.status ?? t.error}`);
-        return { tx: s.tx, assertUrl: s.tx.next.url, reviewUrl: a.next.url, token: a.transaction_token, session: s.tx.session_token, continueUrl: t.next.url, status: t.status };
+        expect(d.status === 200 && t.status === (decision === 'allow' ? 'ready' : 'denied') && validContinueNext(t.next, m.transaction_endpoint), `${decision} → ${d.status} ${t.status ?? t.error}`);
+        return { tx: s.tx, assertUrl: s.tx.next.url, reviewUrl: a.next.url, token: a.transaction_token, session: s.tx.session_token, continueUrl: t.next.url, status: t.status, state: s.params.state };
       };
       /** One request and what its answer must be: HTTP status, error (none for a 200), the transaction's status, and next.url released or withheld. */
       const says = async (name: string, request: Promise<Res>, status: number, error: string | undefined, t: T, released: boolean) => {
@@ -1204,7 +1205,20 @@ class Harness {
         const j = obj(r.json);
         expect(r.status === status && j.error === error, `${name} → ${r.status} ${j.error ?? ''}, expected ${status} ${error ?? ''}`);
         expect(j.status === t.status && j.next?.action === 'continue', `${name}: the body must carry status ${t.status} and next continue, has ${j.status} and ${j.next?.action}`);
-        expect(released ? j.next.url === t.continueUrl : j.next.url === undefined, `${name}: next.url must be ${released ? 'released to' : 'withheld from'} this requester`);
+        expect(released ? validContinueNext(j.next, m.transaction_endpoint) : j.next.url === undefined, `${name}: a valid next.url must be ${released ? 'released to' : 'withheld from'} this requester`);
+        if (released) t.continueUrl = j.next.url;
+      };
+      /** Follow the latest advertised URL with the credential that released it; rotation cannot issue a second code. */
+      const continues = async (t: T, bearer: string) => {
+        const response = t.status === 'ready' ? 'code' : 'error';
+        const first = await this.cont(t.continueUrl, bearer);
+        const redirect = obj(first.json).redirect;
+        const bound = (value: unknown) => typeof value === 'string' && URL.canParse(value) && authorizationRedirectMatches(new URL(value), this.client.redirect_uri, t.state, iss, response);
+        expect(first.status === 200 && bound(redirect), `${t.status}: the latest released continue URL → ${first.status}, expected a bound ${response} response`);
+        const again = await this.cont(t.continueUrl, bearer);
+        const repeated = obj(again.json).redirect;
+        const repeatableError = t.status === 'denied' && again.status === 200 && bound(repeated) && new URL(repeated).searchParams.get('error') === new URL(redirect).searchParams.get('error');
+        expect(repeatableError || (again.status === 410 && singleUseContinueError(again.json, t.status === 'ready' ? 'completed' : 'denied', m.transaction_endpoint)), `${t.status}: reuse of the released continue URL → ${again.status}`);
       };
       const replay = async (t: T, bearer?: string) => call(t.assertUrl, { method: 'POST', headers: auth(bearer), json: { assertion: await this.agent.assertion(iss, t.tx as never) } });
       const decide = (t: T, bearer?: string, body: unknown = { decision: 'allow' }) => call(t.reviewUrl, { method: 'POST', headers: auth(bearer), json: body });
@@ -1224,6 +1238,7 @@ class Harness {
       await says('ready: decision without a credential and with a malformed body (invalid_token before invalid_request)', decide(r, undefined, { decision: 'maybe' }), 401, 'invalid_token', r, false);
       await says('ready: decision that is not JSON, with the session_token (invalid_token before invalid_request)', garbled(r.reviewUrl, r.session), 401, 'invalid_token', r, false);
       await says('ready: decision with the transaction_token', decide(r, r.token), 400, 'invalid_request', r, true);
+      await continues(r, r.token);
 
       const rd = await through('allow', true);
       await says('ready, deliver_to_session: GET with the session_token', read(rd, rd.session), 200, undefined, rd, true);
@@ -1231,6 +1246,7 @@ class Harness {
       await says('ready, deliver_to_session: second assertion with the session_token', replay(rd, rd.session), 409, 'assertion_replayed', rd, true);
       await says('ready, deliver_to_session: second assertion, anonymous', replay(rd), 409, 'assertion_replayed', rd, false);
       await says('ready, deliver_to_session: decision with the session_token', decide(rd, rd.session), 401, 'invalid_token', rd, true);
+      await continues(rd, rd.session);
 
       const d = await through('deny', false);
       await says('denied: GET, anonymous', read(d), 200, undefined, d, false);
@@ -1247,12 +1263,14 @@ class Harness {
       await says('denied: decision with the transaction_token', decide(d, d.token), 410, 'transaction_expired', d, true);
       await says('denied: decision with the transaction_token and a malformed body (transaction_expired before invalid_request)', decide(d, d.token, { decision: 'maybe' }), 410, 'transaction_expired', d, true);
       await says('denied: decision that is not JSON, with the transaction_token (transaction_expired before invalid_request)', garbled(d.reviewUrl, d.token), 410, 'transaction_expired', d, true);
+      await continues(d, d.token);
 
       const dd = await through('deny', true);
       await says('denied, deliver_to_session: GET with the session_token', read(dd, dd.session), 200, undefined, dd, true);
       await says('denied, deliver_to_session: GET, anonymous', read(dd), 200, undefined, dd, false);
       await says('denied, deliver_to_session: assertion with the session_token', replay(dd, dd.session), 410, 'transaction_expired', dd, true);
       await says('denied, deliver_to_session: decision with the session_token', decide(dd, dd.session), 401, 'invalid_token', dd, true);
+      await continues(dd, dd.session);
 
       // invalid_transaction comes first: an unknown identifier answers 404 whatever else is wrong with the request.
       const ghostId = rnd();

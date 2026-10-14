@@ -38,7 +38,7 @@ export async function validateP256Jwk(jwk: unknown): Promise<P256Jwk> {
 }
 
 /** Section 7.2: a `pending` key not proved within T_ASSERT is deleted. Applied wherever a key is read, so it is never seen again. */
-async function dropIfUnproved(ctx: IssuerContext, key: AgentKey | undefined): Promise<AgentKey | undefined> {
+async function dropIfUnproved(ctx: IssuerContext, key: AgentKey | undefined, authorization?: ManagementAuthorization): Promise<AgentKey | undefined> {
   if (key?.status === 'pending') {
     const now = await ctx.store.currentTime(ctx.now());
     if (!key.challenge || now >= key.challenge.expiresAt) {
@@ -46,17 +46,22 @@ async function dropIfUnproved(ctx: IssuerContext, key: AgentKey | undefined): Pr
       // and the reread may return this enrollment's activation, but must not retarget a management request
       // to a replacement enrollment created while cleanup was delayed.
       await ctx.store.deleteKey(key.kid, key.enrollment, now);
-      const current = await ctx.store.getKey(key.kid, key.handle);
+      const current = authorization
+        ? (await ctx.store.readManagementKeys(key.handle, authorization, key.kid))?.[0]
+        : await ctx.store.getKey(key.kid, key.handle);
       return current?.enrollment === key.enrollment && current.agentSub === key.agentSub ? current : undefined;
     }
   }
   return key;
 }
-export const getLiveKey = async (ctx: IssuerContext, kid: string, handle: string): Promise<AgentKey | undefined> => dropIfUnproved(ctx, await ctx.store.getKey(kid, handle));
-export async function listLiveKeys(ctx: IssuerContext, handle: string): Promise<AgentKey[]> {
+export const getLiveKey = async (ctx: IssuerContext, kid: string, handle: string, authorization?: ManagementAuthorization): Promise<AgentKey | undefined> =>
+  dropIfUnproved(ctx, authorization ? (await ctx.store.readManagementKeys(handle, authorization, kid))?.[0] : await ctx.store.getKey(kid, handle), authorization);
+export async function listLiveKeys(ctx: IssuerContext, handle: string, authorization?: ManagementAuthorization): Promise<AgentKey[]> {
   const keys: AgentKey[] = [];
-  for (const k of await ctx.store.listKeys(handle)) {
-    const live = await dropIfUnproved(ctx, k);
+  const records = authorization ? await ctx.store.readManagementKeys(handle, authorization) : await ctx.store.listKeys(handle);
+  if (!records) throw new OAuthError(404, 'not_found');
+  for (const k of records) {
+    const live = await dropIfUnproved(ctx, k, authorization);
     if (live) keys.push(live);
   }
   return keys;
@@ -163,8 +168,9 @@ export async function proveKey(ctx: IssuerContext, handle: string, kid: string, 
 }
 
 /** Section 7.3: revocation and all its effects are one enrollment-conditional store transaction. */
-export async function revokeKeyEffects(ctx: IssuerContext, key: Pick<AgentKey, 'kid' | 'enrollment'>): Promise<void> {
-  await ctx.store.revokeKey(key.kid, key.enrollment, ctx.now());
+export async function revokeKeyEffects(ctx: IssuerContext, key: Pick<AgentKey, 'kid' | 'enrollment'>, authorization: ManagementAuthorization): Promise<void> {
+  const revoked = await ctx.store.revokeKey(key.kid, key.enrollment, ctx.now(), authorization);
+  if (!revoked) throw new OAuthError(404, 'not_found');
 }
 
 /** Section 7.3: a stale bulk request can affect only the immutable Agent identity it authorized. */
@@ -203,10 +209,9 @@ export function accountRecord(a: { clientId: string; status: string; firstSigned
 /** Section 7.8: resolves the credential and checks that the handle belongs to its Owner. */
 export async function authorizeManagement(ctx: IssuerContext, authorization: string | undefined, handle: string, delegable: boolean): Promise<ManagementAuthorization> {
   const bearer = parseBearer(authorization);
-  const cred = bearer ? await ctx.store.getCredential(sha256(bearer)) : undefined;
-  if (!cred) throw new OAuthError(401, 'invalid_token', undefined, { 'WWW-Authenticate': 'Bearer error="invalid_token"' });
-  const agent = await ctx.store.getAgent(handle);
-  if (!agent || agent.ownerId !== cred.ownerId || (cred.kind === 'delegated' && cred.handle !== handle)) throw new OAuthError(404, 'not_found');
+  const cred = bearer ? await ctx.store.resolveManagement(sha256(bearer), handle) : 'invalid_token';
+  if (cred === 'invalid_token') throw new OAuthError(401, 'invalid_token', undefined, { 'WWW-Authenticate': 'Bearer error="invalid_token"' });
+  if (cred === 'not_found') throw new OAuthError(404, 'not_found');
   if (cred.kind === 'delegated' && !delegable) throw new OAuthError(403, 'insufficient_permission', undefined, { 'WWW-Authenticate': 'Bearer error="insufficient_scope"' });
-  return { ...cred, agentSub: agent.sub };
+  return cred;
 }

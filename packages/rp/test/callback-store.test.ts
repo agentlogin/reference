@@ -1,11 +1,14 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
+import { once } from 'node:events';
 import { promisify } from 'node:util';
+import { writeFileSync } from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomBytes } from 'node:crypto';
+import { DatabaseSync } from 'node:sqlite';
 import {
   MemoryCallbackStateStore, SqliteCallbackStateStore, RelyingParty, createHandlers,
   type CallbackStateStore, type SignIn,
@@ -59,6 +62,109 @@ test('SQLite callback claims are atomic across independent Node processes', asyn
     assert.equal(attempts.filter((r) => r.stdout === 'duplicate').length, 5);
     assert.equal(await store.claim('process-race'), 'duplicate');
   } finally { store.close(); await rm(directory, { recursive: true, force: true }); }
+});
+
+test('SQLite callback expiry is checked after an independent process obtains the write lock', async (t) => {
+  for (const operation of ['claim', 'duplicate', 'register'] as const) {
+    await t.test(operation, async () => {
+      const directory = await mkdtemp(join(tmpdir(), 'agentlogin-rp-expiry-lock-'));
+      const filename = join(directory, 'callbacks.sqlite');
+      const clockFile = join(directory, 'clock');
+      writeFileSync(clockFile, '10000');
+      const store = new SqliteCallbackStateStore(filename, { now: () => 10_000 });
+      const blocker = new DatabaseSync(filename);
+      const moduleUrl = new URL('../src/callback-store.ts', import.meta.url).href;
+      const script = `import { SqliteCallbackStateStore } from ${JSON.stringify(moduleUrl)};
+        import { DatabaseSync, StatementSync } from 'node:sqlite';
+        import { readFileSync } from 'node:fs';
+        const store = new SqliteCallbackStateStore(process.argv[1], {
+          now: () => Number(readFileSync(process.argv[2], 'utf8')),
+        });
+        // Signal immediately before the first native write/lock attempt. The parent holds the lock
+        // until this signal, then advances the injected clock before releasing it. Wrapping both
+        // entry points also reproduces the old single-statement claim without relying on sleeps.
+        let armed = false;
+        const signal = () => { if (armed) { armed = false; process.send('write-attempt'); } };
+        const exec = DatabaseSync.prototype.exec;
+        DatabaseSync.prototype.exec = function(sql) {
+          if (/^BEGIN\\b/i.test(sql)) signal();
+          return exec.call(this, sql);
+        };
+        const run = StatementSync.prototype.run;
+        StatementSync.prototype.run = function(...args) { signal(); return run.apply(this, args); };
+        process.once('message', async () => {
+          armed = true;
+          let outcome;
+          try {
+            outcome = process.argv[3] === 'register'
+              ? await store.register('new', 15000) : await store.claim('pending');
+          } catch (error) { outcome = error.message; }
+          // A rejected registration must roll back so the same connection remains usable.
+          let recovered;
+          if (process.argv[3] === 'register') {
+            await store.register('recovered', 30000);
+            recovered = await store.claim('recovered');
+          }
+          process.send({ outcome, recovered });
+          store.close();
+          process.disconnect();
+        });
+        process.send('ready');`;
+      const child = spawn(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', script, filename, clockFile, operation], {
+        stdio: ['ignore', 'ignore', 'inherit', 'ipc'],
+      });
+      const closed = once(child, 'close');
+      const message = async () => (await once(child, 'message', { signal: AbortSignal.timeout(10_000) }))[0];
+      try {
+        assert.equal(await message(), 'ready');
+        await store.register('pending', 15_000);
+        if (operation === 'duplicate') assert.equal(await store.claim('pending'), 'claimed');
+        // Deliberately make no row changes: expiry must advance even behind a no-op writer.
+        blocker.exec('BEGIN IMMEDIATE');
+        const attempting = message();
+        child.send('run');
+        assert.equal(await attempting, 'write-attempt');
+        const result = message();
+        writeFileSync(clockFile, '20000');
+        blocker.exec('COMMIT');
+        assert.deepEqual(await result, operation === 'register'
+          ? { outcome: 'invalid callback state registration', recovered: 'claimed' }
+          : { outcome: 'missing' });
+        if (operation !== 'register') {
+          assert.equal(blocker.prepare('SELECT used FROM agentlogin_rp_callbacks WHERE key = ?').get('pending')?.used,
+            operation === 'duplicate' ? 1 : 0, 'an expired claim does not change the used flag');
+        }
+        assert.equal(blocker.prepare('SELECT used FROM agentlogin_rp_callbacks WHERE key = ?').get('new'), undefined);
+      } finally {
+        if (child.exitCode === null) child.kill();
+        await closed;
+        try { blocker.exec('ROLLBACK'); } catch { /* The transaction may already be committed. */ }
+        blocker.close();
+        store.close();
+        await rm(directory, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+test('SQLite callback registration rolls back cleanup after a failed insert', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'agentlogin-rp-rollback-'));
+  const filename = join(directory, 'callbacks.sqlite');
+  let now = 10_000;
+  const store = new SqliteCallbackStateStore(filename, { now: () => now });
+  const observer = new DatabaseSync(filename);
+  try {
+    await store.register('expired', 15_000);
+    assert.equal(await store.claim('expired'), 'claimed');
+    observer.exec(`CREATE TRIGGER reject_registration BEFORE INSERT ON agentlogin_rp_callbacks
+      WHEN NEW.key = 'rejected' BEGIN SELECT RAISE(ABORT, 'test insert failure'); END`);
+    now = 20_000;
+    await assert.rejects(store.register('rejected', 30_000), /test insert failure/);
+    assert.equal(observer.prepare('SELECT used FROM agentlogin_rp_callbacks WHERE key = ?').get('expired')?.used, 1);
+    assert.equal(await store.register('recovered', 30_000), true);
+    assert.equal(await store.claim('recovered'), 'claimed');
+    assert.equal(observer.prepare('SELECT used FROM agentlogin_rp_callbacks WHERE key = ?').get('expired'), undefined);
+  } finally { observer.close(); store.close(); await rm(directory, { recursive: true, force: true }); }
 });
 
 class TestRelyingParty extends RelyingParty {
