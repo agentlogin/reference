@@ -3,5 +3,5 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
-  "dependencies": { "@agentlogin/rp": "^0.1.0", "@hono/node-server": "^1.19.0", "hono": "^4.9.0" }
+  "dependencies": { "@agentlogin/rp": "^0.1.0", "@agentlogin/rp-store-postgres": "^0.1.0", "@hono/node-server": "^1.19.0", "hono": "^4.9.0" }
 }

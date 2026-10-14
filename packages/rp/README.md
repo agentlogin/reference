@@ -11,16 +11,18 @@ run on edge runtimes: discovery and every request to an issuer go through an add
 `node:dns` and `node:http`. Bun and Deno are untested.
 
 ```ts
-import { RelyingParty, SqliteCallbackStateStore, createHandlers, signInForm } from '@agentlogin/rp';
+import { RelyingParty, createHandlers, signInForm } from '@agentlogin/rp';
+import { PostgresCallbackStateStore } from '@agentlogin/rp-store-postgres';
 
-// Every process on this host uses the same persistent file. Protect its directory with application-only permissions.
-const callbackStore = new SqliteCallbackStateStore('/var/lib/example-app/callbacks.sqlite');
+// Every application replica uses this primary database and schema.
+const callbackStore = new PostgresCallbackStateStore({ connectionString: process.env.RP_DATABASE_URL! });
+await callbackStore.verifySchema(); // Run agentlogin-rp-migrate separately before startup.
 
 const rp = new RelyingParty({
   clientId: 'https://app.example.org/client-metadata.json',   // Open Client: no registration, this URL is your identifier
   redirectUri: 'https://app.example.org/auth/agent/callback',
   issuers: ['https://issuer.example'],                         // the issuers you accept, exactly as they publish themselves
-  stateSecret: process.env.STATE_SECRET!,                      // 32+ characters
+  stateSecret: process.env.STATE_SECRET!,                      // 32+ characters, shared by every replica
 });
 
 const auth = createHandlers(rp, {
@@ -36,6 +38,7 @@ const auth = createHandlers(rp, {
 //   GET, POST /auth/agent/login      -> auth.login      (form field `handle`, or `iss` + `login_hint`)
 //   GET       /auth/agent/callback   -> auth.callback
 // and in your page:  signInForm({ action: '/auth/agent/login' })
+// Drain HTTP requests, then await callbackStore.close() during shutdown.
 ```
 
 `auth.login` is also where an agent starts: it calls the URL with `iss` and `login_hint` (Section 5.8), and the
@@ -106,13 +109,24 @@ same store. A consumed state stays consumed even when token exchange times out, 
 `onSignIn` throws: the caller must start a new sign-in. Re-exchanging a code can revoke an earlier successful
 session at the issuer, so retrying an uncertain exchange is unsafe.
 
+Use [`@agentlogin/rp-store-postgres`](../rp-store-postgres/README.md) for replicas on different hosts. It stores
+opaque state digests in indexed PostgreSQL rows and checks expiry after acquiring the callback row's lock. Run its
+migration before deployment, verify the schema at startup, and schedule bounded `cleanup()` calls. Use the primary
+database and the same stable `stateSecret`, client ID and redirect URI across replicas. Keep application and database
+clocks synchronized. This package is separate from the issuer's `@agentlogin/store-postgres`; neither stores your
+application sessions or accounts.
+
 `SqliteCallbackStateStore` provides durable atomic registration and consumption across processes on one host,
 using Node.js `node:sqlite`, WAL, and full synchronous writes. Close it when the application shuts down. Use a
 local filesystem, keep the database and WAL files together, and do not restore stale snapshots while cookies they
-could resurrect remain valid. For multiple hosts, implement `CallbackStateStore` against a shared database. The
+could resurrect remain valid. The
 store contract requires insert-if-absent registration and an atomic conditional update from unused to used only
 before the original expiry. Never reset existing records, release claims, or evict unexpired records. Missing
 records fail closed; losing the store ends pending sign-ins instead of allowing cookie replay.
+
+Acknowledged claims must survive database failover. Restoring older callback data can undo consumption; before
+serving traffic after a rollback or restore, rotate `stateSecret` on every replica and reject pending cookies made
+with the previous secret. Do not accept old secrets during this recovery. Start new sign-ins instead.
 
 `MemoryCallbackStateStore` is for development and single-process tests; share the same instance between handlers.
 It has a configurable capacity (default 10,000 states) and refuses new sign-ins when full instead of evicting live

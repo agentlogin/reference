@@ -1,4 +1,4 @@
-name: PostgreSQL store
+name: PostgreSQL stores
 
 on:
   push:
@@ -35,4 +35,4 @@ jobs:
       - run: npm ci
       - run: npm run build
       - name: Shared contracts and PostgreSQL adversarial tests (required)
-        run: node --import tsx --test --test-concurrency=1 packages/issuer/test/store-contract.test.ts packages/store-postgres/test/*.test.ts
+        run: node --import tsx --test --test-concurrency=1 packages/issuer/test/store-contract.test.ts packages/store-postgres/test/*.test.ts packages/rp-store-postgres/test/*.test.ts

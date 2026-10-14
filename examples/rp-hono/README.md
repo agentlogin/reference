@@ -41,12 +41,30 @@ Why the development switches: this demo runs over plain HTTP on localhost, where
 `example.com` cannot work. `AGENTLOGIN_INSECURE` and `AGENTLOGIN_ISSUER` tell the client so, and the application maps
 `example.com` to the issuer itself (its `HANDLE_DOMAINS` variable, default `example.com`; set it to the issuer's handle
 domains if you change them). In production none of these is set and the handle's domain names the issuer. Outside
-development the application refuses to start without `STATE_SECRET`.
+development the application refuses to start without `STATE_SECRET` and an HTTPS `BASE_URL`. Plain HTTP is
+accepted only for `localhost`, `127.0.0.1` or `[::1]`, and the development listener binds to loopback.
 
-Callback replay protection uses a persistent SQLite database (`CALLBACK_DB_PATH`, default `./rp-callbacks.sqlite`).
-All application processes on the same host must use the same file and `STATE_SECRET`; put the file in a protected
-local directory. For replicas on different hosts, supply a shared database implementation of `CallbackStateStore`
-to `createExample`. An uncertain callback must be followed by a new sign-in, never by retrying its code.
+For callback replay protection across hosts, use the PostgreSQL adapter:
 
-This remains a development example: its accounts and sessions are in memory. Replace those stores, configure
+```bash
+export RP_DATABASE_URL='postgresql://app@db.example/app'
+export RP_DATABASE_SCHEMA='agentlogin_rp'
+# Run once with a migration role before starting the application:
+npm run rp:migrate
+# Start with runtime database credentials and the same STATE_SECRET on every replica:
+BASE_URL=https://app.example.org ISSUER=https://issuer.example STATE_SECRET='<32-or-more-random-characters>' npm run example
+```
+
+Configure authenticated TLS for remote PostgreSQL connections. The server verifies the schema at startup and
+removes up to 1,000 expired callback records each minute. It drains requests and closes its callback store on
+SIGINT or SIGTERM. See the [adapter guide](../../packages/rp-store-postgres/README.md) for role separation, pool
+limits, clock synchronization and backup recovery. Run additional bounded cleanup batches if registrations
+outpace the example's maintenance interval.
+
+Without `RP_DATABASE_URL`, the example uses a persistent local SQLite database (`CALLBACK_DB_PATH`, default
+`./rp-callbacks.sqlite`). Processes on the same host must use the same protected file and `STATE_SECRET`. An
+uncertain callback must be followed by a new sign-in, never by retrying its code.
+
+PostgreSQL shares only callback state here: this remains a development example with accounts and sessions in
+memory. A callback handled on one host does not create a session on another host. Replace those stores, configure
 application authentication and rate limits, and manage database backups and migrations before deploying it.

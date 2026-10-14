@@ -17,15 +17,17 @@ JSON path and the wait-page path. The specification is at draft 0.1; code lands 
 | --- | --- |
 | `packages/agentlogin` | Agent CLI and client library (npm `agentlogin`): discovery, enrollment, sign-in, cookie jar |
 | `packages/store-postgres` | PostgreSQL issuer adapter: indexed records, serializable mutations, shared contracts and database concurrency tests |
+| `packages/rp-store-postgres` | PostgreSQL RP callback adapter: shared registration and atomic one-use claims across application hosts |
 | `packages/issuer` | Reference issuer (Hono + jose, written to the spec section by section) |
 | `packages/rp` | Relying-party kit (`@agentlogin/rp`): validation per Sections 5.7 and 2.5, handlers, sign-in form |
 | `examples/rp-hono` | A runnable application that accepts agent sign-ins |
 | `packages/conformance` | Conformance harness |
 
-The production storage target is `@agentlogin/store-postgres`: normalized records, asynchronous connections and
-atomic transitions across issuer instances. Memory and SQLite remain local reference/test adapters. The RP requires
-shared one-use callback storage; its bundled SQLite callback store is a single-host option, and a multi-host RP
-needs a separate shared-database adapter. Client locking, sign-in deadlines, cookie ordering and conformance validation have regression
+The production issuer storage target is `@agentlogin/store-postgres`: normalized records, asynchronous connections and
+atomic transitions across issuer instances. For RP replicas on several hosts, `@agentlogin/rp-store-postgres` provides
+shared one-use callback storage in the application's PostgreSQL database. These are separate adapters: the RP store
+does not hold issuer records or application sessions. Memory and SQLite remain local reference/test options.
+Client locking, sign-in deadlines, cookie ordering and conformance validation have regression
 coverage. See package READMEs for migration and storage requirements; rate limiting and complete production Owner
 authentication remain deployment work.
 
@@ -45,8 +47,10 @@ implementation that follows the specification section by section is the more use
 
 Package names: npm `agentlogin` (reserved), PyPI `agent-login` (the name `agentlogin` is held by an unrelated 2019 project), crates.io `agentlogin` (free, not reserved).
 
-PostgreSQL storage is a separate optional package, `@agentlogin/store-postgres`. See
-[its contracts and operations guide](packages/store-postgres/README.md). Set `DATABASE_URL`, run
-`npm run issuer:migrate`, and supply a persistent `SIGNING_JWK` when starting the issuer. RP callback storage is
-separate. `npm test` reports PostgreSQL integration tests as skipped when `AGENTLOGIN_TEST_POSTGRES_URL` is absent;
+For the issuer, see the [PostgreSQL issuer guide](packages/store-postgres/README.md): set `DATABASE_URL`, run
+`npm run issuer:migrate`, and supply a persistent `SIGNING_JWK` when starting the issuer. For the application, see the
+[PostgreSQL RP callback guide](packages/rp-store-postgres/README.md): set `RP_DATABASE_URL`, run `npm run rp:migrate`,
+and use the same database, schema and `STATE_SECRET` across replicas. Both adapters verify migrations at startup;
+ordinary requests do not run DDL. Application accounts and sessions still need their own shared storage.
+`npm test` reports PostgreSQL integration tests as skipped when `AGENTLOGIN_TEST_POSTGRES_URL` is absent;
 `REQUIRE_POSTGRES_TESTS=1 npm run test:postgres` requires a configured database, as the dedicated CI job does.

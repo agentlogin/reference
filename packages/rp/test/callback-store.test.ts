@@ -8,6 +8,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomBytes } from 'node:crypto';
+import { callbackContract } from './callback-contract.js';
 import { DatabaseSync } from 'node:sqlite';
 import {
   MemoryCallbackStateStore, SqliteCallbackStateStore, RelyingParty, createHandlers,
@@ -22,13 +23,7 @@ test('callback stores retain consumed state, reject replacement and fail closed 
   const sqlite = new SqliteCallbackStateStore(join(directory, 'callbacks.sqlite'), { now: () => now });
   try {
     for (const store of [new MemoryCallbackStateStore({ now: () => now }), sqlite]) {
-      assert.equal(await store.claim('absent'), 'missing');
-      assert.equal(await store.register('pending', now + 100), true);
-      assert.equal(await store.register('pending', now + 200), false);
-      assert.deepEqual(await Promise.all([store.claim('pending'), store.claim('pending')]), ['claimed', 'duplicate']);
-      assert.equal(await store.register('pending', now + 300), false, 'registration cannot reset a claim');
-      now += 100;
-      assert.equal(await store.claim('pending'), 'missing', 'original expiry was not extended');
+      await callbackContract(store, () => now, (ms) => { now += ms; });
     }
     assert.equal(await new MemoryCallbackStateStore().claim('pending'), 'missing', 'lost state does not recreate a claim');
   } finally { sqlite.close(); await rm(directory, { recursive: true, force: true }); }

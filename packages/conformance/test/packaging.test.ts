@@ -9,7 +9,7 @@ import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const root = fileURLToPath(new URL('../../..', import.meta.url));
-const packages = ['issuer', 'conformance', 'agentlogin', 'rp', 'store-postgres'];
+const packages = ['issuer', 'conformance', 'agentlogin', 'rp', 'store-postgres', 'rp-store-postgres'];
 
 for (const name of packages) {
   test(`package ${name}: the packed tarball has its entry points and runs without the source`, async () => {
