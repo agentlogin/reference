@@ -7,6 +7,20 @@ The production storage target is [`@agentlogin/store-postgres`](../store-postgre
 records and atomic operations across instances. Memory and SQLite remain local reference/test adapters.
 Requires Node.js 22.13 or newer.
 
+Selected draft 0.2 requirements are implemented; the [compatibility status](../../docs/draft-0.2-status.md) pins the
+target specification and records remaining gaps. `max_age` is parsed and stored with the transaction. A positive
+value limits authentication age at code authorization, redemption and token issuance, including database waits;
+stale completion ends `denied/login_required`, and a stale Token Request gets `invalid_grant`. Owner approval and
+retries preserve the original accepted assertion time. Zero requires a fresh assertion for that transaction and
+allows delayed approval/delivery within the ordinary transaction and code lifetimes. Nonempty wire values must
+contain decimal digits only; an empty optional value is omitted per RFC 6749. Values larger than the safe timestamp
+range act as an unlimited age bound within that range.
+
+The stored age fields are additive and need no PostgreSQL schema migration. Stop old issuer processes before
+upgrading: mixed versions can lose the new checks. Records created without an age constraint retain their previous
+behavior. Custom `Store` adapters must implement the new atomic freshness checks even though the method signatures
+are unchanged; run the shared store contract tests when upgrading an adapter.
+
 ```bash
 npm run issuer            # http://localhost:3000, handle domain localhost, prints a generated ADMIN_TOKEN
 DATABASE_URL=postgresql://... npm run issuer:migrate

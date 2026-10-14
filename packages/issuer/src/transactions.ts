@@ -22,6 +22,7 @@ export interface CreateParams {
   nonce: string;
   codeChallenge: string;
   prompt?: 'consent' | 'none';
+  maxAge?: number;
   loginHint?: string;
   requester?: { user_agent?: string; network?: string };
   /** JSON path: a session_token is minted; HTML path: a session cookie secret. */
@@ -44,6 +45,7 @@ export async function createTransaction(ctx: IssuerContext, p: CreateParams): Pr
     nonce: p.nonce,
     codeChallenge: p.codeChallenge,
     prompt: p.prompt,
+    maxAge: p.maxAge,
     loginHint: p.loginHint,
     disclosure: p.scopes.map((s) => ({ scope: s, ...DISCLOSURE[s] })),
     requester: p.requester,
@@ -384,7 +386,7 @@ export async function cont(ctx: IssuerContext, loaded: Transaction, secret: stri
       codeChallenge: next.codeChallenge, nonce: next.nonce, scopes: next.scopes,
       handle: next.handle!, kid: next.kid!, keyEnrollment: next.keyEnrollment!,
       agentSub: next.agentSub!, agentVersion: next.agentVersion!, accountVersion: next.accountVersion!,
-      authTime: next.assertedAt!, expiresAt: now + ctx.constants.T_CODE, used: false, voided: false,
+      authTime: next.assertedAt!, maxAge: next.maxAge, expiresAt: now + ctx.constants.T_CODE, used: false, voided: false,
     }, now, viewer.kind === 'transaction_token' ? viewer.tokenHash : undefined);
     if (!completed || completed.status !== 'completed') {
       tx = completed ?? await loadTransaction(ctx, tx.id);
@@ -405,6 +407,8 @@ export function redirectError(tx: Transaction): { error: string; description?: s
       return { error: 'consent_required' };
     case 'interaction_required':
       return { error: 'interaction_required' };
+    case 'login_required':
+      return { error: 'login_required' };
     case 'signup_limit_reached':
       return { error: 'signup_limit_reached' };
     default:

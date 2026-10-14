@@ -132,6 +132,14 @@ quota waits and validate again on every retry. Caller-supplied timestamps do not
 replace this clock. Assertion validity windows also reach the atomic acceptance
 operation so that lock contention cannot extend a signed assertion's lifetime.
 
+The request's `max_age` and accepted assertion time remain bound to the transaction
+and its code. A positive age limit is checked at completion, redemption and token
+insertion, including after write waits and retries. If completion becomes stale
+during its writes, a savepoint rolls back the proposed code, account and signup
+changes before the same transaction records `denied`/`login_required` and releases
+its reservation. Zero requires this request's fresh assertion without imposing a
+zero-second delivery window; normal transaction and code lifetimes still apply.
+
 Token creation asks the store clock for its initial timestamp. Token insertion records
 its accepted issuance time and expiry; signed token claims use that persisted result.
 Some initial metadata and expiry bounds originate from the application's clock; the
@@ -166,14 +174,18 @@ intentionally secondary to one-use semantics.
 | Agent or transaction insertion | Its unique identity still holds the exact submitted record. |
 | Key enrollment | The same key and enrollment ID still hold the exact submitted record. |
 | Transaction transition | The expected next version and complete resulting record remain; side effects must also be conclusive. |
-| Completion | The request's code hash belongs to the completed transaction and expected identity/version. |
-| Code redemption | This attempt's marker remains on the used code and its lifecycle/issuance window is still valid; a replay is rejected. |
+| Completion | The request's code hash belongs to the completed transaction and expected identity/version, or the exact produced denial remains. |
+| Code redemption | This attempt's marker remains on the used code and its lifecycle/issuance window is still valid; stale authentication fails and a replay is rejected. |
 | Access-token insertion | This request's token hash remains with valid expiry, code, and lifecycle bindings. |
 | Other mutations, including destructive owner-code consumption | No recovery claim is made; return `UncertainCommitError`. |
 
 A successful transaction followed by a lost HTTP response can still lose the client's
 plaintext authorization code or token. The database stores hashes and this adapter
 cannot reconstruct those secrets. This is not an exactly-once delivery guarantee.
+
+Recovery never refreshes authentication. An age limit that passes after a successful
+commit prevents subsequent issuance, but does not undo a code already committed or
+revoke a token validly issued before that limit passed.
 
 ## Retention and recovery from backups
 

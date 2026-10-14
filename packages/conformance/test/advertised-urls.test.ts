@@ -3,11 +3,13 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
+import { createHash } from 'node:crypto';
 import { serve } from '@hono/node-server';
+import { decodeJwt, decodeProtectedHeader, SignJWT } from 'jose';
 import { createIssuer } from '../../issuer/src/index.js';
 import { runConformance } from '../src/index.js';
 
-type Mode = 'query-secret' | 'assertion-route' | 'rotating-url' | 'credential-leak' | 'unsafe-release' | 'repeatable-ready';
+type Mode = 'query-secret' | 'assertion-route' | 'rotating-url' | 'credential-leak' | 'unsafe-release' | 'repeatable-ready' | 'ignored-max-age' | 'stale-zero-auth-time' | 'delayed-max-age-code';
 
 async function alternativeIssuer(mode: Mode) {
   const placeholder = http.createServer();
@@ -15,8 +17,8 @@ async function alternativeIssuer(mode: Mode) {
   const port = (placeholder.address() as AddressInfo).port;
   await new Promise<void>((resolve) => placeholder.close(() => resolve()));
   const issuer = `http://127.0.0.1:${port}`;
-  const { app } = await createIssuer({ issuer, handleDomains: ['example.com'], allowInsecureClients: true, adminToken: 'admin' });
-  const observed = { queryRequests: 0, terminalAssertions: 0, rotatedRequests: 0, leaks: 0, unsafeReleases: 0, repeatedCodes: 0 };
+  const { app, ctx } = await createIssuer({ issuer, handleDomains: ['example.com'], allowInsecureClients: true, adminToken: 'admin' });
+  const observed = { queryRequests: 0, terminalAssertions: 0, rotatedRequests: 0, leaks: 0, unsafeReleases: 0, repeatedCodes: 0, staleZeroTokens: 0, delayedAgeCodes: 0 };
   const completed = new Map<string, unknown>();
   const advertised = new Map<string, string>();
   const firstVersion = new Map<string, string>();
@@ -54,6 +56,12 @@ async function alternativeIssuer(mode: Mode) {
   const handle = async (original: Request): Promise<Response> => {
     let request = original;
     const url = new URL(request.url);
+    if (mode === 'ignored-max-age' && url.pathname === '/authorize' && url.searchParams.getAll('max_age').length === 1 && url.searchParams.get('max_age') === '1') {
+      // Preserve syntax validation and ordinary token generation, but simulate an issuer losing the positive age
+      // constraint between parsing and storage. A green syntax/auth_time-presence check must not hide this.
+      url.searchParams.delete('max_age');
+      request = new Request(url, request);
+    }
     if (mode === 'query-secret' && url.pathname.endsWith('/continue') && url.searchParams.has('ticket')) {
       observed.queryRequests += 1;
       url.pathname += `/${url.searchParams.get('ticket')}`;
@@ -77,9 +85,29 @@ async function alternativeIssuer(mode: Mode) {
       if (inI43) observed.repeatedCodes += 1;
       return json(completed.get(request.url), 200);
     }
+    if (mode === 'delayed-max-age-code' && url.pathname.includes('/continue/') && observed.delayedAgeCodes === 0) {
+      const tx = await ctx.store.getTransaction(url.pathname.split('/')[2]!);
+      if (tx?.maxAge === 3) {
+        observed.delayedAgeCodes += 1;
+        await new Promise((resolve) => setTimeout(resolve, 4100)); // The first acquisition window expires correctly.
+      }
+    }
+    let zeroAgeToken = false;
+    if (mode === 'stale-zero-auth-time' && url.pathname === '/token' && request.method === 'POST') {
+      const code = new URLSearchParams(await request.clone().text()).get('code');
+      if (code) zeroAgeToken = (await ctx.store.getCode(createHash('sha256').update(code).digest('base64url')))?.maxAge === 0;
+    }
     const response = await app.fetch(request);
     if (!response.headers.get('content-type')?.includes('application/json')) return response;
     const body = await response.json() as Record<string, any>;
+    if (zeroAgeToken && response.status === 200 && typeof body.id_token === 'string') {
+      // A valid issuer signature and otherwise valid token, but authentication from a different request. Generic
+      // auth_time-presence checks and the positive-age I-49 probe must not hide a bug specific to max_age=0.
+      const claims = decodeJwt(body.id_token);
+      claims.auth_time = claims.iat! - 86400;
+      body.id_token = await new SignJWT(claims).setProtectedHeader(decodeProtectedHeader(body.id_token)).sign(ctx.signingKey.privateKey);
+      observed.staleZeroTokens += 1;
+    }
     if (mode === 'assertion-route' && original.url.endsWith('/prove') && response.status === 410 && body.status === 'completed') observed.terminalAssertions += 1;
     if (mode === 'credential-leak' && request.method === 'GET' && !request.headers.has('authorization') && body.status === 'ready') {
       observed.leaks += 1;
@@ -117,6 +145,8 @@ for (const [mode, id, detail] of [
   ['credential-leak', 'I-9', /reveals a credential/],
   ['unsafe-release', 'I-43', /valid next.url/],
   ['repeatable-ready', 'I-43', /reuse of the released continue URL/],
+  ['ignored-max-age', 'I-32', /over-age authentication must not issue a code/],
+  ['stale-zero-auth-time', 'I-32', /max_age=0 auth_time must be the time this request's assertion was accepted/],
 ] as const) test(`advertised URL flexibility still detects ${mode}`, async () => {
   const fixture = await alternativeIssuer(mode);
   try {
@@ -127,5 +157,22 @@ for (const [mode, id, detail] of [
     if (mode === 'credential-leak') assert.ok(fixture.observed.leaks > 0);
     if (mode === 'unsafe-release') assert.ok(fixture.observed.unsafeReleases > 0);
     if (mode === 'repeatable-ready') assert.ok(fixture.observed.repeatedCodes > 0);
+    if (mode === 'stale-zero-auth-time') {
+      assert.equal(fixture.observed.staleZeroTokens, 1);
+      assert.equal(report.results.find((r) => r.id === 'I-49')?.outcome, 'pass', 'the mutation affects only zero-age authentication');
+      assert.equal(report.results.find((r) => r.id === 'I-32' && r.title === 'Positive max_age expires before token issuance')?.outcome, 'pass', 'a zero-age failure does not suppress the token-age probe');
+    }
+  } finally { await fixture.close(); }
+});
+
+test('harness retries slow max_age code acquisition without skipping independent age probes', async () => {
+  const fixture = await alternativeIssuer('delayed-max-age-code');
+  try {
+    const report = await runConformance({ issuer: fixture.issuer, adminToken: 'admin', log: fixture.log });
+    assert.equal(report.failed, 0, report.results.filter((r) => r.outcome === 'fail').map((r) => `${r.id}: ${r.detail}`).join('\n'));
+    assert.equal(fixture.observed.delayedAgeCodes, 1);
+    const ages = report.results.filter((r) => r.id === 'I-32');
+    assert.equal(ages.length, 4);
+    assert.ok(ages.every((r) => r.outcome === 'pass'), ages.map((r) => `${r.title}: ${r.outcome} ${r.detail ?? ''}`).join('\n'));
   } finally { await fixture.close(); }
 });

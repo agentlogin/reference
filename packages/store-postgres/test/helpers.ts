@@ -53,10 +53,11 @@ export async function prepareAgent(store: Store, now: number, id: string, ownerI
   return { agent, key, authorization };
 }
 
-export async function pending(store: Store, now: number, id: string, clientId = 'client', lifetime = 300): Promise<Transaction> {
+export async function pending(store: Store, now: number, id: string, clientId = 'client', lifetime = 300, maxAge?: number): Promise<Transaction> {
   await store.putClient({ clientId, type: 'registered', redirectUris: ['https://rp.example/cb'], requireReview: false, tokenEndpointAuthMethod: 'none' });
   const transaction: Transaction = {
     id, version: 0, clientId, redirectUri: 'https://rp.example/cb', scopes: ['openid'], state: 'state', nonce: 'nonce', codeChallenge: 'challenge',
+    ...(maxAge === undefined ? {} : { maxAge }),
     disclosure: [], status: 'awaiting_agent', challenge: 'challenge', createdAt: now, expiresAt: now + lifetime,
     acceptDisclosure: true, deliverToSession: false, ownerApprovalOutstanding: false, reviewOutstanding: false, passedCap: false,
     continueSecret: 'continue', codeIssued: false, transactionTokenHash: `transaction-token-${id}`,
@@ -70,8 +71,8 @@ export const asserted = (transaction: Transaction, id: string, now: number, owne
   agentSub: `sub-${id}`, agentVersion: 0, accountVersion: 0, ownerId, assertedAt: now,
 });
 
-export async function begin(store: Store, now: number, id: string, txnId: string, clientId = 'client', maxSignups?: number, ownerId = 'owner') {
-  const transaction = await pending(store, now, txnId, clientId);
+export async function begin(store: Store, now: number, id: string, txnId: string, clientId = 'client', maxSignups?: number, ownerId = 'owner', maxAge?: number) {
+  const transaction = await pending(store, now, txnId, clientId, 300, maxAge);
   const result = await store.updateTransaction(asserted(transaction, id, now, ownerId), transaction.version, { now, maxSignups });
   assert.ok(result);
   return result;

@@ -5,7 +5,7 @@ import { createLocalJWKSet, decodeProtectedHeader, jwtVerify, type JSONWebKeySet
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { checkIssuerIdentifier, fetchMetadata, freshness, lookupIssuer, parseHandle, safeFetch, type IssuerMetadata } from 'agentlogin';
 import { ISSUER_ERROR_CODES, RelyingPartyError, type RelyingPartyErrorCode } from './errors.js';
-import type { PendingSignIn } from './seal.js';
+import { validAuthenticationRequest, type PendingSignIn } from './seal.js';
 
 const T_SKEW = 60;
 const T_CACHE = 86_400; // seconds, Section 1.5
@@ -51,6 +51,8 @@ export interface RelyingPartyOptions {
   allowInsecure?: boolean;
   /** Per-request limit for discovery, metadata, JWK Set, token and UserInfo requests. Default and maximum 10 000 ms (N_FETCH). */
   timeoutMs?: number;
+  /** Default maximum authentication age in seconds. Zero requires a fresh assertion for this request. */
+  maxAge?: number;
 }
 export interface BeginOptions {
   /** The Agent Handle the user or agent presented. */
@@ -59,7 +61,20 @@ export interface BeginOptions {
   issuer?: string;
   prompt?: 'consent' | 'none';
   scopes?: string[];
+  /** Application-controlled override of the configured maxAge; never copy untrusted login parameters here. */
+  maxAge?: number;
   returnTo?: string;
+}
+export interface IdTokenValidationOptions {
+  issuer: string;
+  nonce: string;
+  clientId: string;
+  metadata?: IssuerMetadata;
+  expectedHandle?: string;
+  /** The requested max_age, from state bound to the original Authentication Request. */
+  maxAge?: number;
+  /** The original request's Unix timestamp in seconds; required with maxAge. */
+  authenticationRequestedAt?: number;
 }
 export interface Begun {
   /** The Authentication Request URL (Section 5.1). */
@@ -132,6 +147,7 @@ export class RelyingParty {
     if (typeof o.stateSecret !== 'string' || o.stateSecret.length < 32) throw new Error('stateSecret must be a string of at least 32 characters');
     if (typeof o.clientId !== 'string' || !o.clientId) throw new Error('clientId is required');
     if (!URL.canParse(o.redirectUri)) throw new Error('redirectUri must be an absolute URL');
+    if (o.maxAge !== undefined && (!Number.isSafeInteger(o.maxAge) || o.maxAge < 0)) throw new Error('maxAge must be a non-negative safe integer');
     for (const i of o.issuers ?? []) {
       const c = typeof i === 'string' ? { issuer: i } : i;
       try {
@@ -230,6 +246,10 @@ export class RelyingParty {
 
   /** Section 5.1: build the Authentication Request (R-1) and record the Issuer for this `state` (R-2). */
   async begin(p: BeginOptions = {}): Promise<Begun> {
+    const maxAge = p.maxAge === undefined ? this.o.maxAge : p.maxAge;
+    if (maxAge !== undefined && (!Number.isSafeInteger(maxAge) || maxAge < 0)) {
+      throw new RelyingPartyError('invalid_request', 'maxAge must be a non-negative safe integer');
+    }
     let loginHint: string | undefined;
     if (p.handle !== undefined) {
       const h = parseHandle(p.handle);
@@ -240,7 +260,8 @@ export class RelyingParty {
     const issuer = await this.choose({ ...p, handle: loginHint });
     const m = await this.metadata(issuer);
     const { clientId } = this.clientFor(issuer);
-    const pending: PendingSignIn = { state: rnd(), nonce: rnd(), verifier: rnd(32), issuer, loginHint, returnTo: p.returnTo };
+    const pending: PendingSignIn = { state: rnd(), nonce: rnd(), verifier: rnd(32), issuer, loginHint, returnTo: p.returnTo,
+      ...(maxAge === undefined ? {} : { maxAge, authenticationRequestedAt: Math.floor(Date.now() / 1000) }) };
     const u = new URL(m.authorization_endpoint);
     const q: Record<string, string> = {
       response_type: 'code',
@@ -254,6 +275,7 @@ export class RelyingParty {
     };
     if (loginHint) q.login_hint = loginHint; // Section 9: sent whenever the expected handle is known (R-13)
     if (p.prompt) q.prompt = p.prompt;
+    if (maxAge !== undefined) q.max_age = String(maxAge);
     for (const [k, v] of Object.entries(q)) u.searchParams.set(k, v);
     return { url: u.href, pending };
   }
@@ -292,6 +314,7 @@ export class RelyingParty {
     // Step 1 (R-2): `state` bound to this session, `iss` equal to the Issuer recorded for it.
     const state = params.get('state');
     if (!pending || !state || !sameString(state, pending.state)) throw new RelyingPartyError('invalid_state', 'this sign-in was not started in this session, or it expired');
+    if (!validAuthenticationRequest(pending)) throw new RelyingPartyError('invalid_state', 'the stored authentication age policy is malformed');
     const iss = params.get('iss');
     if (!iss || iss !== pending.issuer) throw new RelyingPartyError('issuer_mismatch', 'the response did not come from the Issuer the request was sent to');
     if (!this.issuers.has(pending.issuer) && this.o.federation !== 'any') throw new RelyingPartyError('issuer_not_accepted', 'this application does not accept that Issuer');
@@ -339,7 +362,8 @@ export class RelyingParty {
     }
     if (typeof tok.id_token !== 'string' || typeof tok.access_token !== 'string' || String(tok.token_type).toLowerCase() !== 'bearer') throw new RelyingPartyError('token_request_failed', 'malformed token response');
 
-    const claims = await this.validateIdToken(tok.id_token, { issuer: pending.issuer, nonce: pending.nonce, clientId, metadata: m, expectedHandle: pending.loginHint });
+    const claims = await this.validateIdToken(tok.id_token, { issuer: pending.issuer, nonce: pending.nonce, clientId, metadata: m, expectedHandle: pending.loginHint,
+      maxAge: pending.maxAge, authenticationRequestedAt: pending.authenticationRequestedAt });
     const expiresIn = typeof tok.expires_in === 'number' && tok.expires_in > 0 ? Math.min(tok.expires_in, 3600) : 600;
     return { ...this.identityOf(claims), claims, issuer: pending.issuer, accessToken: tok.access_token, accessTokenExpiresAt: Math.floor(Date.now() / 1000) + expiresIn, returnTo: pending.returnTo };
   }
@@ -348,8 +372,9 @@ export class RelyingParty {
    * Section 5.7 steps 2 to 7 (R-3, R-4, R-14). `expectedHandle` must come from the pending sign-in bound to
    * state, never from callback parameters. Nothing from a token that fails is returned.
    */
-  async validateIdToken(idToken: string, x: { issuer: string; nonce: string; clientId: string; metadata?: IssuerMetadata; expectedHandle?: string }): Promise<JWTPayload> {
+  async validateIdToken(idToken: string, x: IdTokenValidationOptions): Promise<JWTPayload> {
     const bad = (why: string, cause?: unknown) => new RelyingPartyError('invalid_id_token', `ID Token rejected: ${why}`, undefined, { cause });
+    if (!validAuthenticationRequest(x)) throw bad('malformed authentication age policy');
     let header;
     try {
       header = decodeProtectedHeader(idToken);
@@ -370,7 +395,7 @@ export class RelyingParty {
     if (typeof payload.aud !== 'string') throw bad('aud is not a single string');
     if (typeof payload.sub !== 'string' || payload.sub.length === 0 || payload.sub.length > 255) throw bad('sub');
     if (typeof payload.exp !== 'number') throw bad('exp');
-    if (typeof payload.iat !== 'number' || payload.iat > Math.floor(Date.now() / 1000) + T_SKEW) throw bad('iat is in the future');
+    if (typeof payload.iat !== 'number' || payload.iat > Date.now() / 1000 + T_SKEW) throw bad('iat is in the future');
     if (typeof payload.nonce !== 'string' || !sameString(payload.nonce, x.nonce)) throw bad('nonce'); // step 5
     if (payload.actor_type !== 'agent') throw bad('actor_type is not agent'); // step 6
 
@@ -403,6 +428,16 @@ export class RelyingParty {
       const discovered = await this.resolve(bindingHandle.handle);
       if (discovered !== expected) throw new RelyingPartyError('handle_binding_failed', "the handle's domain does not designate this Issuer");
       if (expected !== x.issuer) await this.metadata(expected); // Section 2.2: the designated Issuer's metadata names itself
+    }
+    // Discovery and key retrieval can consume the remaining lifetime. Recheck time at the point of acceptance.
+    const now = Date.now() / 1000;
+    if (payload.exp <= now) throw bad('expired');
+    if (payload.iat! > now + T_SKEW) throw bad('iat is in the future');
+    if (x.maxAge !== undefined) {
+      const authTime = payload.auth_time;
+      if (typeof authTime !== 'number' || !Number.isFinite(authTime) || authTime < 0 || authTime > now || authTime > payload.iat!) throw bad('auth_time');
+      if (x.authenticationRequestedAt! > now) throw bad('authentication request is in the future');
+      if (x.maxAge === 0 ? authTime < x.authenticationRequestedAt! : now - authTime > x.maxAge) throw bad('authentication is too old');
     }
     return payload;
   }

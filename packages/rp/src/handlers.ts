@@ -199,6 +199,8 @@ export function errorMessage(e: RelyingPartyError): string {
     case 'consent_required':
     case 'interaction_required':
       return 'The agent or its owner has to approve this sign-in first. Start again and complete the approval.';
+    case 'login_required':
+      return 'The agent needs to authenticate again. Start a new sign-in.';
     case 'invalid_state':
       return 'This sign-in was not started in this browser or it expired. Start again.';
     case 'duplicate_callback':

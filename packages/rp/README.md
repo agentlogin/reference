@@ -68,6 +68,7 @@ await rp.recheck(session.live);
 | `state`, `nonce`, PKCE `S256` on every request; `login_hint` when the handle is known (5.1, 9) | `begin` |
 | Callback members and session/issuer binding checked before state consumption; code sent only to the recorded issuer; one callback per sign-in (5.7 step 1) | `preflightCallback`, `complete`, `callback` |
 | ID Token: pinned algorithm (ES256), key by `kid`, `iss`, `aud`, required `exp`, `iat`, `nonce`, `actor_type` (5.7) | `validateIdToken` |
+| Requested `max_age` and request time bound to state; required `auth_time`, exact positive age bound, fresh assertion for zero (5.1, 5.7) | `begin`, `complete`, `validateIdToken` |
 | Returned handle matches the expected handle bound to state; handle-to-issuer binding; `home_iss` only from the configured Relay and within its `home_issuers` (2.5) | `validateIdToken` |
 | No Relay beside a Home Issuer it relays, judged by the Relay's metadata as it is now (9 item 10) | `begin`, `complete`, `validateIdToken` |
 | Discovery only for presented handles, cached per the response; address filtering, 64 KiB and 10 s limits on every fetched endpoint (2.2, 9) | `resolve` |
@@ -88,12 +89,35 @@ A Registered Client sets `clientId`, `clientSecret` and optionally `scopes` on t
 `owner_profile` and `owner_email`. A secret is sent only to the issuer it was configured for; a top-level
 `clientSecret` is accepted only with exactly one issuer.
 
+## Authentication freshness
+
+Set `maxAge` on `RelyingPartyOptions` to request a maximum authentication age in seconds; trusted application
+code can override it with `rp.begin({ maxAge: ... })`. Values must be non-negative safe integers. The login
+handler ignores `max_age` in incoming query parameters and forms, so an external caller cannot weaken the
+application's policy. With no configured or per-request value, `max_age` is omitted.
+
+The pending sign-in binds both `maxAge` and `authenticationRequestedAt` to the encrypted state. For a positive
+value, the kit requires a finite, non-negative numeric `auth_time` (fractional seconds are allowed) and rejects
+an ID Token when its age exceeds that value, including time spent fetching keys or checking the handle.
+There is no extra age tolerance. `maxAge: 0` instead requires
+`auth_time` to be at or after the original request time; an Owner approval delay does not turn zero into a delivery
+deadline. Future authentication times and times after the token's `iat` are rejected. Issuer and application
+clocks must therefore be synchronized; the specification's `iat` tolerance does not extend the age bound.
+`maxAge` is checked when accepting a sign-in. Configure application session lifetimes separately and continue
+using `rp.recheck` before actions with lasting effects.
+
+Low-level `validateIdToken` callers must supply the original `maxAge` and `authenticationRequestedAt` together
+in `IdTokenValidationOptions`, from their protected pending state. Never derive them from callback parameters.
+Malformed or incomplete age context is rejected. These checks implement draft 0.2 Sections 5.1 and 5.7;
+[OpenID Connect Core](https://openid.net/specs/openid-connect-core-1_0.html#AuthRequest) requires `auth_time` when
+`max_age` is requested and defines zero as active authentication.
+
 ## Errors
 
 Every failure is a `RelyingPartyError` with a `code` from a fixed set (`RelyingPartyErrorCode`), a `message` written
 by the kit, a `status` (400, 500 for `configuration_error` or `state_store_failed`, 502 for upstream failures) and, for errors the issuer
 returned, its untrusted `description`. Codes from the issuer: `access_denied`, `signup_limit_reached`,
-`consent_required`, `interaction_required`, `invalid_request`, `invalid_scope` and the other OAuth codes; any other
+`consent_required`, `interaction_required`, `login_required`, `invalid_request`, `invalid_scope` and the other OAuth codes; any other
 value becomes `issuer_error`. Codes from the kit: `invalid_state`, `duplicate_callback`, `issuer_mismatch`,
 `issuer_not_accepted`, `invalid_id_token`, `handle_binding_failed`, `token_request_failed`, `discovery_failed`,
 `userinfo_failed`, `revoked`, `reauthentication_required`, `invalid_handle`, `handle_required`, `configuration_error`, `state_store_failed`.

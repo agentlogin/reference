@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import {
-  AssertionWindowError, AssertionSubjectError, TransactionExpiredError, TransactionTokenError, KeyActivationConflictError, TERMINAL, sameConsentMetadata, consentRecordReason,
+  AssertionWindowError, AssertionSubjectError, TransactionExpiredError, TransactionTokenError, KeyActivationConflictError, TERMINAL, sameConsentMetadata, consentRecordReason, isAuthenticationTooOld,
   type Store, type Owner, type OwnerCode, type Agent, type AgentKey, type Credential, type Client,
   type Transaction, type Code, type AccessToken, type Account, type Consent, type SubjectFilter,
   type ManagementAuthorization, type TransitionEffects, type InsertKeyResult, type RedeemResult,
@@ -473,6 +473,9 @@ export class PostgresStore implements Store {
       if (effects.assertionWindow && (now < effects.assertionWindow.notBefore || now >= effects.assertionWindow.expiresAt)) throw new AssertionWindowError();
       if (assertionKey && effects.expectedShareOwner !== undefined && assertionKey.permissions.share_owner !== effects.expectedShareOwner) return undefined;
       let next = clone(supplied);
+      // Approval and retries cannot weaken the request or renew its accepted assertion.
+      next.maxAge = cur.maxAge;
+      next.assertedAt = cur.assertedAt;
       if (next.status === 'denied') next.terminalAt = now;
       const dead = next.kid ? await this.subject(s,next,now) : undefined;
       if (expired) next = expired;
@@ -518,7 +521,9 @@ export class PostgresStore implements Store {
   }
   completeTransaction(input: Transaction, expectedVersion: number, inputCode: Code, suppliedNow: number, transactionTokenHash?: string): Promise<Transaction | undefined> {
     const supplied = clone(input), code = clone(inputCode);
+    let produced: Transaction | undefined;
     return this.db.mutate('completeTransaction', async (s) => {
+      produced = undefined;
       if (supplied.ownerId) await this.quota(s,supplied.ownerId,supplied.clientId);
       const cur = await this.one<Transaction>(s,'transactions','id=$1',[supplied.id]);
       if (cur) await this.requireTransactionToken(s,cur,transactionTokenHash);
@@ -528,18 +533,23 @@ export class PostgresStore implements Store {
       const expired = await this.expiration(s,cur,now);
       const account = await this.one<Account>(s,'accounts','agent_sub=$1 AND client_id=$2',[cur.agentSub,cur.clientId]);
       const reservation = await s.query(`SELECT 1 FROM ${s.table('reservations')} WHERE txn_id=$1 AND agent_sub=$2 AND owner_id=$3 AND client_id=$4 AND expires_at>$5`,[cur.id,cur.agentSub,cur.ownerId,cur.clientId,now]);
-      if (dead || expired || (cur.passedCap && !account && !reservation.rowCount)) {
-        const next: Transaction = { ...cur,...expired,status:expired?.status ?? 'denied',reason:expired ? expired.reason : dead ?? 'signup_limit_reached',terminalAt:expired?.terminalAt ?? now,challenge:undefined,version:cur.version+1 };
+      const stale = isAuthenticationTooOld(cur.maxAge,cur.assertedAt,now);
+      if (dead || expired || stale || (cur.passedCap && !account && !reservation.rowCount)) {
+        const next: Transaction = { ...cur,...expired,status:expired?.status ?? 'denied',reason:expired ? expired.reason : dead ?? (stale ? 'login_required' : 'signup_limit_reached'),terminalAt:expired?.terminalAt ?? now,challenge:undefined,version:cur.version+1 };
         await this.replace(s,'transactions','id',cur.id,next);
         await s.query(`DELETE FROM ${s.table('reservations')} WHERE txn_id=$1`,[cur.id]);
+        produced = next;
         return next;
       }
       const ttl = code.expiresAt - suppliedNow;
       if (!Number.isSafeInteger(ttl) || ttl <= 0) throw new Error('Invalid code lifetime');
       const issued: Code = { ...code,txnId:cur.id,clientId:cur.clientId,redirectUri:cur.redirectUri,codeChallenge:cur.codeChallenge,nonce:cur.nonce,scopes:cur.scopes,
         handle:cur.handle!,kid:cur.kid!,keyEnrollment:cur.keyEnrollment!,agentSub:cur.agentSub!,agentVersion:cur.agentVersion!,accountVersion:cur.accountVersion!,
-        authTime:cur.assertedAt!,expiresAt:now+ttl,used:false,voided:false,replayed:undefined };
+        authTime:cur.assertedAt!,maxAge:cur.maxAge,expiresAt:now+ttl,used:false,voided:false,replayed:undefined };
       const next: Transaction = { ...cur,status:'completed',terminalAt:now,challenge:undefined,codeIssued:true,version:cur.version+1 };
+      // Later inserts can wait on row, index, or table locks. If age expires during
+      // those waits, discard every speculative success effect before recording denial.
+      await s.query('SAVEPOINT completion_effects');
       await this.replace(s,'transactions','id',cur.id,next);
       await s.query(`INSERT INTO ${s.table('codes')}(data) VALUES($1::jsonb)`,[JSON.stringify(issued)]);
       const nextAccount: Account = account ? { ...account,lastSignedInAt:now,signInCount:account.signInCount+1 } :
@@ -549,10 +559,20 @@ export class PostgresStore implements Store {
       await s.query(`DELETE FROM ${s.table('reservations')} WHERE txn_id=$1`,[cur.id]);
       const acceptedAt = await s.now();
       if (acceptedAt >= cur.expiresAt || await this.subject(s,cur,acceptedAt) || (cur.passedCap && !account && acceptedAt >= cur.expiresAt)) throw new WindowElapsed('expired');
+      if (isAuthenticationTooOld(cur.maxAge,cur.assertedAt,acceptedAt)) {
+        await s.query('ROLLBACK TO SAVEPOINT completion_effects');
+        const denied: Transaction = { ...cur,status:'denied',reason:'login_required',terminalAt:acceptedAt,challenge:undefined,version:cur.version+1 };
+        await this.replace(s,'transactions','id',cur.id,denied);
+        await s.query(`DELETE FROM ${s.table('reservations')} WHERE txn_id=$1`,[cur.id]);
+        produced = denied;
+        return denied;
+      }
+      produced = next;
       return next;
     }, async (s) => {
       const c = await this.one<Code>(s,'codes','hash=$1 AND txn_id=$2',[code.hash,supplied.id]);
       const tx = await this.one<Transaction>(s,'transactions','id=$1',[supplied.id]);
+      if (produced?.status === 'denied' && sameRecord(tx,produced)) return {resolved:true,value:tx};
       return c && tx?.status === 'completed' && tx.version === expectedVersion+1 && c.agentSub === supplied.agentSub && c.keyEnrollment === supplied.keyEnrollment ? {resolved:true,value:tx} : unknown;
     }).catch((error) => { if (error instanceof WindowElapsed) return undefined; throw error; });
   }
@@ -569,10 +589,10 @@ export class PostgresStore implements Store {
         return 'used';
       }
       if (code.voided || await this.subject(s,code,now)) return 'void';
-      if (now >= code.expiresAt) return 'expired';
+      if (now >= code.expiresAt || isAuthenticationTooOld(code.maxAge,code.authTime,now)) return 'expired';
       await s.query(`UPDATE ${s.table('codes')} SET data=data || '{"used":true}'::jsonb,redemption_attempt=$2,redeemed_at=$3,issuance_until=$4 WHERE hash=$1`,[hash,attempt,now,now+this.issuanceWindow]);
       const acceptedAt = await s.now();
-      if (acceptedAt >= code.expiresAt) throw new WindowElapsed('expired');
+      if (acceptedAt >= code.expiresAt || isAuthenticationTooOld(code.maxAge,code.authTime,acceptedAt)) throw new WindowElapsed('expired');
       if (await this.subject(s,code,acceptedAt)) throw new WindowElapsed('void');
       return 'ok';
     }, async (s) => {
@@ -580,6 +600,7 @@ export class PostgresStore implements Store {
       if (!row) return unknown;
       if (row.data.replayed) return {resolved:true,value:'used'};
       const now = await s.now();
+      if (row.redemption_attempt === attempt && row.data.used && isAuthenticationTooOld(row.data.maxAge,row.data.authTime,now)) return {resolved:true,value:'expired'};
       return row.redemption_attempt === attempt && row.data.used && Number(row.issuance_until)>now && !await this.subject(s,row.data,now) ? {resolved:true,value:'ok'} : unknown;
     }).catch((error) => { if (error instanceof WindowElapsed) return error.result; throw error; });
   }
@@ -591,14 +612,14 @@ export class PostgresStore implements Store {
       const row = (await s.query<{data:Code;issuance_until:string}>(`SELECT data,issuance_until FROM ${s.table('codes')} WHERE txn_id=$1`,[token.txnId])).rows[0];
       const now = await s.now();
       if (!row || !row.data.used || row.data.replayed || Number(row.issuance_until)<=now || await this.subject(s,token,now)) return false;
-      if (await this.subject(s,row.data,now)) return false;
+      if (isAuthenticationTooOld(row.data.maxAge,row.data.authTime,now) || await this.subject(s,row.data,now)) return false;
       if ((['handle','kid','agentSub','keyEnrollment','agentVersion','accountVersion','clientId'] as const).some((field)=>row.data[field] !== token[field]) || !isDeepStrictEqual(row.data.scopes,token.scopes)) return false;
       const ttl = token.expiresAt - suppliedNow;
       if (!Number.isSafeInteger(ttl) || ttl <= 0) return false;
       const issued = { ...token,issuedAt:now,expiresAt:now+ttl };
       const result = await s.query(`INSERT INTO ${s.table('access_tokens')}(data) VALUES($1::jsonb) ON CONFLICT DO NOTHING`,[JSON.stringify(issued)]);
       const acceptedAt = await s.now();
-      if (Number(row.issuance_until)<=acceptedAt || await this.subject(s,row.data,acceptedAt)) throw new WindowElapsed('expired');
+      if (Number(row.issuance_until)<=acceptedAt || isAuthenticationTooOld(row.data.maxAge,row.data.authTime,acceptedAt) || await this.subject(s,row.data,acceptedAt)) throw new WindowElapsed('expired');
       return result.rowCount === 1;
     }, async (s) => {
       const stored = await this.one<AccessToken>(s,'access_tokens','hash=$1 AND txn_id=$2',[token.hash,token.txnId]);

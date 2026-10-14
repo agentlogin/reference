@@ -161,7 +161,14 @@ export function createIssuerApp(ctx: IssuerContext): Hono {
       const prompt = one('prompt');
       const loginHintRaw = one('login_hint');
       const responseMode = one('response_mode');
-      for (const k of ['max_age', 'claims', 'display', 'ui_locales', 'id_token_hint', 'acr_values']) one(k); // ignored, but not repeatable
+      // RFC 6749 Section 3.1: an optional parameter without a value is omitted, not the numeric value zero.
+      const maxAgeRaw = one('max_age') || undefined;
+      if (maxAgeRaw !== undefined && !/^\d+$/.test(maxAgeRaw)) {
+        return redirectError('invalid_request', 'max_age must be non-negative integer seconds', state);
+      }
+      // Decimal integers have no protocol upper bound. Saturation preserves their effect over our safe timestamps.
+      const maxAge = maxAgeRaw === undefined ? undefined : Math.min(Number(maxAgeRaw), Number.MAX_SAFE_INTEGER);
+      for (const k of ['claims', 'display', 'ui_locales', 'id_token_hint', 'acr_values']) one(k); // ignored, but not repeatable
       if (one('request') !== undefined) return redirectError('request_not_supported', 'request objects are not supported', state);
       if (one('request_uri') !== undefined) return redirectError('request_uri_not_supported', 'request_uri is not supported', state);
       if (responseMode !== undefined && responseMode !== 'query') return redirectError('invalid_request', 'response_mode must be query', state);
@@ -189,6 +196,7 @@ export function createIssuerApp(ctx: IssuerContext): Hono {
         nonce,
         codeChallenge,
         prompt: promptValue,
+        maxAge,
         loginHint,
         requester: ua ? { user_agent: ua.slice(0, 200) } : undefined,
         sessionSecret,

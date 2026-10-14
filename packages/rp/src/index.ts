@@ -1,5 +1,5 @@
 export { RelyingParty } from './rp.js';
-export type { RelyingPartyOptions, IssuerConfig, BeginOptions, Begun, AgentIdentity, OwnerIdentity, SignIn, LiveCheck, ClientMetadataInput } from './rp.js';
+export type { RelyingPartyOptions, IssuerConfig, BeginOptions, Begun, IdTokenValidationOptions, AgentIdentity, OwnerIdentity, SignIn, LiveCheck, ClientMetadataInput } from './rp.js';
 export { RelyingPartyError, ISSUER_ERROR_CODES, LOCAL_ERROR_CODES } from './errors.js';
 export type { RelyingPartyErrorCode } from './errors.js';
 export { createHandlers, errorMessage, errorPage, safeReturnTo } from './handlers.js';

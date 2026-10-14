@@ -3,7 +3,7 @@ import { SignJWT } from 'jose';
 import { createHash } from 'node:crypto';
 import type { IssuerContext } from './context.js';
 import { OAuthError, invalidToken } from './errors.js';
-import type { Agent, Client, Owner } from './store.js';
+import { isAuthenticationTooOld, type Agent, type Client, type Owner } from './store.js';
 import { nowSeconds, randomSecret, safeEqual, sha256 } from './util.js';
 import { subjectState } from './state.js';
 import type { Scope } from './constants.js';
@@ -87,7 +87,12 @@ export async function exchangeCode(ctx: IssuerContext, client: Client, r: TokenR
     await ctx.store.revokeAccessTokens({ txnId: code.txnId });
     throw fail();
   }
-  const remaining = persistedToken.expiresAt - await ctx.store.currentTime(ctx.now());
+  const responseTime = await ctx.store.currentTime(ctx.now());
+  if (isAuthenticationTooOld(code.maxAge, code.authTime, responseTime)) {
+    await ctx.store.revokeAccessTokens({ txnId: code.txnId });
+    throw fail();
+  }
+  const remaining = persistedToken.expiresAt - responseTime;
   if (remaining <= 0) throw fail();
   return { access_token: accessToken, token_type: 'Bearer', expires_in: remaining, id_token: idToken, scope: code.scopes.join(' ') };
 }

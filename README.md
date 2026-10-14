@@ -4,8 +4,10 @@ Reference code for the [Agent Login](https://github.com/agentlogin/spec) specifi
 server), a relying-party library with a "Sign in with your agent" button, an agent command-line client and
 SDKs, and a conformance test harness. Apache-2.0.
 
-Status: milestone 1 landed (10 October 2026): the reference issuer passes the conformance harness end to end on the
-JSON path and the wait-page path. The specification is at draft 0.1; code lands milestone by milestone:
+Status: draft 0.1 is the published baseline; this branch also implements selected draft 0.2 changes. See the
+[pinned compatibility status](docs/draft-0.2-status.md) for implemented paths, remaining requirements and evidence
+gaps. The reference issuer passes the partial harness on JSON and wait-page flows; this is not full conformance.
+The implementation milestones are:
 
 1. Issuer core and conformance harness. Done except Ed25519 keys, `private_key_jwt`, rate limits and Owner
    authentication pages; see `packages/issuer/README.md`.
@@ -58,6 +60,7 @@ and use the same database, schema and `STATE_SECRET` across replicas. The
 ordinary requests do not run DDL. Other applications can use their own session infrastructure independently of the
 callback adapter.
 `npm test` reports PostgreSQL integration tests as skipped when `AGENTLOGIN_TEST_POSTGRES_URL` is absent;
-`REQUIRE_POSTGRES_TESTS=1 npm run test:postgres` requires a configured database, as the dedicated CI job does.
+`REQUIRE_POSTGRES_TESTS=1 npm run test:postgres` requires a configured database. CI runs the entire `npm test`
+suite with PostgreSQL required, including client/RP tests, conformance probes, package artifacts and the example.
 The database tests create isolated schemas and temporary restricted roles; use a dedicated test database and a
 test user with schema-creation and role-creation privileges.

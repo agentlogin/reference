@@ -94,7 +94,7 @@ export type TxStatus = 'awaiting_agent' | 'awaiting_owner' | 'awaiting_consent' 
 export const TERMINAL: ReadonlySet<TxStatus> = new Set(['completed', 'denied', 'expired']);
 export type DenyReason =
   | 'cancelled' | 'access_denied' | 'key_revoked' | 'owner_declined'
-  | 'consent_required' | 'interaction_required' | 'signup_limit_reached';
+  | 'consent_required' | 'interaction_required' | 'signup_limit_reached' | 'login_required';
 export type ConsentReason = 'first_visit' | 'material_change' | 'expired' | 'prompt_consent' | 'policy';
 export interface Disclosure { scope: Scope; title: string; description: string }
 export interface Transaction {
@@ -108,6 +108,8 @@ export interface Transaction {
   nonce: string;
   codeChallenge: string;
   prompt?: 'consent' | 'none';
+  /** Immutable requested authentication age in seconds; zero requires this transaction's fresh assertion. */
+  maxAge?: number;
   loginHint?: string;
   disclosure: Disclosure[];
   requester?: { user_agent?: string; network?: string };
@@ -157,6 +159,8 @@ export interface Code {
   agentVersion: number;
   accountVersion: number;
   authTime: number;
+  /** Bound to the original Authentication Request, never supplied by the redeeming caller. */
+  maxAge?: number;
   expiresAt: number;
   used: boolean;
   voided: boolean;
@@ -217,6 +221,13 @@ export interface Account {
 export interface SubjectFilter { kid?: string; keyEnrollment?: string; handle?: string; clientId?: string; ownerId?: string; txnId?: string }
 export type InsertKeyResult = 'unauthorized' | 'ok' | 'enrolled' | 'other_handle' | 'revoked';
 export type RedeemResult = 'ok' | 'used' | 'void' | 'expired' | 'unknown';
+
+/** Section 5.1: equality is allowed; zero requests fresh authentication, not instantaneous delivery. */
+export function isAuthenticationTooOld(maxAge: number | undefined, authTime: number | undefined, now: number): boolean {
+  if (maxAge === undefined) return false; // Existing records predate this optional request constraint.
+  if (!Number.isSafeInteger(maxAge) || maxAge < 0 || !Number.isSafeInteger(authTime) || authTime! < 0) return true;
+  return maxAge > 0 && now - authTime! > maxAge;
+}
 
 export interface ManagementAuthorization extends Credential { agentSub: string }
 export interface TransitionEffects {
@@ -359,25 +370,27 @@ export interface Store {
    * First assertions with invalid key/Agent authority throw AssertionSubjectError without consuming the challenge;
    * Account denial remains an accepted gate. A changed expectedShareOwner returns a conflict with no effects,
    * so the caller can recompute gates using the same enrollment's current permission. A supplied transactionTokenHash is checked before version/terminal checks and throws TransactionTokenError
-   * if explicit revocation removed its authority.
+   * if explicit revocation removed its authority. The original maxAge is immutable; only first assertion acceptance
+   * sets assertedAt, using the store's fresh clock. Subsequent transitions cannot refresh that time.
    */
   updateTransaction(t: Transaction, expectedVersion: number, effects: TransitionEffects): Promise<Transaction | undefined>;
   /** Transactions whose stored status is not terminal (an expired one may still be listed; callers look at `expiresAt`). */
   listOpenTransactions(filter: SubjectFilter): Promise<Transaction[]>;
 
-  /** ATOMIC. Validate subject, reservation and expiry; complete, insert code, count Account and release reservation together. */
+  /** ATOMIC. Validate subject, reservation, expiry and maxAge; complete, insert code, count Account and release
+   * reservation together. Stale authentication ends denied/login_required without code, Account or count changes. */
   completeTransaction(t: Transaction, expectedVersion: number, code: Code, now: number, transactionTokenHash?: string): Promise<Transaction | undefined>;
 
   // ---- codes and Access Tokens (Section 5) ----
   getCode(hash: string): Promise<Code | undefined>;
   /**
-   * ATOMIC. Marks the code used if it is neither used, void nor expired; otherwise says which. One redemption wins.
+   * ATOMIC. Marks the code used if it is neither used, void nor expired (including maxAge); otherwise says which. One redemption wins.
    * A code that was used already is also marked `replayed`, and its Access Tokens are revoked in the same operation.
    */
   redeemCode(hash: string, now: number): Promise<RedeemResult>;
   /** ATOMIC per code. Voids every matching code that has not been used. */
   voidCodes(filter: SubjectFilter): Promise<void>;
-  /** ATOMIC. Issue only for a redeemed, unreplayed code and a current subject lifecycle. */
+  /** ATOMIC. Issue only for a redeemed, unreplayed code, a current subject lifecycle and its stored maxAge. */
   insertAccessToken(t: AccessToken, now: number): Promise<boolean>;
   getAccessToken(hash: string): Promise<AccessToken | undefined>;
   /** ATOMIC per token. Revokes every matching Access Token. */
@@ -766,7 +779,7 @@ export class StoreState implements SyncStore {
     if (effects.assertionWindow && (effects.now < effects.assertionWindow.notBefore || effects.now >= effects.assertionWindow.expiresAt)) throw new AssertionWindowError();
     if (cur.status === 'awaiting_agent' && t.kid && effects.expectedShareOwner !== undefined &&
       this.enrollmentKey(t.kid, t.keyEnrollment!)?.permissions.share_owner !== effects.expectedShareOwner) return undefined;
-    const next = copy(expired ?? t);
+    const next = { ...copy(expired ?? t), maxAge: cur.maxAge, assertedAt: cur.assertedAt };
     const deny = (reason: DenyReason) => { next.status = 'denied'; next.reason = reason; next.terminalAt = effects.now; next.challenge = undefined; };
     if (!expired && next.kid) {
       const reason = this.subjectReason(next, effects.now);
@@ -811,15 +824,16 @@ export class StoreState implements SyncStore {
     const dead = this.subjectReason(cur, now);
     const reservation = cur.ownerId && this.reservations.get(`${cur.ownerId}\u0000${cur.clientId}`)?.get(cur.id);
     const needsReservation = cur.passedCap && !this.accounts.has(`${cur.handle}\u0000${cur.clientId}`);
-    if (now >= cur.expiresAt || dead || (needsReservation && (!reservation || reservation.expiresAt <= now))) {
-      return this.updateTransaction({ ...cur, status: 'denied', reason: dead ?? 'signup_limit_reached', terminalAt: now, challenge: undefined }, expectedVersion, { now });
+    const staleAuthentication = isAuthenticationTooOld(cur.maxAge, cur.assertedAt, now);
+    if (now >= cur.expiresAt || dead || staleAuthentication || (needsReservation && (!reservation || reservation.expiresAt <= now))) {
+      return this.updateTransaction({ ...cur, status: 'denied', reason: dead ?? (staleAuthentication ? 'login_required' : 'signup_limit_reached'), terminalAt: now, challenge: undefined }, expectedVersion, { now });
     }
     if (this.codes.has(code.hash)) throw new Error('Authorization code already exists');
     const next = { ...copy(cur), version: expectedVersion + 1, status: 'completed' as const, terminalAt: now, challenge: undefined, codeIssued: true };
     const issued: Code = { ...copy(code), txnId: cur.id, clientId: cur.clientId, redirectUri: cur.redirectUri,
       codeChallenge: cur.codeChallenge, nonce: cur.nonce, scopes: copy(cur.scopes), handle: cur.handle!, kid: cur.kid!,
       keyEnrollment: cur.keyEnrollment!, agentSub: cur.agentSub!, agentVersion: cur.agentVersion!, accountVersion: cur.accountVersion!,
-      authTime: cur.assertedAt!, used: false, voided: false, replayed: undefined };
+      authTime: cur.assertedAt!, maxAge: cur.maxAge, used: false, voided: false, replayed: undefined };
     this.transactions.set(next.id, next);
     this.codes.set(code.hash, issued);
     this.recordSignIn({ handle: next.handle!, clientId: next.clientId, ownerId: next.ownerId!, txnId: next.id, now });
@@ -839,14 +853,14 @@ export class StoreState implements SyncStore {
       return 'used';
     }
     if (c.voided || this.subjectReason(c, now)) return 'void';
-    if (now >= c.expiresAt) return 'expired';
+    if (now >= c.expiresAt || isAuthenticationTooOld(c.maxAge, c.authTime, now)) return 'expired';
     c.used = true;
     return 'ok';
   }
   voidCodes(f: SubjectFilter) { for (const c of this.codes.values()) if (!c.used && matches(c, f)) c.voided = true; }
   insertAccessToken(t: AccessToken, now: number) {
     const code = [...this.codes.values()].find((c) => c.txnId === t.txnId);
-    if (!code || !code.used || code.replayed || this.subjectReason(code, now) || this.subjectReason(t, now)) return false;
+    if (!code || !code.used || code.replayed || isAuthenticationTooOld(code.maxAge, code.authTime, now) || this.subjectReason(code, now) || this.subjectReason(t, now)) return false;
     for (const field of ['handle', 'kid', 'agentSub', 'keyEnrollment', 'agentVersion', 'accountVersion', 'clientId'] as const) {
       if (t[field] !== code[field]) return false;
     }

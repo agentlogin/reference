@@ -992,6 +992,76 @@ class Harness {
         this.credential = saved;
       }
     });
+    await this.check('I-32', 'max_age rejects malformed and repeated values; an empty value is omitted', async () => {
+      for (const value of ['-1', '+1', '1.5', '1e3', 'NaN', 'Infinity', ' 1']) {
+        const response = await call(this.authUrl(this.client, { max_age: value }).url);
+        expect(response.status === 400 && obj(response.json).error === 'invalid_request', `invalid max_age ${JSON.stringify(value)} → ${response.status} ${obj(response.json).error ?? ''}`);
+      }
+      const empty = await this.start(this.client, { max_age: '' }); // RFC 6749 Section 3.1: no value means omitted.
+      expect(empty.tx.status === 'awaiting_agent', 'an empty optional max_age must behave as omitted');
+      const repeated = await call(this.authUrl(this.client, { max_age: '1' }, [['max_age', '2']]).url);
+      expect(repeated.status === 400 && obj(repeated.json).error === 'invalid_request', 'repeated max_age must be invalid_request');
+    });
+    const startAgeReady = async (maxAge: string) => {
+      const started = await this.start(this.client, { max_age: maxAge });
+      const assertionStart = performance.now();
+      const asserted = obj((await this.assert(started.tx, this.agent, { accept_disclosure: true })).json);
+      const assertionEnd = performance.now();
+      expect(asserted.status === 'ready', `max_age=${maxAge} assertion → ${asserted.status} ${asserted.reason ?? ''}`);
+      return { started, asserted, assertionStart, assertionEnd };
+    };
+    await this.check('I-32', 'Positive max_age expires before code issuance', async () => {
+      const continuation = await startAgeReady('1');
+      await sleep(2100); // More than two whole-second ticks; the transaction's ordinary lifetime remains live.
+      const denied = await this.cont(continuation.asserted.next.url, continuation.asserted.transaction_token);
+      expect(denied.status === 200 && typeof obj(denied.json).redirect === 'string', `stale authentication continuation → ${denied.status}`);
+      expect(new URL(obj(denied.json).redirect).searchParams.get('error') === 'login_required', 'over-age authentication must not issue a code');
+      const state = obj((await this.get(continuation.asserted, continuation.asserted.transaction_token)).json);
+      expect(state.status === 'denied' && state.reason === 'login_required', 'stale completion must retain denied/login_required');
+    });
+    await this.check('I-32', 'Zero max_age permits delayed delivery and preserves the original authentication time', async () => {
+      const zero = await startAgeReady('0');
+      await sleep(2100);
+      const completed = await this.cont(zero.asserted.next.url, zero.asserted.transaction_token);
+      expect(completed.status === 200 && typeof obj(completed.json).redirect === 'string', `delayed zero-age continuation → ${completed.status}`);
+      const redirect = new URL(obj(completed.json).redirect);
+      expect(!!redirect.searchParams.get('code'), 'zero requires fresh authentication for the request, not immediate delivery');
+      const exchangeStart = performance.now();
+      const tokens = await this.exchange(this.client, redirect.searchParams.get('code')!, zero.started.verifier);
+      const exchangeEnd = performance.now();
+      expect(tokens.status === 200, `delayed max_age=0 exchange → ${tokens.status}`);
+      const { payload } = await jwtVerify(obj(tokens.json).id_token, createRemoteJWKSet(new URL(m.jwks_uri)), { issuer: iss, audience: this.client.client_id });
+      expect(typeof payload.auth_time === 'number' && typeof payload.iat === 'number', 'max_age=0 requires auth_time and iat');
+      // As in I-49, compare readings from the Issuer's clock against measured elapsed intervals. This detects
+      // both reused old authentication and replacing the original time with a value just before token issuance.
+      const gap = payload.iat - payload.auth_time;
+      const least = (exchangeStart - zero.assertionEnd) / 1000 - 1;
+      const most = (exchangeEnd - zero.assertionStart) / 1000 + 1;
+      expect(gap > least && gap < most, `max_age=0 auth_time must be the time this request's assertion was accepted: observed iat - auth_time ${gap}s, expected between ${least.toFixed(3)} and ${most.toFixed(3)}s`);
+    });
+    await this.check('I-32', 'Positive max_age expires before token issuance', async () => {
+      // Code acquisition must fit inside the requested age, while redemption must happen after it. Retry with
+      // a wider window if ordinary network/DB scheduling consumed the first one; other I-32 probes are independent.
+      for (const maxAge of [3, 10]) {
+        const candidate = await startAgeReady(String(maxAge));
+        const codeRequestedAt = performance.now();
+        const issued = await this.cont(candidate.asserted.next.url, candidate.asserted.transaction_token);
+        expect(issued.status === 200 && typeof obj(issued.json).redirect === 'string', `max_age code continuation → ${issued.status}`);
+        const redirect = new URL(obj(issued.json).redirect);
+        if (redirect.searchParams.get('error') === 'login_required') continue;
+        const code = redirect.searchParams.get('code');
+        expect(!!code, 'fresh max_age continuation must issue a code');
+        await sleep(Math.max(1, candidate.assertionEnd + (maxAge + 1) * 1000 + 100 - performance.now()));
+        // Section 1.5's T_CODE is 60s. A long scheduler/transport stall cannot prove which expiry was enforced.
+        if (performance.now() - codeRequestedAt >= 59_000) throw new Skip('infrastructure delay approached the ordinary 60-second code lifetime; authentication-age rejection could not be isolated');
+        const refused = await this.exchange(this.client, code!, candidate.started.verifier);
+        if (performance.now() - codeRequestedAt >= 59_000) throw new Skip('infrastructure delay approached the ordinary 60-second code lifetime during exchange; authentication-age rejection could not be isolated');
+        expect(refused.status === 400 && obj(refused.json).error === 'invalid_grant' && obj(refused.json).access_token === undefined && obj(refused.json).id_token === undefined, 'an unused code with stale authentication must not yield tokens');
+        return;
+      }
+      throw new Skip('could not acquire a fresh code within either the 3-second or 10-second authentication-age window; token-age enforcement is inconclusive, independent completion and zero-age probes still ran');
+    });
+
     await this.check('I-33', 'session_token accepted as Bearer on the resource; continue answers only to the credential that released it', async () => {
       const s = await this.start();
       const g = await this.get(s.tx, s.tx.session_token);

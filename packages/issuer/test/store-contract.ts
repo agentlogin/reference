@@ -48,12 +48,12 @@ async function client(f: StoreContractFixture, maxSignups = 1): Promise<Client> 
   return record;
 }
 
-async function pending(f: StoreContractFixture, c: Client, id: string, ttl = 300): Promise<Transaction> {
+async function pending(f: StoreContractFixture, c: Client, id: string, ttl = 300, maxAge?: number): Promise<Transaction> {
   const tx: Transaction = { id, version: 0, clientId: c.clientId, redirectUri: c.redirectUris[0]!, scopes: ['openid'],
     state: `state-${id}`, nonce: `nonce-${id}`, codeChallenge: hash(`pkce-${id}`), disclosure: [], status: 'awaiting_agent',
     challenge: `challenge-${id}`, createdAt: f.now(), expiresAt: f.now() + ttl, acceptDisclosure: false,
     deliverToSession: false, ownerApprovalOutstanding: false, reviewOutstanding: false, passedCap: false,
-    sessionSecretHash: hash(`session-${id}`), continueSecret: `continue-${id}`, codeIssued: false };
+    sessionSecretHash: hash(`session-${id}`), continueSecret: `continue-${id}`, codeIssued: false, ...(maxAge === undefined ? {} : { maxAge }) };
   await f.store.insertTransaction(tx);
   return tx;
 }
@@ -99,6 +99,89 @@ export function registerStoreContract(name: string, factory: StoreContractFactor
       await run(f);
     });
   };
+
+  check('authentication age and first assertion time stay immutable through transitions and code binding', async (f) => {
+    const a = await subject(f); const c = await client(f);
+    const original = await pending(f, c, 'immutable-authentication-age', 300, 10);
+    const authTime = f.now();
+    const tx = (await f.store.updateTransaction({ ...asserted(f, original, a), maxAge: 0, assertedAt: authTime + 100 }, 0,
+      { now: f.now(), maxSignups: 1 }))!;
+    assert.equal(tx.assertedAt, authTime);
+    assert.equal(tx.maxAge, 10);
+    await f.advance(3);
+    const updated = (await f.peer.updateTransaction({ ...tx, assertedAt: f.now(), maxAge: undefined }, tx.version, { now: f.now() }))!;
+    assert.equal(updated.assertedAt, authTime, 'review, approval and retry never refresh authentication');
+    assert.equal(updated.maxAge, 10);
+    await f.advance(7);
+    const proposedCode = { ...codeFor(f, updated), maxAge: 0, authTime: f.now() };
+    const completed = await f.store.completeTransaction({ ...updated, maxAge: 0, assertedAt: f.now() }, updated.version, proposedCode, f.now());
+    assert.equal(completed?.status, 'completed', 'positive age equality is allowed');
+    const code = (await f.peer.getCode(proposedCode.hash))!;
+    assert.equal(code.maxAge, 10);
+    assert.equal(code.authTime, authTime);
+    assert.equal(await f.peer.redeemCode(code.hash, f.now()), 'ok');
+    assert.equal(await f.store.insertAccessToken(tokenFor(f, code), f.now()), true);
+  });
+
+  check('stale authentication denies completion without code or account and releases only its own reservation', async (f) => {
+    const a = await subject(f); const b = await subject(f, 'second'); const c = await client(f);
+    const original = await pending(f, c, 'stale-authentication', 300, 1);
+    const tx = (await f.store.updateTransaction(asserted(f, original, a), 0, { now: f.now(), maxSignups: 1 }))!;
+    const sibling = await ready(f, c, a, 'same-agent-reservation');
+    await f.advance(2);
+    const deniedAt = f.now();
+    const code = codeFor(f, tx);
+    const result = await f.peer.completeTransaction({ ...tx, maxAge: 0, assertedAt: f.now() }, tx.version, { ...code, authTime: f.now(), maxAge: 0 }, f.now());
+    assert.equal(result?.status, 'denied');
+    assert.equal(result?.reason, 'login_required');
+    assert.equal(result?.terminalAt, deniedAt);
+    assert.equal(result?.expiresAt, tx.expiresAt);
+    assert.equal(result?.assertedAt, tx.assertedAt);
+    assert.equal(await f.store.getCode(code.hash), undefined);
+    assert.equal(await f.store.getAccount(a.agent.handle, c.clientId), undefined);
+    assert.equal(await f.store.signupsEver(a.owner.id, c.clientId), 0);
+    assert.equal((await ready(f, c, b, 'other-agent-blocked')).reason, 'signup_limit_reached', 'sibling reservation still holds capacity');
+    await f.peer.updateTransaction({ ...sibling, status: 'denied', reason: 'cancelled' }, sibling.version, { now: f.now() });
+    assert.equal((await ready(f, c, b, 'other-agent-admitted')).status, 'ready', 'stale transaction did not leave a reservation');
+    await f.advance(31);
+    assert.equal(await f.store.readTransaction(tx.id, { now: f.now(), retainFor: 30 }), undefined);
+    assert.equal((await f.peer.getTransaction(tx.id))?.terminalAt, deniedAt);
+  });
+
+  check('authentication age is rechecked at code redemption and token insertion', async (f) => {
+    const a = await subject(f); const c = await client(f);
+    const codes: Code[] = [];
+    for (const id of ['redeem-late', 'insert-late']) {
+      const tx = await pending(f, c, id, 300, 10);
+      const accepted = (await f.store.updateTransaction(asserted(f, tx, a), 0, { now: f.now(), maxSignups: 1 }))!;
+      codes.push(await complete(f, accepted));
+    }
+    await f.advance(10);
+    assert.equal(await f.store.redeemCode(codes[1]!.hash, f.now()), 'ok', 'redemption accepts equality');
+    await f.advance(1);
+    assert.equal(await f.peer.redeemCode(codes[0]!.hash, f.now()), 'expired');
+    assert.equal((await f.store.getCode(codes[0]!.hash))?.used, false);
+    const token = tokenFor(f, codes[1]!);
+    assert.equal(await f.peer.insertAccessToken(token, f.now()), false);
+    assert.equal(await f.store.getAccessToken(token.hash), undefined);
+  });
+
+  for (const maxAge of [0, undefined]) {
+    check(`${maxAge === 0 ? 'zero' : 'absent'} max_age permits delayed approval and preserves original authentication`, async (f) => {
+      const a = await subject(f); const c = await client(f);
+      const tx = await pending(f, c, 'delayed-approval', 300, maxAge);
+      const accepted = (await f.store.updateTransaction({ ...asserted(f, tx, a), status: 'awaiting_owner', ownerApprovalOutstanding: true }, 0, { now: f.now(), maxSignups: 1 }))!;
+      await f.advance(60);
+      const approved = (await f.peer.updateTransaction({ ...accepted, status: 'ready', ownerApprovalOutstanding: false, assertedAt: f.now(), maxAge: 1 }, accepted.version, { now: f.now() }))!;
+      assert.equal(approved.assertedAt, accepted.assertedAt);
+      assert.equal(approved.maxAge, maxAge, 'legacy transactions cannot acquire a caller-supplied age bound');
+      const code = await complete(f, approved);
+      await f.advance(30);
+      assert.equal(await f.store.redeemCode(code.hash, f.now()), 'ok');
+      assert.equal(await f.peer.insertAccessToken(tokenFor(f, code), f.now()), true);
+      assert.equal((await f.store.getCode(code.hash))?.authTime, accepted.assertedAt);
+    });
+  }
 
   check('records are copied and handle identity cannot be overwritten or reused by stale authorization', async (f) => {
     const s = await subject(f);

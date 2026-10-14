@@ -42,13 +42,23 @@ and report skip, naming what is missing, without it:
 | `--relay-issuer URL` | a Relay whose metadata the issuer can fetch, with `issuer` and `op_policy_uri` (Section 4.4); a domain name, so that look-alike hosts can be formed | I-45, I-48 |
 | `--email-only-owner-credential CRED` | with `--handle`: a second Owner Credential of the same Owner, obtained through the issuer's one-time-code sign-in alone (library, with `adminToken`: `ownerEmailSignIn(email)`, which performs that sign-in) | I-45 |
 
-Covered today: I-1 to I-4, I-6, I-7, I-9 to I-15, I-17, I-19 to I-24, I-26 to I-28, I-33, I-37 to I-49, and two checks
+Covered today: I-1 to I-4, I-6, I-7, I-9 to I-15, I-17, I-19 to I-24, I-26 to I-28, I-32, I-33, I-37 to I-49, and two checks
 of the reference issuer's own surface: M-1 (Delegated Credential binding) and M-2 (the bootstrap `session_auth` marker).
 I-49 runs last: it audits every response the whole run received from the authorization, transaction, token, UserInfo,
 registration and agents endpoints. Owner approval (I-13, I-45) is exercised through the reference issuer's
 `/owner/transactions/{id}` API, which the specification does not define.
 These identifiers name check groups, not exhaustive coverage of every requirement in those groups. Groups absent
 from this list have no dedicated probes.
+
+I-32 independently checks `max_age` syntax and duplicate rejection (an empty value is omitted), positive age limits
+at completion, delayed delivery with zero, and positive age limits at token exchange. The zero-age probe compares
+the signed `iat`/`auth_time` interval with the measured assertion-to-exchange interval, so an old or replaced
+authentication time cannot pass merely by being earlier than issuance. Token-code acquisition first uses a
+three-second age limit and retries with ten seconds if scheduling or transport consumed the first window. Only that
+probe reports an inconclusive skip if neither window yields a code, or infrastructure delay approaches the ordinary
+60-second code lifetime; independent age checks still run. Normal age probes add about eight seconds of waiting per
+run, with a successful wider-window retry adding about eleven seconds. Database lock waits, retry schedules and
+Owner approval delays are covered by the reference's deterministic store and HTTP tests, not this black-box probe.
 
 Optional behavior is not required to pass: I-40 accepts either an exact-match-only policy or the permitted port
 exception for registered loopback IP redirects, while rejecting other URI differences. I-17 accepts repeatable or

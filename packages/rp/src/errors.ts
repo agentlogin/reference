@@ -1,6 +1,6 @@
 /** OAuth error codes an Issuer may return on the redirect (Section 5.5). Anything else is reported as `issuer_error`. */
 export const ISSUER_ERROR_CODES = [
-  'access_denied', 'signup_limit_reached', 'consent_required', 'interaction_required', 'invalid_request', 'invalid_scope',
+  'access_denied', 'signup_limit_reached', 'consent_required', 'interaction_required', 'login_required', 'invalid_request', 'invalid_scope',
   'unauthorized_client', 'unsupported_response_type', 'server_error', 'temporarily_unavailable', 'request_not_supported',
   'request_uri_not_supported',
 ] as const;
