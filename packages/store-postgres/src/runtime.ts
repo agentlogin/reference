@@ -47,6 +47,22 @@ function sqlState(error: unknown): string | undefined {
 }
 const retryable = (error: unknown): boolean => ['40001', '40P01'].includes(sqlState(error) ?? '');
 
+/** Pool error handlers cover idle clients only; checked-out clients emit socket failures independently. */
+function watchConnection(client: PoolClient) {
+  let failure: Error | undefined;
+  const onError = (error: Error): void => { failure = error; };
+  client.on('error', onError);
+  return {
+    failed: () => failure !== undefined,
+    check: (): void => { if (failure) throw failure; },
+    release: (poisoned: boolean): void => {
+      // release restores the pool's idle listener. Remove ours afterwards so no event has an unhandled gap.
+      try { client.release(poisoned || failure !== undefined); }
+      finally { client.removeListener('error', onError); }
+    },
+  };
+}
+
 /** One checked-out connection. Every query in an atomic operation uses this session. */
 export class PgSession {
   constructor(
@@ -125,17 +141,21 @@ export class PgDatabase {
   /** Polling and ordinary lookups cannot mutate the database. */
   async read<T>(fn: (session: PgSession) => Promise<T>): Promise<T> {
     const client = await this.connect();
+    const connection = watchConnection(client);
     let poisoned = false;
     try {
       await client.query('BEGIN ISOLATION LEVEL READ COMMITTED READ ONLY');
       await this.configure(client);
       const result = await fn(new PgSession(client, this, 'read', 0));
-      await client.query('COMMIT');
+      connection.check();
+      const commit = await client.query('COMMIT');
+      if (commit.command !== 'COMMIT') throw new Error('PostgreSQL rolled back the transaction instead of committing');
+      connection.check();
       return result;
     } catch (error) {
       try { await client.query('ROLLBACK'); } catch { poisoned = true; }
       throw error;
-    } finally { client.release(poisoned); }
+    } finally { connection.release(poisoned); }
   }
 
   async mutate<T>(
@@ -145,6 +165,7 @@ export class PgDatabase {
   ): Promise<T> {
     for (let attempt = 0; ; attempt += 1) {
       const client = await this.connect();
+      const connection = watchConnection(client);
       let committing = false;
       let committed = false;
       let poisoned = false;
@@ -154,8 +175,10 @@ export class PgDatabase {
         await this.configure(client);
         const session = new PgSession(client, this, operation, attempt);
         await session.checkpoint('afterBegin');
+        connection.check();
         const result = await fn(session);
         await session.checkpoint('beforeCommit');
+        connection.check();
         committing = true;
         const commit = await client.query('COMMIT');
         if (commit.command !== 'COMMIT') {
@@ -166,11 +189,12 @@ export class PgDatabase {
         committed = true;
         // Throwing here deliberately models a committed write whose acknowledgement never reached its caller.
         await session.checkpoint('afterCommit');
+        connection.check();
         return result;
       } catch (error) {
-        if (committed || (committing && !retryable(error))) {
+        if (committed || (committing && (!retryable(error) || connection.failed()))) {
           poisoned = true;
-          client.release(true);
+          connection.release(true);
           released = true;
           if (reconcile) {
             try {
@@ -181,8 +205,8 @@ export class PgDatabase {
           throw new UncertainCommitError(operation, error);
         }
         try { await client.query('ROLLBACK'); } catch { poisoned = true; }
-        if (!retryable(error) || attempt >= this.options.maxRetries) throw error;
-      } finally { if (!released) client.release(poisoned); }
+        if (connection.failed() || !retryable(error) || attempt >= this.options.maxRetries) throw error;
+      } finally { if (!released) connection.release(poisoned); }
       // Bounded exponential delay with jitter. This delay holds no database connection or lock.
       const cap = Math.min(this.options.retryBaseMs * 2 ** attempt, 1_000);
       if (cap > 0) await delay(Math.floor(cap / 2 + Math.random() * cap / 2));
@@ -208,7 +232,9 @@ export class PgDatabase {
   /** Explicit versioned migration. The advisory lock is used only for DDL, never for issuer operations. */
   async migrate(): Promise<void> {
     const client = await this.connect();
+    const connection = watchConnection(client);
     let poisoned = false;
+    let committing = false;
     try {
       await client.query('BEGIN');
       await this.configure(client);
@@ -228,11 +254,22 @@ export class PgDatabase {
         await client.query(schemaV2(this.schema));
         await client.query(`INSERT INTO ${migrations} (version) VALUES (2)`);
       }
-      await client.query('COMMIT');
+      connection.check();
+      committing = true;
+      const commit = await client.query('COMMIT');
+      if (commit.command !== 'COMMIT') {
+        committing = false;
+        throw new Error('PostgreSQL rolled back the migration instead of committing');
+      }
+      connection.check();
     } catch (error) {
+      if (committing) {
+        poisoned = true;
+        throw new UncertainCommitError('migrate', error);
+      }
       try { await client.query('ROLLBACK'); } catch { poisoned = true; }
       throw error;
-    } finally { client.release(poisoned); }
+    } finally { connection.release(poisoned); }
   }
 
   /** Drain issuer requests before closing. Caller-supplied pools retain their owner-controlled lifecycle. */

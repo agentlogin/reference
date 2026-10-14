@@ -5,12 +5,13 @@ import type { Pool } from 'pg';
 import { PgDatabase, UncertainCommitError } from '../src/runtime.js';
 
 /** Minimal protocol double for outcomes that need driver-level injection, not a PostgreSQL scheduling fixture. */
-class Connection {
+class Connection extends EventEmitter {
   readonly statements: string[] = [];
   released?: boolean;
-  constructor(private readonly pool: ConnectionPool) {}
+  constructor(private readonly pool: ConnectionPool) { super(); }
   async query(sql: string) {
     this.statements.push(sql);
+    await this.pool.onQuery?.(this, sql);
     if (sql === 'COMMIT' && this.pool.commitFailure) throw this.pool.commitFailure;
     const command = sql === 'COMMIT' ? this.pool.commitCommand : sql.split(' ', 1)[0];
     const rows = sql.includes('.app_now()') ? [{ now: this.pool.clocks.shift() ?? 0 }] : [];
@@ -23,6 +24,7 @@ class ConnectionPool extends EventEmitter {
   clocks: number[] = [];
   commitCommand = 'COMMIT';
   commitFailure?: Error;
+  onQuery?: (connection: Connection, sql: string) => void | Promise<void>;
   async connect() { const c = new Connection(this); this.connections.push(c); return c; }
   async end() {}
   asPool() { return this as unknown as Pool; }
@@ -119,5 +121,56 @@ test('a retry-shaped fault after confirmed COMMIT never reruns committed work', 
     assert.equal(calls, 1);
     assert.equal(pool.connections.length, 1);
     assert.equal(pool.connections[0].released, true);
+  } finally { await db.close(); }
+});
+
+for (const operation of ['read', 'mutate', 'migrate'] as const) {
+  test(`${operation} handles checked-out socket loss before COMMIT and discards the connection`, async () => {
+    const pool = new ConnectionPool();
+    const failure = Object.assign(new Error('socket lost between queries'), { code: 'ECONNRESET' });
+    pool.onQuery = (client, sql) => {
+      if (sql.startsWith('SELECT\n')) client.emit('error', failure);
+    };
+    const db = new PgDatabase({ pool: pool.asPool() });
+    try {
+      const result = operation === 'read' ? db.read(async () => true)
+        : operation === 'mutate' ? db.mutate('socket-loss', async () => true) : db.migrate();
+      await assert.rejects(result, (error) => error === failure);
+      assert.equal(pool.connections.length, 1);
+      assert.equal(pool.connections[0].released, true);
+      assert(!pool.connections[0].statements.includes('COMMIT'));
+      assert.equal(pool.connections[0].listenerCount('error'), 0);
+    } finally { await db.close(); }
+  });
+}
+
+for (const phase of ['during', 'after'] as const) {
+  test(`socket loss ${phase} COMMIT remains uncertain even when shaped like a rollback error`, async () => {
+    const pool = new ConnectionPool();
+    const failure = Object.assign(new Error('socket lost'), { code: '40001' });
+    if (phase === 'during') pool.onQuery = (client, sql) => { if (sql === 'COMMIT') client.emit('error', failure); };
+    const db = new PgDatabase({ pool: pool.asPool(), onCheckpoint: ({ client, phase: checkpoint }) => {
+      if (phase === 'after' && checkpoint === 'afterCommit') client.emit('error', failure);
+    } });
+    let calls = 0;
+    try {
+      await assert.rejects(db.mutate('socket-loss', async () => { calls++; return true; }), UncertainCommitError);
+      assert.equal(calls, 1);
+      assert.equal(pool.connections.length, 1);
+      assert.equal(pool.connections[0].released, true);
+      assert.equal(pool.connections[0].listenerCount('error'), 0);
+    } finally { await db.close(); }
+  });
+}
+
+test('migration with an uncertain COMMIT discards its connection and never reports success', async () => {
+  const pool = new ConnectionPool();
+  pool.onQuery = (client, sql) => { if (sql === 'COMMIT') client.emit('error', new Error('socket lost')); };
+  const db = new PgDatabase({ pool: pool.asPool() });
+  try {
+    await assert.rejects(db.migrate(), UncertainCommitError);
+    assert.equal(pool.connections.length, 1);
+    assert.equal(pool.connections[0].released, true);
+    assert.equal(pool.connections[0].listenerCount('error'), 0);
   } finally { await db.close(); }
 });
