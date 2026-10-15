@@ -123,3 +123,21 @@ upstream material, including [OpenID Connect key rotation](https://openid.net/sp
 and [PostgreSQL transaction isolation](https://www.postgresql.org/docs/17/transaction-iso.html).
 Publication, deployment and external adoption are not inferred from internal
 reviews or tests. No review can establish the absence of every possible defect.
+
+## Round 9: cold-cache release verification
+
+Linux CI exposed a packaging-test assumption missed by the warm local cache:
+`npm ci` can cache package tarballs without caching the registry metadata needed by
+a later `npm install --offline`. The clean-consumer test now derives an exact
+consumer lock from the tested runtime records, replaces every workspace link with
+its real tarball and integrity, and uses `npm ci` with a new cache. Registry access
+can fetch the locked tarballs; it cannot select newer semver-compatible versions.
+The complete PostgreSQL consumer pilot passed with that empty cache. The fixture
+rejects unhandled dependency layouts and verifies every packed dependency is a real
+installation and the lock remains unchanged. The underlying runtime code did not
+change. This follows npm's documented [lockfile format](https://docs.npmjs.com/cli/v10/configuring-npm/package-lock-json/)
+and [`npm ci` behavior](https://docs.npmjs.com/cli/v10/commands/npm-ci/).
+The independent reviewer traced all 20 retained registry records to the eight
+packed packages, found no missing or extra dependency, and reported no further
+actionable finding. This verifies their integrated installation, not each package
+in isolation.

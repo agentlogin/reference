@@ -64,3 +64,6 @@ callback adapter.
 suite with PostgreSQL required, including client/RP tests, conformance probes, package artifacts and the example.
 The database tests create isolated schemas and temporary restricted roles; use a dedicated test database and a
 test user with schema-creation and role-creation privileges.
+The clean-consumer test installs into a new npm cache using the exact tested lockfile resolutions and locally
+packed workspaces. It needs registry access to fetch the locked third-party tarballs; a warm development cache
+is neither required nor sufficient evidence of a clean installation.
