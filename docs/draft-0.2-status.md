@@ -1,33 +1,58 @@
 # Draft 0.2 compatibility status
 
-This manually maintained record compares the reference implementation with specification commit
-[`a000e29c7af91d3fd8a5a4ad6241e2b10aabcc78`](https://github.com/agentlogin/spec/tree/a000e29c7af91d3fd8a5a4ad6241e2b10aabcc78),
-including its [core][core], [checklist][checklist] and [migration notes][migration]. Discovery's `1.0` value does
-not distinguish working drafts. Pin the specification revision when assessing compatibility.
+This release work list targets specification commit
+[`a000e29c7af91d3fd8a5a4ad6241e2b10aabcc78`](https://github.com/agentlogin/spec/tree/a000e29c7af91d3fd8a5a4ad6241e2b10aabcc78).
+Discovery's `1.0` value does not distinguish drafts. Pin this revision when assessing
+compatibility. This is not an exhaustive conformance report; unlisted requirements
+are not automatically passed. Separate AI reviewers are not independent implementers.
 
-The target here is direct sign-in: the issuer with PostgreSQL, the RP kit, and the TypeScript Agent Client.
-This is a release work list, not a complete conformance report. Unlisted requirements are not automatically
-passed. Tests of the reference's own components do not establish independent interoperability.
+The implemented product path is direct ES256 sign-in: the PostgreSQL issuer, a
+managed Owner integration, the TypeScript client/local MCP helper, and a relying
+party with its own shared application sessions and durable notes.
 
-| Area and specification requirement | Status | Evidence and remaining work |
+| Area | Implemented behavior and evidence | Remaining boundary |
 | --- | --- | --- |
-| Authentication age: Core 5.1, 5.6, 5.7; I-32, R-3 | Implemented; combined suite passed | Issuer, atomic stores and RP preserve and enforce `max_age` and `auth_time`, including positive-age expiry and zero's fresh-request semantics. [Issuer](../packages/issuer/test/max-age.test.ts), [PostgreSQL](../packages/store-postgres/test/max-age.test.ts) and [RP](../packages/rp/test/max-age.test.ts) tests cover delayed approval, lock waits/retries and asynchronous validation. The black-box harness also checks syntax, completion, token issuance and zero-age freshness. |
-| Owner verification, approval and recovery: Core 6.6, 7.5; I-16, I-22, I-45, I-55 | Required integration unfinished | The [issuer](../packages/issuer/src/app.ts) supplies email-code delivery through an application hook and an approval API, but strong-session credentials still come from privileged bootstrap assertions. A `session_auth` label does not prove an Agent-inaccessible factor. Supply a real qualifying authentication method, protect its enrollment and recovery, deliver verification codes privately, and implement the required Owner approval page. |
-| Issuer signing-key lifecycle: Core 7.7; I-30, I-57 | Required lifecycle support unfinished | [Issuer configuration](../packages/issuer/src/index.ts) accepts one signing key; the [JWK Set endpoint](../packages/issuer/src/app.ts) publishes that key alone. Add staged publication, overlapping old verification keys, retirement and compromise withdrawal. Supplying a persistent `SIGNING_JWK` prevents restart identity loss but does not implement rotation. |
-| Address-linked signup counts: Core 7.6; I-28 | Required accounting and policy unfinished | Per-Owner/client admission and permanent counts exist. [Store records](../packages/issuer/src/store.ts) and [PostgreSQL schema](../packages/store-postgres/src/schema.ts) do not implement shared counts for the same verified address, email-change inheritance or deleted-Owner retention linkage; discovery does not publish the required retention policy at `op_policy_uri`. Owner email lookup also lowercases the whole address, whereas the draft preserves local-part octets. A published zero retention period is allowed; it does not remove live-Owner address accounting requirements. Owner deletion need not have a standardized HTTP endpoint. |
-| Lifecycle, consent, replay and callback coordination: Core 5-7; I-25 to I-29, I-41, I-50 to I-54; R-15 | Implemented paths with regression evidence; not exhaustive certification | Shared [store contracts](../packages/issuer/test/store-contract.ts), [concurrency tests](../packages/issuer/test/hardening.test.ts), [RP validation tests](../packages/rp/test/response-validation.test.ts) and the [PostgreSQL callback adapter](../packages/rp-store-postgres/README.md) exercise these guarantees. Review remaining checklist obligations separately; a passing scenario does not prove its entire check group. |
-| Algorithm migration: Core 1.1, 2.4, 3.2, 5.7 | Required alignment when the optional path is enabled | ES256-only operation is permitted. The [RP configuration](../packages/rp/src/rp.ts) and [harness](../packages/conformance/src/index.ts) still contain legacy `EdDSA` assumptions. Remove that draft-0.1 option or implement and test `Ed25519` before claiming that optional path under draft 0.2. Lack of Ed25519 support alone is not nonconformance. |
-| `private_key_jwt`, DNS fallback and Relay | Optional or separate scope | `private_key_jwt` is recommended, not mandatory; document its omission. DNS fallback is a Core 2.3 MAY and the [client](../packages/agentlogin/src/discovery.ts) does not offer it. The [Relay profile][relay] has separate conformance requirements; the reference does not implement a Relay issuer. These omissions do not require expanding the direct-sign-in release. |
-| Rate limiting: Core 6.7; I-31 | Deployment SHOULD not implemented | The [issuer's documented limits](../packages/issuer/README.md) remain applicable. Supply transaction, invalid-assertion and pending-approval limits for deployment; any implemented rejection must return `429` with `Retry-After`. An absent SHOULD is assessed as a deviation, not mislabeled as an unconditional MUST failure. |
-| Application authorization and operations: Core 9; R-7 to R-9 | Application integration remains necessary | The [Hono example](../examples/rp-hono/README.md) demonstrates shared sessions and live checks. Its notes action does not persist a business write. Actual applications must implement their authorization and per-owner policies, protect Owner data, and coordinate session authorization with their own writes. Capacity, restore and failover exercises remain operational evidence to obtain. |
-| Complete regression execution | CI configured; full suite passed locally | The combined tree passed `npm test` with `AGENTLOGIN_TEST_POSTGRES_URL` set and `REQUIRE_POSTGRES_TESTS=1`, without skipped tests. [CI](../.github/workflows/postgres.yml) is configured to run that complete suite; its GitHub run awaits publication of these commits. The [harness report](../packages/conformance/README.md) remains explicitly partial. |
-| Clean consumer installation and independent interoperability | Evidence not yet established | The [packaging test](../packages/conformance/test/packaging.test.ts) unpacks tarballs but supplies workspace dependencies by symlink. Verify installation into an independent consumer with only declared dependencies. The [stock OIDC test](../packages/rp/test/stock-oidc.test.ts) uses an external OIDC library against this repository's issuer and Agent Client; obtain a separately implemented Agent Login participant. These are release evidence gaps, not missing protocol messages. |
+| Authentication age (Core 5.1, 5.6, 5.7) | Issuer/stores/RP preserve `auth_time` and enforce `max_age`, including lock waits, late approval and zero-age freshness. RP token expiry is anchored before the token request and rechecked after validation. | External IdP clock/factor behavior needs deployment verification. |
+| Owner verification and approval (Core 6.6, 7.5) | The separate SentFrom.ai identity service implements signed OIDC authentication, immutable user mapping, shared browser state, approval/revocation/reset pages and actual one-time email proof. Email proof does not elevate session authority. | Configure and verify the IdP's independent factor, enrollment and recovery policy; provision its immutable Clerk subject mapping and private email delivery. Reference bootstrap credentials are test/admin facilities, not proof of human authentication. |
+| Signing-key lifecycle (Core 7.7) | Durable publication/activation/retirement/compromise state, publish-before-use, shared maximum JWKS cache lifetime, post-signing withdrawal checks and configuration reload. [Tests](../packages/issuer/test/signing-lifecycle.test.ts). | Provision private keys securely and exercise rotation/recovery in the deployment. Non-exportable KMS/HSM signing is not supplied. |
+| Address-linked signup accounting (Core 7.6) | Exact local-part/domain-normalized address equality, shared pending capacity, unique Account-creation events, inherited counts, fixed deletion deadlines and published retention policy. [Shared contracts](../packages/issuer/test/store-contract.ts). | Operator chooses the published retention period; zero is permitted. Permanent identity/event records must remain available for their dependent checks. |
+| Lifecycle, consent and replay (Core 5-7) | Immutable identities, atomic transitions, preserved polling/retention outcomes, authenticated replay handling and shared callback consumption. SQL lifecycle mutations coordinate with application-originated changes. [PostgreSQL tests](../packages/store-postgres/test/lifecycle-functions.test.ts). | Restore/failover exercises remain operational evidence. |
+| Application authorization (Core 9) | Agent Workspace persists private notes, checks UserInfo before a lasting action, and commits session authorization with the write. Idempotency, logout, expiry and bounded pagination have tests. | Other applications implement their own business permissions and sessions. A prior check cannot make arbitrary external side effects atomic. |
+| Plugin and catalogs | Local MCP enrollment/sign-in, immutable application-session binding, full disclosure review, configured operations, and optional provider/application catalogs. Catalogs distinguish review evidence from trust and support Open and Registered Clients. | No public participant is fabricated; initial catalogs are empty. Browser sessions need their own integration. |
+| Algorithms and optional profiles | The release accepts ES256; legacy `EdDSA` configuration is rejected. The harness recognizes optional `Ed25519` naming. | Ed25519, recommended `private_key_jwt`, optional DNS fallback and the separate Relay profile are not implemented by this direct-sign-in release. |
+| Rate limits (Core 6.7) | Managed-service shared PostgreSQL limits cover authorization/assertion/Owner requests, with bounded bodies and `429` / `Retry-After`. | Tune edge and tenant limits using measured load and the actual proxy topology. The reference core does not itself impose a deployment policy. |
+| Packaging and verification | A clean consumer installs real tarballs without workspace dependency links and runs PostgreSQL sign-in, persistent actions, instance switching, logout and revocation. [Pilot test](../packages/conformance/test/clean-consumer.test.ts). Hosted-service release preparation vendors exact issuer packages into a standalone artifact. | Publishing, actual target deployment, external adopter testing and independent protocol interoperability are not established by local execution. |
 
-Memory and SQLite remain local reference/test choices. The issuer's documented SQLite deadline limitation is
-outside this PostgreSQL release target. Optional implementation omissions must not conceal mandatory gaps,
-and closing this list does not by itself establish complete conformance or production readiness.
+See [the review record](product-review.md) for findings and their fixes. Test totals
+belong to the final execution report rather than this compatibility table. The
+conformance harness remains partial, including checks that cannot be established
+through a black-box protocol probe. Passing internal tests is not a 1.0 approval.
 
-[core]: https://github.com/agentlogin/spec/blob/a000e29c7af91d3fd8a5a4ad6241e2b10aabcc78/agent-login-core.md
-[checklist]: https://github.com/agentlogin/spec/blob/a000e29c7af91d3fd8a5a4ad6241e2b10aabcc78/conformance.md
-[migration]: https://github.com/agentlogin/spec/blob/a000e29c7af91d3fd8a5a4ad6241e2b10aabcc78/migration-0.2.md
-[relay]: https://github.com/agentlogin/spec/blob/a000e29c7af91d3fd8a5a4ad6241e2b10aabcc78/relay-profile.md
+Memory and SQLite are local reference/test options. PostgreSQL is the multi-host
+release target. The documented SQLite deadline limitation does not justify a
+production claim for that adapter.
+
+## External pilot handoff
+
+The clean-consumer test completes the install-and-run part of the pilot locally.
+An outside adopter and a live deployment are still required. Give that adopter the
+exact specification revision above, committed package tarballs and lockfiles, the
+[application integration guide](../examples/rp-hono/README.md), and the
+[helper configuration](../packages/mcp/README.md). Record the tested software
+revisions, environment, observations and exclusions without including credentials
+or Owner addresses. Do not label a planned check as passed.
+
+| Pilot check | Required observation |
+| --- | --- |
+| Independent installation | The adopter installs the supplied artifacts without repository links or undocumented dependencies. |
+| Live domain discovery | The real handle domain identifies the intended issuer over HTTPS; no loopback or development overrides are used. |
+| Human authority | Enrollment and Owner disclosure require the configured independent factor. Agent mailbox/API access alone cannot approve them; factor enrollment and recovery enforce the same separation. |
+| Multi-host sign-in and action | Callback completion, session reads and a persistent application action work when routed to different replicas. Logout on one replica denies the session on another. |
+| Lifecycle and identity | Key revocation or mailbox suspension blocks a subsequent lasting action. Reset or handle reassignment never exposes the previous subject's application data. |
+| Failure and expiry | Expired credentials fail; a lost write acknowledgement can be reconciled using the same operation ID without duplicating an action. Issuer/database outages do not report false success. |
+| Upgrade and operations | Actual key rotation, migration, recovery and restore procedures preserve the documented authority and retention boundaries; expected dataset sizes and concurrency are measured. |
+
+These are release acceptance scenarios, not additional Core requirements or a
+substitute for its full conformance checklist. Publish only redacted evidence
+that its participants approve. A catalog submission may link that report after
+the checks actually run; inclusion still does not make an issuer trusted.

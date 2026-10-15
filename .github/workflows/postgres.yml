@@ -1,4 +1,4 @@
-name: PostgreSQL stores
+name: Agent Login integration
 
 on:
   push:

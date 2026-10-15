@@ -205,7 +205,7 @@ test('migration and verification work with a restricted runtime role and do not 
   await f.admin.query(`CREATE ROLE ${quote(role)}`);
   try {
     await f.admin.query(`GRANT USAGE ON SCHEMA ${quote(f.schema)} TO ${quote(role)};
-      GRANT SELECT,INSERT,UPDATE,DELETE ON ${f.table},${f.accounts} TO ${quote(role)};
+      GRANT SELECT,INSERT,UPDATE,DELETE ON ${f.table},${f.accounts},${quote(f.schema)}.app_notes TO ${quote(role)};
       GRANT SELECT ON ${quote(f.schema)}.app_schema_migrations TO ${quote(role)};
       GRANT EXECUTE ON FUNCTION ${quote(f.schema)}.app_now() TO ${quote(role)}`);
     await pool.query(`SET ROLE ${quote(role)}`);
@@ -213,6 +213,8 @@ test('migration and verification work with a restricted runtime role and do not 
     const cookie = sid();
     await runtime.create(cookie, session(f.now()));
     assert.ok(await runtime.get(cookie));
+    await runtime.saveNote(cookie, 'restricted-role-note', 'Runtime credentials can save notes');
+    assert.equal((await runtime.listNotes(cookie))?.length, 1);
     await runtime.revoke(cookie);
     assert.equal(await runtime.cleanup(), 0);
     await assert.rejects(runtime.migrate(), (e: any) => e.code === '42501');

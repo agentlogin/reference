@@ -75,12 +75,18 @@ export function keyRecord(ctx: IssuerContext, k: AgentKey): Record<string, unkno
 }
 
 /** Section 7.2: create a pending key. */
-export async function enrollKey(ctx: IssuerContext, handle: string, body: unknown, authorization: ManagementAuthorization): Promise<{ record: Record<string, unknown>; challenge: string; proof_url: string }> {
+export async function enrollKey(ctx: IssuerContext, handle: string, body: unknown, authorization: ManagementAuthorization, enrollmentId = randomId(), challengeExpiresAt?: number): Promise<{ record: Record<string, unknown>; challenge: string; proof_url: string; enrollmentId: string }> {
   if (!isPlainObject(body)) throw new OAuthError(400, 'invalid_request', 'body must be an object');
+  if (!/^[A-Za-z0-9_-]{16,128}$/.test(enrollmentId)) throw new OAuthError(400, 'invalid_request', 'invalid internal enrollment identifier');
   const jwk = await validateP256Jwk(body.jwk);
   // The thumbprint is taken over canonical coordinates, so equal identifiers mean equal decoded points (Section 7.2).
   const kid = await calculateJwkThumbprint(jwk, 'sha256');
   const now = await ctx.store.currentTime(ctx.now());
+  // Hosted approval retries may reuse an internal enrollment ID only within its original proof window.
+  // Carry that fixed deadline into the atomic store insertion; a retry must not renew it.
+  const challengeDeadline = challengeExpiresAt ?? now + ctx.constants.T_ASSERT;
+  if (!Number.isSafeInteger(challengeDeadline) || challengeDeadline <= now || challengeDeadline > now + ctx.constants.T_ASSERT)
+    throw new OAuthError(400, 'invalid_request', 'invalid enrollment challenge deadline');
   let expiresAt = now + ctx.constants.T_KEY;
   if (body.expires_at !== undefined) {
     if (typeof body.expires_at !== 'number' || !Number.isInteger(body.expires_at) || body.expires_at <= now) throw new OAuthError(400, 'invalid_request', 'expires_at');
@@ -91,14 +97,14 @@ export async function enrollKey(ctx: IssuerContext, handle: string, body: unknow
     kid,
     handle,
     agentSub: authorization.agentSub,
-    enrollment: randomId(), // credentials bind to this enrollment; an earlier, expired one of the same key stays dead
+    enrollment: enrollmentId, // credentials bind to this enrollment; an earlier, expired one of the same key stays dead
     status: 'pending',
     jwk,
     permissions: { share_owner: false },
     name: typeof body.name === 'string' ? body.name.slice(0, 200) : undefined,
     createdAt: now,
     expiresAt,
-    challenge: { value: challenge, expiresAt: now + ctx.constants.T_ASSERT },
+    challenge: { value: challenge, expiresAt: challengeDeadline },
   };
   // One atomic operation with its preconditions: not revoked for this handle, not enrolled now (Section 7.2).
   const inserted = await ctx.store.insertKey(key, now, authorization);
@@ -106,7 +112,7 @@ export async function enrollKey(ctx: IssuerContext, handle: string, body: unknow
   if (inserted === 'revoked') throw new OAuthError(400, 'invalid_request', 'this public key was revoked for this handle');
   if (inserted === 'other_handle') throw new OAuthError(400, 'invalid_request', 'public key is enrolled for another handle');
   if (inserted === 'enrolled') throw new OAuthError(400, 'invalid_request', 'key already enrolled');
-  return { record: keyRecord(ctx, key), challenge, proof_url: `${ctx.issuer}/agents/${encodeURIComponent(handle)}/keys/${encodeURIComponent(kid)}/proof` };
+  return { enrollmentId, record: keyRecord(ctx, key), challenge, proof_url: `${ctx.issuer}/agents/${encodeURIComponent(handle)}/keys/${encodeURIComponent(kid)}/proof` };
 }
 
 /** Section 7.2: verify the enrollment proof and activate the key. */

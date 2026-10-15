@@ -1,8 +1,8 @@
 import { Pool, type PoolClient } from 'pg';
 import type { AgentIdentity } from '@agentlogin/rp';
-import { SessionProtection, cleanupLimit, validSid, validateSession, type NewSession, type Session, type SessionStore } from './session-store.js';
+import { SessionProtection, cleanupLimit, validSid, validateSession, validateNote, NoteError, type Note, type NoteCursor, type NewSession, type Session, type SessionStore } from './session-store.js';
 
-type Operation = 'create' | 'get' | 'revoke' | 'cleanup' | 'migrate' | 'verifySchema';
+type Operation = 'create' | 'get' | 'revoke' | 'saveNote' | 'listNotes' | 'cleanup' | 'migrate' | 'verifySchema';
 export interface ApplicationSessionCheckpoint {
   operation: Operation;
   phase: 'after-lock' | 'before-commit' | 'after-commit';
@@ -44,7 +44,7 @@ interface StoredSession {
   first_seen: string;
 }
 
-const VERSION = 1;
+const VERSION = 2;
 const MAX_TIME = Number.MAX_SAFE_INTEGER;
 const quote = (identifier: string): string => `"${identifier}"`;
 function integer(value: number | undefined, fallback: number, name: string, max = 2_147_483_647): number {
@@ -87,7 +87,7 @@ export class PostgresSessionStore implements SessionStore {
     this.pool.on('error', this.poolErrorHandler);
   }
 
-  private name(name: 'app_accounts' | 'app_sessions' | 'app_schema_migrations' | 'app_now'): string {
+  private name(name: 'app_accounts' | 'app_sessions' | 'app_notes' | 'app_schema_migrations' | 'app_now'): string {
     return `${quote(this.schema)}.${quote(name)}`;
   }
   private async checkpoint(client: PoolClient, operation: Operation, phase: ApplicationSessionCheckpoint['phase']): Promise<void> {
@@ -216,6 +216,53 @@ export class PostgresSessionStore implements SessionStore {
     });
   }
 
+  async saveNote(sid: string, id: string, text: string): Promise<Note> {
+    validateNote(id, text);
+    if (!validSid(sid)) throw new NoteError('session_expired');
+    const key = this.protection.key(sid);
+    const authorize = async (client: PoolClient) => {
+      const row = await this.read(client, key);
+      const s = this.session(row, await this.now(client));
+      if (!s) throw new NoteError('session_expired');
+      if (!s.live) throw new NoteError('reauthentication_required');
+      return row!;
+    };
+    return this.transaction('saveNote', async (client) => {
+      // Logout and rotation serialize on this session row. Network checks happen before this transaction.
+      await client.query(`SELECT key FROM ${this.name('app_sessions')} WHERE key = $1 FOR UPDATE`, [key]);
+      const row = await authorize(client);
+      // Serialize the storage limit and idempotency across this account's concurrent sessions.
+      await client.query(`SELECT account_key FROM ${this.name('app_accounts')} WHERE account_key = $1 FOR NO KEY UPDATE`, [row.account_key]);
+      await this.checkpoint(client, 'saveNote', 'after-lock');
+      await authorize(client);
+      const previous = await client.query<{ id: string; text: string; created_at: string }>(
+        `SELECT id, text, created_at FROM ${this.name('app_notes')} WHERE account_key = $1 AND id = $2`, [row.account_key, id]);
+      if (previous.rows[0]) {
+        if (previous.rows[0].text !== text) throw new NoteError('idempotency_conflict');
+        return { id, text, createdAt: Number(previous.rows[0].created_at) };
+      }
+      const count = await client.query<{ count: string }>(`SELECT count(*) FROM ${this.name('app_notes')} WHERE account_key = $1`, [row.account_key]);
+      if (Number(count.rows[0]!.count) >= 1000) throw new NoteError('note_limit');
+      const createdAt = await this.now(client);
+      await client.query(`INSERT INTO ${this.name('app_notes')} (account_key, id, text, created_at) VALUES ($1, $2, $3, $4)`, [row.account_key, id, text, createdAt]);
+      return { id, text, createdAt };
+    }, { finalize: async (client, note) => { await authorize(client); return note; } });
+  }
+
+  async listNotes(sid: string, before?: NoteCursor): Promise<Note[] | undefined> {
+    if (!validSid(sid)) return undefined;
+    const key = this.protection.key(sid);
+    return this.transaction('listNotes', async (client) => {
+      const row = await this.read(client, key);
+      if (!this.session(row, await this.now(client))) return undefined;
+      const notes = await client.query<{ id: string; text: string; created_at: string }>(
+        `SELECT id, text, created_at FROM ${this.name('app_notes')} WHERE account_key = $1
+         AND ($2::bigint IS NULL OR created_at < $2 OR (created_at = $2 AND id > $3))
+         ORDER BY created_at DESC, id LIMIT 100`, [row!.account_key, before?.createdAt ?? null, before?.id ?? null]);
+      return notes.rows.map((n) => ({ id: n.id, text: n.text, createdAt: Number(n.created_at) }));
+    }, { readOnly: true, finalize: async (client, notes) => this.session(await this.read(client, key), await this.now(client)) ? notes : undefined });
+  }
+
   /** Bounded expiry work, safe to run concurrently on multiple hosts. Account first-seen records are retained. */
   async cleanup(limit = 1000): Promise<number> {
     cleanupLimit(limit);
@@ -247,8 +294,8 @@ export class PostgresSessionStore implements SessionStore {
       const result = await client.query<{ version: number }>(`SELECT version FROM ${this.name('app_schema_migrations')} ORDER BY version DESC LIMIT 1`);
       const version = result.rows[0]?.version ?? 0;
       if (version === VERSION) return;
-      if (version !== 0) throw new Error('Unsupported PostgreSQL application session schema version');
-      await client.query(`CREATE FUNCTION ${this.name('app_now')}() RETURNS bigint LANGUAGE sql VOLATILE SET search_path = pg_catalog
+      if (version !== 0 && version !== 1) throw new Error('Unsupported PostgreSQL application session schema version');
+      if (version === 0) await client.query(`CREATE FUNCTION ${this.name('app_now')}() RETURNS bigint LANGUAGE sql VOLATILE SET search_path = pg_catalog
           AS 'SELECT floor(extract(epoch FROM clock_timestamp()))::bigint';
         CREATE TABLE ${this.name('app_accounts')} (
           account_key text PRIMARY KEY CHECK (account_key ~ '^[0-9a-f]{64}$'),
@@ -266,7 +313,16 @@ export class PostgresSessionStore implements SessionStore {
         );
         CREATE INDEX app_sessions_expiry ON ${this.name('app_sessions')} (expires_at, key);
         CREATE INDEX app_sessions_live_expiry ON ${this.name('app_sessions')} (live_expires_at, key) WHERE live_expires_at IS NOT NULL;
-        INSERT INTO ${this.name('app_schema_migrations')} (version) VALUES (${VERSION});`);
+        INSERT INTO ${this.name('app_schema_migrations')} (version) VALUES (1);`);
+      await client.query(`CREATE TABLE ${this.name('app_notes')} (
+          account_key text NOT NULL REFERENCES ${this.name('app_accounts')} (account_key),
+          id text COLLATE "C" NOT NULL CHECK (id ~ '^[A-Za-z0-9_-]{16,128}$'),
+          text text NOT NULL CHECK (octet_length(text) BETWEEN 1 AND 4096),
+          created_at bigint NOT NULL CHECK (created_at BETWEEN 0 AND ${MAX_TIME}),
+          PRIMARY KEY (account_key, id)
+        );
+        CREATE INDEX app_notes_recent ON ${this.name('app_notes')} (account_key, created_at DESC, id);
+        INSERT INTO ${this.name('app_schema_migrations')} (version) VALUES (2);`);
     });
   }
 
@@ -277,6 +333,7 @@ export class PostgresSessionStore implements SessionStore {
         if (result.rows[0]?.version !== VERSION) throw new Error('Unsupported PostgreSQL application session schema version');
         await client.query(`SELECT s.key, s.agent, s.expires_at, s.live_expires_at, s.live_ciphertext, a.first_seen
           FROM ${this.name('app_sessions')} s JOIN ${this.name('app_accounts')} a USING (account_key) LIMIT 0`);
+        await client.query(`SELECT account_key, id, text, created_at FROM ${this.name('app_notes')} LIMIT 0`);
         await this.now(client);
       }, { readOnly: true });
     } catch (error) {

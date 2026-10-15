@@ -13,7 +13,7 @@ let homeIssuer: string;
 let key: CryptoKey;
 let jwk: JWK;
 let server: http.Server;
-const token = { nonce: '', claims: {} as Record<string, unknown>, requests: 0, mode: 'success' };
+const token = { nonce: '', claims: {} as Record<string, unknown>, requests: 0, mode: 'success', expires: 300 as unknown };
 let homeMetadataRequests = 0;
 const clientId = 'response-validation-client';
 const redirectUri = 'https://rp.example/callback?view=one&view=two';
@@ -45,7 +45,7 @@ before(async () => {
       const idToken = await new SignJWT({ actor_type: 'agent', nonce: token.nonce, ...token.claims })
         .setProtectedHeader({ alg: 'ES256', kid: 'test-key' }).setIssuer(issuer).setAudience(clientId)
         .setSubject('test-agent').setIssuedAt().setExpirationTime('5m').sign(key);
-      send({ id_token: idToken, access_token: 'test-access-token', token_type: 'Bearer', expires_in: 300, scope: 'openid' });
+      send({ id_token: idToken, access_token: 'test-access-token', token_type: 'Bearer', expires_in: token.expires, scope: 'openid' });
     } else send({}, 404);
   });
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -61,13 +61,13 @@ const rpFor = (relay = false) => new RelyingParty({
 
 async function start(rp: RelyingParty, handle?: string) {
   const backing = new MemoryCallbackStateStore();
-  const counts = { claims: 0, signIns: 0 };
+  const counts = { claims: 0, signIns: 0, expiresAt: 0 };
   const callbackStore: CallbackStateStore = {
     register: (state, expiresAt) => backing.register(state, expiresAt),
     claim: (state) => { counts.claims += 1; return backing.claim(state); },
   };
   const handlers = createHandlers(rp, {
-    callbackStore, onSignIn: () => { counts.signIns += 1; return new Response('signed in'); }, log: () => {},
+    callbackStore, onSignIn: (signIn) => { counts.signIns += 1; counts.expiresAt = signIn.accessTokenExpiresAt; return new Response('signed in'); }, log: () => {},
   });
   const response = await handlers.login(new Request(`https://rp.example/login${handle ? `?handle=${encodeURIComponent(handle)}` : ''}`));
   assert.equal(response.status, 302);
@@ -77,6 +77,7 @@ async function start(rp: RelyingParty, handle?: string) {
   token.nonce = auth.searchParams.get('nonce')!;
   token.claims = {};
   token.mode = 'success';
+  token.expires = 300;
   const params = () => new URLSearchParams({ state, iss: issuer, code: 'test-code' });
   const callback = (p: URLSearchParams, sessionCookie = cookie) => handlers.callback(new Request(
     `${redirectUri}&${p}`, { headers: { cookie: sessionCookie } },
@@ -213,4 +214,32 @@ test('Relay tokens require discovery of returned email or the pre-bound handle',
     else assert.equal(homeMetadataRequests, before + 1, 'discovery also verifies the Home Issuer metadata');
     assert.equal(s.counts.signIns, scenario.accepted ? 1 : 0);
   });
+});
+
+test('token responses require a bounded integer expiry without fallback lifetimes', async () => {
+  for (const expires of [undefined, null, '600', 0, -1, 0.5, 601, 3600]) {
+    const s = await start(rpFor()); token.expires = expires;
+    const rejected = await s.callback(s.params());
+    assert.equal(rejected.status, 502, String(expires));
+    assert.equal(s.counts.signIns, 0);
+  }
+});
+
+test('asynchronous validation cannot renew a token or return one that expired during validation', async () => {
+  const realNow = Date.now;
+  let clock = realNow();
+  Date.now = () => clock;
+  try {
+    for (const lifetime of [300, 10]) {
+      const rp = rpFor();
+      const validate = rp.validateIdToken.bind(rp);
+      rp.validateIdToken = async (...args) => { const claims = await validate(...args); clock += 30_000; return claims; };
+      const s = await start(rp); token.expires = lifetime;
+      const requestStarted = Math.floor(clock / 1000);
+      const response = await s.callback(s.params());
+      assert.equal(response.status, lifetime === 300 ? 200 : 400);
+      if (lifetime === 300) assert.equal(s.counts.expiresAt, requestStarted + lifetime);
+      else assert.equal(s.counts.signIns, 0);
+    }
+  } finally { Date.now = realNow; }
 });

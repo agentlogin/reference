@@ -1,6 +1,7 @@
+import { LEGACY_SIGNING_OVERLAP_SECONDS, ownerAddressKey } from '@agentlogin/issuer';
 import { setTimeout as delay } from 'node:timers/promises';
 import { Pool, type PoolClient, type QueryResult, type QueryResultRow } from 'pg';
-import { identifier, schemaV1, schemaV2, SCHEMA_VERSION, TABLES, type TableName, validateSchema } from './schema.js';
+import { identifier, schemaV1, schemaV2, schemaV3, SCHEMA_VERSION, TABLES, type TableName, validateSchema } from './schema.js';
 
 export interface PgCheckpoint {
   operation: string;
@@ -133,7 +134,8 @@ export class PgDatabase {
       set_config('statement_timeout', $1, true),
       set_config('lock_timeout', $2, true),
       set_config('idle_in_transaction_session_timeout', $3, true),
-      set_config('search_path', 'pg_catalog', true)`, [
+      set_config('search_path', 'pg_catalog', true),
+      set_config('synchronous_commit', 'on', true)`, [
       String(this.options.statementTimeoutMs), String(this.options.lockTimeoutMs), String(this.options.idleTransactionTimeoutMs),
     ]);
   }
@@ -244,6 +246,7 @@ export class PgDatabase {
       await client.query(`CREATE TABLE IF NOT EXISTS ${migrations} (version integer PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT clock_timestamp())`);
       const found = await client.query<{ version: number }>(`SELECT version FROM ${migrations} ORDER BY version DESC LIMIT 1`);
       let version = found.rows[0]?.version ?? 0;
+      const upgradingExistingSchema = version > 0;
       if (version > SCHEMA_VERSION) throw new Error(`Database schema ${version} is newer than supported schema ${SCHEMA_VERSION}`);
       if (version === 0) {
         await client.query(schemaV1(this.schema));
@@ -253,6 +256,18 @@ export class PgDatabase {
       if (version === 1) {
         await client.query(schemaV2(this.schema));
         await client.query(`INSERT INTO ${migrations} (version) VALUES (2)`);
+        version = 2;
+      }
+      if (version === 2) {
+        await client.query(schemaV3(this.schema,upgradingExistingSchema ? LEGACY_SIGNING_OVERLAP_SECONDS : 0));
+        const owners = await client.query<{ id: string; data: { email: string } }>(`SELECT id,data FROM ${this.table('owners')}`);
+        for (const owner of owners.rows) await client.query(`UPDATE ${this.table('owners')} SET address_key=$1 WHERE id=$2`, [ownerAddressKey(owner.data.email),owner.id]);
+        await client.query(`INSERT INTO ${this.table('signup_events')}(owner_id,client_id,event_id)
+          SELECT target.id,e.client_id,e.event_id FROM ${this.table('owners')} target JOIN ${this.table('owners')} source ON source.address_key=target.address_key
+          JOIN ${this.table('signup_events')} e ON e.owner_id=source.id
+          WHERE (target.data->>'emailVerified')::boolean AND (source.data->>'emailVerified')::boolean ON CONFLICT DO NOTHING`);
+        await client.query(`ALTER TABLE ${this.table('owners')} ALTER COLUMN address_key DROP DEFAULT`);
+        await client.query(`INSERT INTO ${migrations} (version) VALUES (3)`);
       }
       connection.check();
       committing = true;

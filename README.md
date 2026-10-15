@@ -9,14 +9,15 @@ Status: draft 0.1 is the published baseline; this branch also implements selecte
 gaps. The reference issuer passes the partial harness on JSON and wait-page flows; this is not full conformance.
 The implementation milestones are:
 
-1. Issuer core and conformance harness. Done except Ed25519 keys, `private_key_jwt`, rate limits and Owner
-   authentication pages; see `packages/issuer/README.md`.
-2. Relying-party kit. `@agentlogin/rp` done (10 Oct 2026): framework-agnostic core, web-standard handlers, sign-in form, example application (`examples/rp-hono`), tests against the issuer and the agent client. Better Auth, Auth.js, Clerk, Supabase and Auth0 guides are open and will be written against tested configurations.
-3. Agent CLI, SDKs and MCP server. CLI + TypeScript library done (10 Oct 2026, end-to-end test against the issuer and a stub relying party); Python SDK and MCP server open.
-4. Federation: WebFinger discovery, relay, Docker image and one-click templates.
+1. Direct sign-in issuer and partial conformance harness, including shared PostgreSQL lifecycle transitions, signing-key rotation and address-linked signup accounting. Production Owner authentication is supplied by the managed-service integration or an operator's equivalent integration.
+2. Relying-party kit and Agent Workspace pilot: persistent notes, shared PostgreSQL accounts/sessions and live authorization checks. Framework-specific guides remain pending tested integrations.
+3. Agent CLI, TypeScript SDK and local MCP/plugin: private enrollment, disclosure review, application sessions and bounded named operations. Python SDK work is separate.
+4. Optional provider/application catalogs with review evidence, validation and a static directory. Relay implementation and independent interoperability remain separate milestones.
 
 | Package | Purpose |
 | --- | --- |
+| `packages/mcp` | Local MCP tools and skills for enrollment, sign-in, configured application operations and logout |
+| `catalogs` | Optional provider/application records, review policy, validation and static directory |
 | `packages/agentlogin` | Agent CLI and client library (npm `agentlogin`): discovery, enrollment, sign-in, cookie jar |
 | `packages/store-postgres` | PostgreSQL issuer adapter: indexed records, serializable mutations, shared contracts and database concurrency tests |
 | `packages/rp-store-postgres` | PostgreSQL RP callback adapter: shared registration and atomic one-use claims across application hosts |
@@ -32,8 +33,7 @@ does not hold issuer records or application sessions. The Hono example stores it
 in separate PostgreSQL tables, so authenticated requests and logout work across application hosts. Memory and
 SQLite remain local reference/test options.
 Client locking, sign-in deadlines, cookie ordering and conformance validation have regression
-coverage. See package READMEs for migration and storage requirements; rate limiting and complete production Owner
-authentication remain deployment work.
+coverage. See package READMEs for migration and storage requirements and [the product review record](docs/product-review.md) for review findings and evidence. The separate SentFrom.ai identity service supplies Owner authentication/approval, email verification and shared request limits; enabling it requires a correctly configured independent identity provider and delivery service. No local test establishes production capacity or independent interoperability.
 
 Development (Node.js 22.13 or newer):
 

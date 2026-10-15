@@ -58,7 +58,7 @@ export async function pending(store: Store, now: number, id: string, clientId = 
   const transaction: Transaction = {
     id, version: 0, clientId, redirectUri: 'https://rp.example/cb', scopes: ['openid'], state: 'state', nonce: 'nonce', codeChallenge: 'challenge',
     ...(maxAge === undefined ? {} : { maxAge }),
-    disclosure: [], status: 'awaiting_agent', challenge: 'challenge', createdAt: now, expiresAt: now + lifetime,
+    disclosure: [], clientPresentation: { type: 'registered' }, status: 'awaiting_agent', challenge: 'challenge', createdAt: now, expiresAt: now + lifetime,
     acceptDisclosure: true, deliverToSession: false, ownerApprovalOutstanding: false, reviewOutstanding: false, passedCap: false,
     continueSecret: 'continue', codeIssued: false, transactionTokenHash: `transaction-token-${id}`,
   };

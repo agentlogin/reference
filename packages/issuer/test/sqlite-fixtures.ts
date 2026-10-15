@@ -15,7 +15,7 @@ export async function prepareAgent(store: Store, id: string): Promise<void> {
 export async function beginSignIn(store: Store, id: string, txnId: string, clientId: string, maxSignups?: number): Promise<Transaction> {
   const tx: Transaction = {
     id: txnId, version: 0, clientId, redirectUri: 'https://rp.example/cb', scopes: ['openid'], state: 'state', nonce: 'nonce', codeChallenge: 'challenge',
-    disclosure: [], status: 'awaiting_agent', challenge: 'challenge', createdAt: 1, expiresAt: 100,
+    disclosure: [], clientPresentation: { type: 'registered' }, status: 'awaiting_agent', challenge: 'challenge', createdAt: 1, expiresAt: 100,
     acceptDisclosure: true, deliverToSession: false, ownerApprovalOutstanding: false, reviewOutstanding: false, passedCap: false, continueSecret: 'continue', codeIssued: false,
   };
   await store.insertTransaction(tx);

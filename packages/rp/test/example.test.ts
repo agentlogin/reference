@@ -29,6 +29,7 @@ function fixture() {
 function wrappedStore(store: SessionStore, overrides: Partial<SessionStore>): SessionStore {
   return {
     create: (...args) => store.create(...args), get: (...args) => store.get(...args),
+    saveNote: (...args) => store.saveNote(...args), listNotes: (...args) => store.listNotes(...args),
     revoke: (...args) => store.revoke(...args), cleanup: (...args) => store.cleanup(...args), close: () => store.close(),
     ...overrides,
   };
@@ -68,7 +69,7 @@ test('example sessions and Access Tokens expire on the server, including session
   await sweep();
   assert.equal(await f.store.cleanup(), 0, 'sweep already removed expired credentials from the unread session');
   assert.equal((await f.store.get(b))!.live, undefined);
-  const notes = await app.request(`${base}/notes`, { method: 'POST', headers: { cookie: cookie(a) } });
+  const notes = await app.request(`${base}/notes`, { method: 'POST', headers: { cookie: cookie(a), 'content-type': 'application/json' }, body: JSON.stringify({ id: 'test-note-request', text: 'note' }) });
   assert.equal(notes.status, 401);
   assert.equal((await notes.json() as { error: string }).error, 'reauthentication_required');
   noStore(notes);
@@ -86,7 +87,7 @@ test('sessions, account firstSeen and logout are shared by independent applicati
     assert.equal((await response.json() as { first_seen: string }).first_seen, original.firstSeen);
     noStore(response);
   }
-  const logout = await b.app.request(`${base}/logout`, { method: 'POST', headers: { cookie: cookie(sid) } });
+  const logout = await b.app.request(`${base}/logout`, { method: 'POST', headers: { cookie: cookie(sid), 'content-type': 'application/json' }, body: JSON.stringify({ id: 'test-note-request', text: 'note' }) });
   assert.equal(logout.status, 200); assert.deepEqual(await logout.json(), { signed_out: true }); noStore(logout);
   assert.match(logout.headers.get('set-cookie')!, /Max-Age=0/);
   assert.equal((await a.app.request(`${base}/me`, { headers: { cookie: cookie(sid) } })).status, 401);
@@ -132,7 +133,7 @@ test('session reads fail closed with 503 and no sensitive error details', async 
 test('logout storage failure cannot report success or clear the usable session cookie', async () => {
   const f = fixture(); const sid = newSid(); await f.store.create(sid, f.session());
   const example = f.make(wrappedStore(f.store, { revoke: async () => { throw new Error('offline'); } }));
-  const response = await example.app.request(`${base}/logout`, { method: 'POST', headers: { cookie: cookie(sid) } });
+  const response = await example.app.request(`${base}/logout`, { method: 'POST', headers: { cookie: cookie(sid), 'content-type': 'application/json' }, body: JSON.stringify({ id: 'test-note-request', text: 'note' }) });
   assert.equal(response.status, 503); noStore(response); assert.doesNotMatch(await response.text(), /signed_out/);
   assert.equal(response.headers.get('set-cookie'), null); assert.ok(await f.store.get(sid));
 });
@@ -140,14 +141,14 @@ test('logout storage failure cannot report success or clear the usable session c
 test('a temporary UserInfo failure rejects the action but preserves the application session', async () => {
   const f = fixture(); const sid = newSid(); await f.store.create(sid, f.session()); const example = f.make();
   example.rp.recheck = async () => { throw new RelyingPartyError('userinfo_failed', 'upstream unavailable'); };
-  const response = await example.app.request(`${base}/notes`, { method: 'POST', headers: { cookie: cookie(sid) } });
+  const response = await example.app.request(`${base}/notes`, { method: 'POST', headers: { cookie: cookie(sid), 'content-type': 'application/json' }, body: JSON.stringify({ id: 'test-note-request', text: 'note' }) });
   assert.equal(response.status, 503); noStore(response); assert.equal(response.headers.get('set-cookie'), null); assert.ok(await f.store.get(sid));
 });
 
 test('UserInfo revocation invalidates the session for every application instance', async () => {
   const f = fixture(); const sid = newSid(); await f.store.create(sid, f.session()); const a = f.make(); const b = f.make();
   a.rp.recheck = async () => { throw new RelyingPartyError('revoked', 'revoked'); };
-  const response = await a.app.request(`${base}/notes`, { method: 'POST', headers: { cookie: cookie(sid) } });
+  const response = await a.app.request(`${base}/notes`, { method: 'POST', headers: { cookie: cookie(sid), 'content-type': 'application/json' }, body: JSON.stringify({ id: 'test-note-request', text: 'note' }) });
   assert.equal(response.status, 401); noStore(response); assert.equal(await f.store.get(sid), undefined);
   assert.equal((await b.app.request(`${base}/me`, { headers: { cookie: cookie(sid) } })).status, 401);
 });
@@ -158,7 +159,7 @@ test('a delayed UserInfo failure cannot clear a newer sign-in cookie', async () 
   const oldRequestApp = f.make(f.store, secureBase), loginApp = f.make(f.store, secureBase);
   const entered = deferred(), finish = deferred();
   oldRequestApp.rp.recheck = async () => { entered.resolve(); await finish.promise; throw new RelyingPartyError('revoked', 'revoked'); };
-  const pending = oldRequestApp.app.request(`${secureBase}/notes`, { method: 'POST', headers: { cookie: cookie(oldSid, true) } });
+  const pending = oldRequestApp.app.request(`${secureBase}/notes`, { method: 'POST', headers: { cookie: cookie(oldSid, true), 'content-type': 'application/json' }, body: JSON.stringify({ id: 'test-note-request', text: 'note' }) });
   await entered.promise;
   const callback = await callbackRequest(loginApp, { agent, issuer, claims: {}, accessToken: 'new-live-token', accessTokenExpiresAt: f.now() + 600 }, oldSid, secureBase);
   const signedIn = await callback.request();
@@ -179,7 +180,7 @@ test('a failed session revalidation after UserInfo cannot authorize the action',
     get: async (key) => { if (++reads === 2) throw new Error('offline after UserInfo'); return f.store.get(key); },
   }));
   example.rp.recheck = async () => ({ sub: agent.sub });
-  const response = await example.app.request(`${base}/notes`, { method: 'POST', headers: { cookie: cookie(sid) } });
+  const response = await example.app.request(`${base}/notes`, { method: 'POST', headers: { cookie: cookie(sid), 'content-type': 'application/json' }, body: JSON.stringify({ id: 'test-note-request', text: 'note' }) });
   assert.equal(response.status, 503); noStore(response); assert.doesNotMatch(await response.text(), /saved/);
   assert.equal(reads, 2); assert.ok(await f.store.get(sid));
 });
@@ -188,7 +189,7 @@ test('failed durable revocation after UserInfo does not pretend the session ende
   const f = fixture(); const sid = newSid(); await f.store.create(sid, f.session());
   const example = f.make(wrappedStore(f.store, { revoke: async () => { throw new Error('offline'); } }));
   example.rp.recheck = async () => { throw new RelyingPartyError('revoked', 'revoked'); };
-  const response = await example.app.request(`${base}/notes`, { method: 'POST', headers: { cookie: cookie(sid) } });
+  const response = await example.app.request(`${base}/notes`, { method: 'POST', headers: { cookie: cookie(sid), 'content-type': 'application/json' }, body: JSON.stringify({ id: 'test-note-request', text: 'note' }) });
   assert.equal(response.status, 503); noStore(response); assert.equal(response.headers.get('set-cookie'), null);
   assert.ok(await f.store.get(sid));
 });
@@ -198,10 +199,10 @@ for (const change of ['logout', 'session expiry', 'Access Token expiry'] as cons
     const f = fixture(); const sid = newSid(); await f.store.create(sid, f.session()); const a = f.make(); const b = f.make();
     const entered = deferred(); const finish = deferred();
     a.rp.recheck = async () => { entered.resolve(); await finish.promise; return { sub: agent.sub }; };
-    const pending = a.app.request(`${base}/notes`, { method: 'POST', headers: { cookie: cookie(sid) } });
+    const pending = a.app.request(`${base}/notes`, { method: 'POST', headers: { cookie: cookie(sid), 'content-type': 'application/json' }, body: JSON.stringify({ id: 'test-note-request', text: 'note' }) });
     await entered.promise;
     if (change === 'logout') {
-      const response = await b.app.request(`${base}/logout`, { method: 'POST', headers: { cookie: cookie(sid) } });
+      const response = await b.app.request(`${base}/logout`, { method: 'POST', headers: { cookie: cookie(sid), 'content-type': 'application/json' }, body: JSON.stringify({ id: 'test-note-request', text: 'note' }) });
       assert.equal(response.status, 200, 'logout does not wait for the upstream request');
     } else f.advance(change === 'session expiry' ? SESSION_TTL : 600);
     finish.resolve();
@@ -213,7 +214,7 @@ test('same-origin browser mutations and agent requests work; cross-origin mutati
   const f = fixture(); const sid = newSid(); await f.store.create(sid, f.session()); const example = f.make();
   let checks = 0; example.rp.recheck = async () => { checks++; return { sub: agent.sub }; };
   for (const headers of [{ origin: base }, {}]) {
-    const response = await example.app.request(`${base}/notes`, { method: 'POST', headers: { cookie: cookie(sid), ...headers } });
+    const response = await example.app.request(`${base}/notes`, { method: 'POST', headers: { cookie: cookie(sid), ...headers, 'content-type': 'application/json' }, body: JSON.stringify({ id: randomBytes(16).toString('hex'), text: 'A saved note' }) });
     assert.equal(response.status, 200); noStore(response);
   }
   assert.equal(checks, 2);
@@ -234,4 +235,39 @@ test('application session cleanup is bounded and preserves active sessions', asy
   assert.equal(await f.store.cleanup(2), 2); assert.equal(await f.store.cleanup(2), 1); assert.equal(await f.store.cleanup(2), 0);
   assert.ok(await f.store.get(active));
   for (const sid of expired) assert.equal(await f.store.get(sid), undefined);
+});
+
+test('notes reject coerced identifiers and malformed content without persisting a write', async () => {
+  const f = fixture(), sid = newSid(); await f.store.create(sid, f.session());
+  const example = f.make(); example.rp.recheck = async () => ({ sub: agent.sub });
+  const post = (body: unknown) => example.app.request(`${base}/notes`, {
+    method: 'POST', headers: { cookie: cookie(sid), 'content-type': 'application/json' }, body: JSON.stringify(body),
+  });
+  for (const id of [1234567890123456, ['abcdefghijklmnop'], null]) assert.equal((await post({ id, text: 'note' })).status, 400);
+  for (const text of ['', '   ', '\u0000', '🙂'.repeat(1025)]) assert.equal((await post({ id: 'abcdefghijklmnop', text })).status, 400);
+  assert.deepEqual(await f.store.listNotes(sid), []);
+  assert.equal((await post({ id: 'abcdefghijklmnop', text: 'A valid note' })).status, 200);
+  assert.equal((await post({ id: 'abcdefghijklmnop', text: 'A valid note' })).status, 200);
+  assert.equal((await f.store.listNotes(sid))?.length, 1);
+});
+
+test('notes accept maximally escaped valid text and paginate below the MCP response bound', async () => {
+  const f = fixture(), sid = newSid(); await f.store.create(sid, f.session());
+  const example = f.make(); example.rp.recheck = async () => ({ sub: agent.sub });
+  const headers = { cookie: cookie(sid), 'content-type': 'application/json' };
+  const escaped = '{"id":"escaped-json-note","text":"' + '\\u0061'.repeat(4096) + '"}';
+  assert.equal((await example.app.request(`${base}/notes`, { method: 'POST', headers, body: escaped })).status, 200);
+  assert.equal((await example.app.request(`${base}/notes`, { method: 'POST', headers, body: JSON.stringify({ id: 'quoted-json-note', text: '"'.repeat(4096) }) })).status, 200);
+  for (let i = 0; i < 30; i++) await f.store.saveNote(sid, `large-note-${String(i).padStart(6, '0')}`, 'x'.repeat(4096));
+  const seen = new Set<string>(); let cursor: string | undefined; let pages = 0;
+  do {
+    const response = await example.app.request(`${base}/notes${cursor ? `?before=${cursor}` : ''}`, { headers });
+    assert.equal(response.status, 200);
+    const body = await response.text(); assert.ok(Buffer.byteLength(body) < 64 * 1024);
+    const result = JSON.parse(body);
+    for (const note of result.notes) { assert.equal(seen.has(note.id), false); seen.add(note.id); }
+    cursor = result.next_cursor; assert.ok(++pages < 10);
+  } while (cursor);
+  assert.equal(seen.size, 32); assert.ok(pages > 1);
+  assert.equal((await example.app.request(`${base}/notes?before=invalid`, { headers })).status, 400);
 });

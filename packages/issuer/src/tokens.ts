@@ -131,14 +131,20 @@ export function claimsFor(agent: Agent, owner: Owner, scopes: Scope[]): Record<s
 export async function mintIdToken(ctx: IssuerContext, p: { agent: Agent; owner: Owner; client: Client; scopes: Scope[]; nonce: string; authTime: number; issuedAt?: number; expiresAt?: number }): Promise<string> {
   const now = p.issuedAt ?? await ctx.store.currentTime(ctx.now());
   const claims = claimsFor(p.agent, p.owner, p.scopes);
-  return new SignJWT({ ...claims, nonce: p.nonce, scope: p.scopes.join(' '), auth_time: p.authTime })
-    .setProtectedHeader({ alg: ctx.signingKey.alg, kid: ctx.signingKey.kid, typ: 'JWT' })
+  const expiresAt=p.expiresAt ?? now+ctx.constants.T_TOKEN;
+  const reserved=await ctx.store.reserveSigningKey(expiresAt,ctx.now());
+  const key=reserved && ctx.signingKeys.get(reserved.kid);
+  if (!key) throw new OAuthError(503,'temporarily_unavailable','No active issuer signing key is available');
+  const signed=await new SignJWT({ ...claims, nonce: p.nonce, scope: p.scopes.join(' '), auth_time: p.authTime })
+    .setProtectedHeader({ alg: key.alg, kid: key.kid, typ: 'JWT' })
     .setIssuer(ctx.issuer)
     .setAudience(p.client.clientId)
     .setIssuedAt(now)
-    .setExpirationTime(p.expiresAt ?? now + ctx.constants.T_TOKEN)
+    .setExpirationTime(expiresAt)
     .setJti(randomSecret())
-    .sign(ctx.signingKey.privateKey);
+    .sign(key.privateKey);
+  if (!(await ctx.store.listSigningKeys()).some((published)=>published.kid===key.kid)) throw new OAuthError(503,'temporarily_unavailable','Issuer signing key was withdrawn');
+  return signed;
 }
 
 /** Section 3.3: UserInfo with live state. */

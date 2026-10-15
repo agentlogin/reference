@@ -71,12 +71,14 @@ test('real sign-in starts on A, finishes on B, survives restart and logs out bot
     assert.equal(exchanges, 1);
     assert.equal((await a.app.fetch(callback())).status, 400, 'replaying on another app does not exchange the code again');
     assert.equal(exchanges, 1);
-    assert.equal((await a.app.request(`${base}/notes`, { method: 'POST', headers: { cookie } })).status, 200, 'the successful token remains valid');
+    assert.equal((await a.app.request(`${base}/notes`, { method: 'POST', headers: { cookie, 'content-type': 'application/json' }, body: JSON.stringify({ id: 'multi-host-note-1', text: 'Persists across replicas' }) })).status, 200, 'the successful token remains valid');
 
     const restartedStore = new PostgresSessionStore(f.config);
     try {
       const restarted = createExample({ ...options, callbackStore: callbackA, sessionStore: restartedStore });
       assert.deepEqual(await (await read(restarted.app)).json(), identity);
+      const saved = await (await restarted.app.request(`${base}/notes`, { headers: { cookie } })).json() as { notes: Array<{ text: string }> };
+      assert.equal(saved.notes[0]?.text, 'Persists across replicas');
       assert.equal((await b.app.request(`${base}/logout`, { method: 'POST', headers: { cookie } })).status, 200);
       for (const app of [a.app, b.app, restarted.app]) {
         assert.equal((await read(app)).status, 401);

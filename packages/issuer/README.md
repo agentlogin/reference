@@ -50,8 +50,7 @@ handle}` or `{owner_id, kind: "owner", session_auth}`; `PATCH /admin/agents/{han
 the Section 7.6 count is retained). `session_auth` states how the session that obtained an Owner Credential
 authenticated the Owner: `passkey`, `oidc`, `domain`, `email_factor` or `email_only`. Only the first four approve a
 transaction or grant `share_owner` (Sections 6.6, 7.8); a caller that omits it gets `email_only`, and a stored
-credential with no recorded session does not qualify either. `owner_verified_via` reports the strongest method among
-`verified_via` and the sessions stated (7.5). All with `Authorization: Bearer ADMIN_TOKEN`.
+credential with no recorded session does not qualify either. `owner_verified_via` records a method supplied by the trusted operator (7.5); these historical labels are not assurance levels. The bootstrap markers do not themselves authenticate a human. All with `Authorization: Bearer ADMIN_TOKEN`.
 
 Status: passes the automated probes in `@agentlogin/conformance` (`npm test`); the report keeps evidence gaps,
 including unverified entropy generation, explicit. Not yet implemented: Ed25519 agent keys,
@@ -151,3 +150,89 @@ the optional transaction-bearer checks and branded assertion-subject and transac
 there is no migration from third-party stores. The RP handler also now requires explicit shared callback storage
 (see `@agentlogin/rp`). These fixes do not implement rate limiting or a production Owner authentication system, so
 passing the tests is not a deployment approval.
+
+Transactions now persist `clientPresentation`, a snapshot of only the public client name, logo, legal URLs and
+Relay presentation that was displayed when authorization began. Authentication credentials, signup caps and
+review policy remain on the current Client record. On upgrade, issuer startup cancels open transactions that
+lack this snapshot with `access_denied`; users must start a new sign-in. It never backfills acceptance from
+current metadata. Cancellation reads batches of at most 256 through `listLegacyTransactions`, uses the existing
+atomic transition to release reservations, preserves effective expiry, and fixes terminal retention once. Custom
+adapters must implement that filtered, bounded read and preserve `clientPresentation` on every transition.
+PostgreSQL schema v3 includes its partial index; MemoryStore indexes legacy IDs and SQLite retains its documented
+whole-snapshot storage behavior. Drain old issuer processes before upgrading; mixed versions are unsupported.
+
+### Signing-key lifecycle
+
+An issuer database now owns the active signing-key identity and the public-key
+history. Private keys remain in the process's configured key ring. Every replica
+reads shared authority before signing and rechecks withdrawal before delivery;
+a replica missing the active private key fails closed.
+
+`createIssuer({ signingJwks: [privateJwk, ...], jwksCacheSeconds: 3600 })` publishes
+the supplied ES256 keys. Only an empty database selects the first key as its
+bootstrap key. Adding a key to an existing database stages it without selecting
+it. Use the returned `publishSigningKeys`, `activateSigningKey` and
+`removeSigningKey` methods for lifecycle changes. Activation requires publication
+to precede it on the authoritative database clock. Deploy the new private material
+to every replica, verify the public JWKS, and then activate it.
+
+Ordinary retirement is refused while a key is active or its issued-token lifetime
+plus the longest JWKS cache lifetime has not elapsed. PostgreSQL reserves a
+conservative extra minute when recording issuance to avoid a write for every
+signature. `removeSigningKey(kid, true)` immediately withdraws a suspected
+compromised key. Removed keys cannot be republished. Existing cached JWKS readers
+may still trust a removed key until their cache expires; withdrawal is not an
+instantaneous revocation of every relying-party session.
+
+When upgrading a snapshot or PostgreSQL schema that predates signing history,
+stop and drain every older issuer before migration, and include every previously
+published key needed by outstanding tokens in the first configured upgrade ring.
+The adapter cannot reconstruct those public keys from tokens or private keys that
+were not supplied. Unknown issuance and cache history receives a fixed conservative
+87,000-second overlap (Core T_TOKEN 600 plus maximum T_CACHE 86,400), even if the
+new JWKS cache setting is zero. SQLite starts this deadline at the first successful
+publication after upgrade; PostgreSQL fixes it at migration, after the old issuers
+have stopped. The pending SQLite guard survives unrelated writes and restarts.
+Publication transfers the guard atomically to the initial ring; later restarts and
+publication never renew it. If a legacy key continues signing, each new signing
+reservation preserves the maximum historical cache bound after that token expires;
+only new issuance can extend the floor. This conservative behavior stays with that
+legacy key until retirement. New installations and subsequently added keys keep
+normal retirement timing. Compromised-key withdrawal still takes effect immediately.
+This automatic bound covers Core-conforming historical lifetimes; deployments
+that previously exceeded them must retain the prior keys for their longer overlap.
+
+The standalone server also accepts `SIGNING_KEYS_FILE`, mutually exclusive with
+`SIGNING_JWK`. Its JSON object has `keys` (private JWK array), and optional
+`activateKid`, `retireKids`, and `compromisedKids`. Identifiers are SHA-256 JWK
+thumbprints. Removed keys must be absent from `keys`. Atomically replace the file
+and send `SIGHUP` to reload. The complete file is validated before changes begin.
+Publication, activation and removal are separate durable operations: if activation
+or retirement is premature, publication remains staged and the existing active
+key remains selected. Emergency removal is never reversed by a later failure.
+Publish a new key in one reload and activate it in a subsequent reload.
+
+### Owner deletion and quota inheritance
+
+`ownerDeletionRetentionSeconds` is a fixed non-negative integer, defaulting to
+zero; the standalone variable is `OWNER_DELETION_RETENTION_SECONDS`. Metadata
+publishes `op_policy_uri`, defaulting to the issuer's `/policy` document. A custom
+`policyUri` / `OP_POLICY_URI` must describe the same configured period.
+
+Trusted Owner integrations call `store.putOwner(owner, now)` after verified
+address changes and `store.deleteOwner(id, ownerSub, now, retentionSeconds)` for
+deletions. The latter must receive the configured published retention period.
+Deletion invalidates dependent authority atomically. Counts are inherited only
+while the deleted Owner's fixed deadline remains live; policy changes never move
+that deadline. Zero ends inheritance immediately. Use fresh immutable Owner IDs
+and subjects; deleted identities cannot be reused.
+
+Quota membership records identify individual Account-creation events, including a new creation after Account deletion,
+so repeated verification or address changes do not double-count an account.
+Live Owners sharing a verified address share completed counts and pending
+capacity. Moving an address preserves the Owner's existing counts and inherits
+eligible history at the new address. Email identity preserves the parsed local
+part exactly and compares lower-case A-label domains; no provider alias folding
+is performed. These address links are personal data. PostgreSQL `cleanup()`
+removes expired deleted-Owner links in bounded batches, while preserving copied
+history still belonging to a live Owner. Schedule that cleanup regularly.

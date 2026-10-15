@@ -3,7 +3,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, symlinkSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, symlinkSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -12,9 +12,10 @@ const root = fileURLToPath(new URL('../../..', import.meta.url));
 const packages = ['issuer', 'conformance', 'agentlogin', 'rp', 'store-postgres', 'rp-store-postgres'];
 
 for (const name of packages) {
-  test(`package ${name}: the packed tarball has its entry points and runs without the source`, async () => {
+  test(`package ${name}: the packed tarball has its entry points and runs without the source`, async (t) => {
     const dir = join(root, 'packages', name);
     const out = mkdtempSync(join(tmpdir(), `al-pack-${name}-`));
+    t.after(() => rmSync(out, { recursive: true, force: true }));
     // `npm pack` runs the package's prepack script, which builds: a tarball never ships a stale or missing build.
     const tarball = (JSON.parse(execFileSync('npm', ['pack', '--json', '--pack-destination', out], { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })) as Array<{ filename: string }>)[0]!.filename;
     execFileSync('tar', ['-xzf', join(out, tarball), '-C', out]);

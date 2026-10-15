@@ -46,7 +46,7 @@ export interface RelyingPartyOptions {
   /** Handle domain to Issuer Identifier, consulted before WebFinger. For development and private deployments. */
   staticIssuers?: Record<string, string>;
   /** ID Token algorithms accepted. Default `['ES256']`. */
-  idTokenAlgs?: Array<'ES256' | 'EdDSA'>;
+  idTokenAlgs?: Array<'ES256'>;
   /** Development only: http Issuers and loopback addresses. */
   allowInsecure?: boolean;
   /** Per-request limit for discovery, metadata, JWK Set, token and UserInfo requests. Default and maximum 10 000 ms (N_FETCH). */
@@ -166,6 +166,7 @@ export class RelyingParty {
       throw new Error('a top-level clientSecret is allowed only with exactly one Issuer and without federation: "any"; set clientSecret on the Issuer it belongs to');
     }
     this.algs = o.idTokenAlgs ?? ['ES256'];
+    if (this.algs.length !== 1 || this.algs[0] !== 'ES256') throw new Error('This RP release supports ES256 only');
     this.timeoutMs = Math.min(o.timeoutMs ?? 10_000, 10_000);
   }
 
@@ -349,6 +350,8 @@ export class RelyingParty {
     else form.set('client_id', clientId);
     let status: number;
     let tok: unknown;
+    // Conservative start-of-request anchor: neither transport nor later JWKS/handle validation renews the token.
+    const tokenRequestAt = Math.floor(Date.now() / 1000);
     try {
       const r = await safeFetch(m.token_endpoint, { method: 'POST', headers, body: form.toString(), maxBytes: MAX_BYTES, timeoutMs: this.timeoutMs, allowPrivate: this.o.allowInsecure });
       status = r.status;
@@ -360,12 +363,17 @@ export class RelyingParty {
       const why = isObject(tok) && typeof tok.error === 'string' && /^[a-z_]{1,40}$/.test(tok.error) ? tok.error : `status ${status}`;
       throw new RelyingPartyError('token_request_failed', `the Issuer refused the code (${why})`);
     }
-    if (typeof tok.id_token !== 'string' || typeof tok.access_token !== 'string' || String(tok.token_type).toLowerCase() !== 'bearer') throw new RelyingPartyError('token_request_failed', 'malformed token response');
+    if (typeof tok.id_token !== 'string' || typeof tok.access_token !== 'string' || !tok.access_token ||
+        typeof tok.token_type !== 'string' || tok.token_type.toLowerCase() !== 'bearer' ||
+        typeof tok.expires_in !== 'number' || !Number.isSafeInteger(tok.expires_in) || tok.expires_in <= 0 || tok.expires_in > 600) {
+      throw new RelyingPartyError('token_request_failed', 'malformed token response');
+    }
+    const accessTokenExpiresAt = tokenRequestAt + tok.expires_in;
 
     const claims = await this.validateIdToken(tok.id_token, { issuer: pending.issuer, nonce: pending.nonce, clientId, metadata: m, expectedHandle: pending.loginHint,
       maxAge: pending.maxAge, authenticationRequestedAt: pending.authenticationRequestedAt });
-    const expiresIn = typeof tok.expires_in === 'number' && tok.expires_in > 0 ? Math.min(tok.expires_in, 3600) : 600;
-    return { ...this.identityOf(claims), claims, issuer: pending.issuer, accessToken: tok.access_token, accessTokenExpiresAt: Math.floor(Date.now() / 1000) + expiresIn, returnTo: pending.returnTo };
+    if (Date.now() / 1000 >= accessTokenExpiresAt) throw new RelyingPartyError('reauthentication_required', 'The Access Token expired before sign-in validation completed');
+    return { ...this.identityOf(claims), claims, issuer: pending.issuer, accessToken: tok.access_token, accessTokenExpiresAt, returnTo: pending.returnTo };
   }
 
   /**

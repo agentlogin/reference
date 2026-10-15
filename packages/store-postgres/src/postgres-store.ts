@@ -1,7 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import {
-  AssertionWindowError, AssertionSubjectError, TransactionExpiredError, TransactionTokenError, KeyActivationConflictError, TERMINAL, sameConsentMetadata, consentRecordReason, isAuthenticationTooOld,
+  LEGACY_SIGNING_CACHE_SECONDS,
+  samePublicSigningKey, validateSigningPublication, type PublishedSigningKey, type SigningKeyPublication, ownerAddressKey, AssertionWindowError, AssertionSubjectError, TransactionExpiredError, TransactionTokenError, KeyActivationConflictError, TERMINAL, sameConsentMetadata, consentRecordReason, isAuthenticationTooOld,
   type Store, type Owner, type OwnerCode, type Agent, type AgentKey, type Credential, type Client,
   type Transaction, type Code, type AccessToken, type Account, type Consent, type SubjectFilter,
   type ManagementAuthorization, type TransitionEffects, type InsertKeyResult, type RedeemResult,
@@ -43,6 +44,14 @@ export class PostgresStore implements Store {
   }
   private get<T>(table: TableName, where: string, values: unknown[]) { return this.db.read((s) => this.one<T>(s, table, where, values)); }
   private list<T>(table: TableName, where: string, values: unknown[] = []) { return this.db.read((s) => this.many<T>(s, table, where, values)); }
+  /** Quotas precede Agent locks; Agent locks precede dependent record writes.
+   * READ COMMITTED hosting triggers update this row, so SSI alone cannot fence them.
+   * A stale SERIALIZABLE snapshot retries after a conflicting lifecycle update.
+   */
+  private async lockAgent(s: PgSession, handle: string, agentSub?: string) {
+    await s.checkpoint('before_agent_lock');
+    return this.one<Agent>(s, 'agents', `handle=$1${agentSub === undefined ? '' : ' AND sub=$2'} FOR SHARE`, agentSub === undefined ? [handle] : [handle,agentSub]);
+  }
   private async replace(s: PgSession, table: TableName, key: string, value: unknown, data: unknown) {
     await s.query(`UPDATE ${s.table(table)} SET data=$1::jsonb WHERE ${key}=$2`, [JSON.stringify(data), value]);
   }
@@ -62,16 +71,127 @@ export class PostgresStore implements Store {
     return { where: clauses.join(' AND ') || 'TRUE', values };
   }
 
-  putOwner(o: Owner) {
-    const data = clone(o);
+  publishSigningKeys(keys: SigningKeyPublication[], bootstrapKid: string, _now: number, cacheLifetime: number) {
+    const input=clone(keys);
+    if (!Number.isSafeInteger(cacheLifetime) || cacheLifetime<0 || !input.some((k)=>k.kid===bootstrapKid)) throw new TypeError('Invalid signing publication');
+    for (const key of input) validateSigningPublication(key);
+    return this.db.mutate('publishSigningKeys',async(s)=>{
+      const state=(await s.query<{legacy_retire_not_before:string|null}>(`SELECT legacy_retire_not_before FROM ${s.table('signing_state')} WHERE singleton FOR UPDATE`)).rows[0];
+      const first=!(await s.query(`SELECT 1 FROM ${s.table('signing_keys')} LIMIT 1`)).rowCount;
+      const now=await s.now();
+      // Retain the largest declared policy across replicas and historical keys: a
+      // running replica serves newly staged keys with its own unchanged cache header.
+      const sharedCacheLifetime=Math.max(cacheLifetime,Number((await s.query<{maximum:string|null}>(`SELECT max((data->>'cacheLifetime')::bigint) AS maximum FROM ${s.table('signing_keys')}`)).rows[0]?.maximum??0));
+      await s.query(`UPDATE ${s.table('signing_keys')} SET data=jsonb_set(data,'{cacheLifetime}',to_jsonb($1::bigint)) WHERE data->>'status'='published' AND (data->>'cacheLifetime')::bigint<$1`,[sharedCacheLifetime]);
+      for (const key of input) {
+        const previous=await this.one<PublishedSigningKey>(s,'signing_keys','kid=$1',[key.kid]);
+        if (previous && !samePublicSigningKey(previous.publicJwk,key.publicJwk)) throw new Error('Signing key identifier cannot be reused');
+        if (previous && previous.status!=='published') throw new Error('Removed signing key cannot be republished');
+        const retireNotBefore=first && state?.legacy_retire_not_before != null ? Number(state.legacy_retire_not_before) : undefined;
+        const next=previous?{...previous,cacheLifetime:sharedCacheLifetime}:{...key,status:'published',publishedAt:now,cacheLifetime:sharedCacheLifetime,retireNotBefore};
+        await s.query(`INSERT INTO ${s.table('signing_keys')}(kid,data) VALUES($1,$2::jsonb) ON CONFLICT(kid) DO UPDATE SET data=EXCLUDED.data`,[key.kid,JSON.stringify(next)]);
+      }
+      if (first) await s.query(`UPDATE ${s.table('signing_state')} SET active_kid=$1 WHERE singleton`,[bootstrapKid]);
+    });
+  }
+  listSigningKeys() { return this.list<PublishedSigningKey>('signing_keys',"data->>'status'='published'"); }
+  activateSigningKey(kid:string,_now:number) {
+    return this.db.mutate('activateSigningKey',async(s)=>{
+      await s.query(`SELECT 1 FROM ${s.table('signing_state')} WHERE singleton FOR UPDATE`);
+      const key=await this.one<PublishedSigningKey>(s,'signing_keys','kid=$1',[kid]);
+      if (!key || key.status!=='published' || await s.now()<=key.publishedAt) return false;
+      await s.query(`UPDATE ${s.table('signing_state')} SET active_kid=$1 WHERE singleton`,[kid]);
+      return true;
+    });
+  }
+  removeSigningKey(kid:string,compromised:boolean,_now:number) {
+    return this.db.mutate('removeSigningKey',async(s)=>{
+      const state=(await s.query<{active_kid:string}>(`SELECT active_kid FROM ${s.table('signing_state')} WHERE singleton FOR UPDATE`)).rows[0];
+      const key=await this.one<PublishedSigningKey>(s,'signing_keys','kid=$1 FOR UPDATE',[kid]);
+      if (!key) return false;
+      if (key.status!=='published') return true;
+      if (!compromised && (state?.active_kid===kid || await s.now()<Math.max((key.lastIssuedExpiresAt??key.publishedAt)+key.cacheLifetime,key.retireNotBefore??0))) return false;
+      key.status=compromised?'compromised':'retired';
+      await this.replace(s,'signing_keys','kid',kid,key);
+      await s.query(`UPDATE ${s.table('signing_state')} SET active_kid=NULL WHERE singleton AND active_kid=$1`,[kid]);
+      return true;
+    });
+  }
+  reserveSigningKey(expiresAt:number,_now:number) {
+    return this.db.mutate('reserveSigningKey',async(s)=>{
+      const key=(await s.query<DataRow<PublishedSigningKey>>(`SELECT k.data FROM ${s.table('signing_keys')} k JOIN ${s.table('signing_state')} st ON st.active_kid=k.kid WHERE st.singleton`)).rows[0]?.data;
+      if (!key || key.status!=='published' || !Number.isSafeInteger(expiresAt) || expiresAt<=await s.now()) return undefined;
+      if (expiresAt>(key.lastIssuedExpiresAt??0)) {
+        // A conservative one-minute lease avoids updating the key row for every issuance.
+        key.lastIssuedExpiresAt=expiresAt+60;
+        if (key.retireNotBefore!==undefined) key.retireNotBefore=Math.max(key.retireNotBefore,key.lastIssuedExpiresAt+LEGACY_SIGNING_CACHE_SECONDS);
+        await this.replace(s,'signing_keys','kid',key.kid,key);
+      }
+      return key;
+    });
+  }
+  private async expireOwnerLinks(s: PgSession, now: number) {
+    await s.query(`WITH candidates AS (SELECT owner_id FROM ${s.table('owner_tombstones')} WHERE expires_at<=$1 ORDER BY expires_at,owner_id LIMIT 1000 FOR UPDATE SKIP LOCKED), expired AS (UPDATE ${s.table('owner_tombstones')} SET address_key=NULL,expires_at=NULL WHERE owner_id IN (SELECT owner_id FROM candidates) RETURNING owner_id)
+      DELETE FROM ${s.table('signup_events')} WHERE owner_id IN (SELECT owner_id FROM expired)`, [now]);
+  }
+  private async quotaOwners(s: PgSession, ownerId: string): Promise<string[]> {
+    const owner = await this.one<Owner>(s, 'owners', 'id=$1', [ownerId]);
+    if (!owner?.emailVerified) return [ownerId];
+    return (await s.query<{id:string}>(`SELECT id FROM ${s.table('owners')} WHERE address_key=$1 AND (data->>'emailVerified')::boolean ORDER BY id`, [ownerAddressKey(owner.email)])).rows.map((r) => r.id);
+  }
+  putOwner(o: Owner, _now?: number) {
+    const data = clone(o), address = ownerAddressKey(o.email);
     return this.db.mutate('putOwner', async (s) => {
+      await this.expireOwnerLinks(s, await s.now());
       const old = await this.one<Owner>(s, 'owners', 'id=$1', [o.id]);
       if (old && old.ownerSub !== data.ownerSub) throw new Error('Owner subject is immutable');
-      await s.query(`INSERT INTO ${s.table('owners')}(data) VALUES($1::jsonb) ON CONFLICT(id) DO UPDATE SET data=EXCLUDED.data`, [JSON.stringify(data)]);
+      if ((await s.query(`SELECT 1 FROM ${s.table('owner_tombstones')} WHERE owner_id=$1 OR owner_sub=$2`, [o.id,o.ownerSub])).rowCount) throw new Error('Deleted Owner identity cannot be reused');
+      await s.query(`INSERT INTO ${s.table('owners')}(data,address_key) VALUES($1::jsonb,$2) ON CONFLICT(id) DO UPDATE SET data=EXCLUDED.data,address_key=EXCLUDED.address_key`, [JSON.stringify(data),address]);
+      if (o.emailVerified) {
+        const peers = await this.quotaOwners(s, o.id);
+        const inheritanceTime=await s.now();
+        const deadline=(await s.query<{deadline:string|null}>(`SELECT min(expires_at) AS deadline FROM ${s.table('owner_tombstones')} WHERE address_key=$1 AND expires_at>$2`,[address,inheritanceTime])).rows[0]?.deadline;
+        await s.query(`INSERT INTO ${s.table('signup_events')}(owner_id,client_id,event_id)
+          SELECT p,e.client_id,e.event_id FROM unnest($1::text[]) p CROSS JOIN (
+            SELECT DISTINCT client_id,event_id FROM ${s.table('signup_events')}
+            WHERE owner_id=ANY($1::text[]) OR owner_id IN (SELECT owner_id FROM ${s.table('owner_tombstones')} WHERE address_key=$2 AND expires_at>$3)
+          ) e ON CONFLICT DO NOTHING`, [peers,address,inheritanceTime]);
+        if (deadline!==null && deadline!==undefined && await s.now()>=Number(deadline)) {
+          // A row/index wait can cross the retention deadline. Roll back and re-evaluate the whole operation.
+          throw Object.assign(new Error('Quota inheritance deadline crossed during mutation'),{code:'40001'});
+        }
+      }
+    });
+  }
+  deleteOwner(id: string, ownerSub: string, _now: number, retentionSeconds: number) {
+    if (!Number.isSafeInteger(retentionSeconds) || retentionSeconds < 0) throw new TypeError('Invalid Owner retention period');
+    return this.db.mutate('deleteOwner', async (s) => {
+      const owner = await this.one<Owner>(s,'owners','id=$1 AND owner_sub=$2',[id,ownerSub]);
+      if (!owner) return false;
+      await this.subjectQuotas(s,{ownerId:id});
+      const agents=await this.many<Agent>(s,'agents','owner_id=$1 ORDER BY handle COLLATE "C" FOR UPDATE',[id]);
+      const now=await s.now();
+      if (!Number.isSafeInteger(now+retentionSeconds)) throw new TypeError('Invalid Owner retention period');
+      await this.expireOwnerLinks(s,now);
+      for (const agent of agents) {
+        await s.query(`SELECT ${identifier(this.db.schema)}.invalidate_agent($1,$2,$3)`,[agent.handle,agent.sub,now]);
+        await s.query(`INSERT INTO ${s.table('revoked_keys')}(handle,kid) SELECT handle,kid FROM ${s.table('keys')} WHERE agent_sub=$1 ON CONFLICT DO NOTHING`,[agent.sub]);
+        for (const table of ['keys','accounts','consents'] as const) await s.query(`DELETE FROM ${s.table(table)} WHERE agent_sub=$1`,[agent.sub]);
+      }
+      await s.query(`DELETE FROM ${s.table('agents')} WHERE owner_id=$1`,[id]);
+      await s.query(`DELETE FROM ${s.table('credentials')} WHERE owner_id=$1`,[id]);
+      await s.query(`DELETE FROM ${s.table('owner_codes')} WHERE owner_id=$1`,[id]);
+      await s.query(`DELETE FROM ${s.table('owners')} WHERE id=$1`,[id]);
+      const retained=owner.emailVerified && retentionSeconds>0;
+      const deletedAt=await s.now();
+      if (!Number.isSafeInteger(deletedAt+retentionSeconds)) throw new TypeError('Invalid Owner retention period');
+      await s.query(`INSERT INTO ${s.table('owner_tombstones')}(owner_id,owner_sub,address_key,expires_at) VALUES($1,$2,$3,$4)`,[id,ownerSub,retained?ownerAddressKey(owner.email):null,retained?deletedAt+retentionSeconds:null]);
+      if (!retained) await s.query(`DELETE FROM ${s.table('signup_events')} WHERE owner_id=$1`,[id]);
+      return true;
     });
   }
   getOwner(id: string) { return this.get<Owner>('owners', 'id=$1', [id]); }
-  getOwnerByEmail(email: string) { return this.get<Owner>('owners', 'email_lower=lower($1) ORDER BY created_at DESC LIMIT 1', [email]); }
+  getOwnerByEmail(email: string) { return this.get<Owner>('owners', 'address_key=$1 ORDER BY created_at DESC LIMIT 1', [ownerAddressKey(email)]); }
   putOwnerCode(c: OwnerCode) { return this.put('putOwnerCode', 'owner_codes', 'owner_id', c.ownerId, c); }
   takeOwnerCode(ownerId: string) {
     // Absence after an uncertain COMMIT cannot identify who consumed the code. Deliberately no reconciliation.
@@ -158,16 +278,27 @@ export class PostgresStore implements Store {
     const f = this.filter(filter, true);
     return this.list<Transaction>('transactions', `status NOT IN ('completed','denied','expired') AND ${f.where}`, f.values);
   }
+  listLegacyTransactions(limit: number) {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 256) throw new RangeError('Legacy transaction batch must be between 1 and 256');
+    return this.db.read((s) => this.many<Transaction>(s, 'transactions',
+      "status NOT IN ('completed','denied','expired') AND NOT (data ? 'clientPresentation') ORDER BY id LIMIT $1", [limit]));
+  }
   getCode(hash: string) { return this.get<Code>('codes', 'hash=$1', [hash]); }
   getAccessToken(hash: string) { return this.get<AccessToken>('access_tokens', 'hash=$1', [hash]); }
   getAccount(handle: string, clientId: string) { return this.get<Account>('accounts', 'handle=$1 AND client_id=$2', [handle, clientId]); }
   listAccounts(handle: string) { return this.list<Account>('accounts', 'handle=$1', [handle]); }
   getConsent(handle: string, clientId: string) { return this.get<Consent>('consents', 'handle=$1 AND client_id=$2', [handle, clientId]); }
   listConsents(handle: string) { return this.list<Consent>('consents', 'handle=$1', [handle]); }
-  signupsEver(ownerId: string, clientId: string) { return this.db.read(async (s) => Number((await s.query<{ count: string }>(`SELECT count FROM ${s.table('quotas')} WHERE owner_id=$1 AND client_id=$2`, [ownerId, clientId])).rows[0]?.count ?? 0)); }
+  signupsEver(ownerId: string, clientId: string) { return this.db.read(async (s) => Number((await s.query<{ count: string }>(`SELECT count(DISTINCT event_id) AS count FROM ${s.table('signup_events')} WHERE owner_id=ANY($1::text[]) AND client_id=$2`, [await this.quotaOwners(s,ownerId),clientId])).rows[0]?.count ?? 0)); }
 
   /** Quota coordination precedes key-permission locks. SSI detects stale snapshots after either wait. */
   private async quota(s: PgSession, ownerId: string, clientId: string) {
+    const owner = await this.one<Owner>(s,'owners','id=$1',[ownerId]);
+    if (owner?.emailVerified) {
+      const address=ownerAddressKey(owner.email);
+      await s.query(`INSERT INTO ${s.table('address_quotas')}(address_key,client_id) VALUES($1,$2) ON CONFLICT DO NOTHING`,[address,clientId]);
+      await s.query(`SELECT 1 FROM ${s.table('address_quotas')} WHERE address_key=$1 AND client_id=$2 FOR UPDATE`,[address,clientId]);
+    }
     await s.query(`INSERT INTO ${s.table('quotas')}(owner_id,client_id) VALUES($1,$2) ON CONFLICT DO NOTHING`, [ownerId, clientId]);
     await s.query(`SELECT count FROM ${s.table('quotas')} WHERE owner_id=$1 AND client_id=$2 FOR UPDATE`, [ownerId, clientId]);
     await s.checkpoint('quota_locked');
@@ -178,6 +309,7 @@ export class PostgresStore implements Store {
     for (const p of pairs.rows) await this.quota(s, p.owner_id, p.client_id);
   }
   private async authorized(s: PgSession, handle: string, auth: ManagementAuthorization) {
+    if (!await this.lockAgent(s,handle,auth.agentSub)) return false;
     return (await s.query(this.managementQuery(s),this.managementValues(handle,auth))).rowCount === 1;
   }
   private async subject(s: PgSession, t: Partial<Subject>, now: number): Promise<'key_revoked' | 'access_denied' | undefined> {
@@ -243,7 +375,7 @@ export class PostgresStore implements Store {
   setAgentEnabled(handle: string, enabled: boolean, agentSub: string, _now: number) {
     return this.db.mutate('setAgentEnabled', async (s) => {
       await this.subjectQuotas(s, { handle });
-      const a = await this.one<Agent>(s, 'agents', 'handle=$1 AND sub=$2', [handle, agentSub]);
+      const a = await this.one<Agent>(s, 'agents', 'handle=$1 AND sub=$2 FOR UPDATE', [handle, agentSub]);
       if (!a) return undefined;
       a.enabled = enabled;
       if (!enabled) a.authorizationVersion += 1;
@@ -255,7 +387,7 @@ export class PostgresStore implements Store {
   deleteAgent(handle: string, agentSub: string, _now: number) {
     return this.db.mutate('deleteAgent', async (s) => {
       await this.subjectQuotas(s, { handle });
-      if (!await this.one(s, 'agents', 'handle=$1 AND sub=$2', [handle, agentSub])) return false;
+      if (!await this.one(s, 'agents', 'handle=$1 AND sub=$2 FOR UPDATE', [handle, agentSub])) return false;
       await this.invalidate(s, { handle }, 'access_denied', await s.now());
       for (const key of await this.many<AgentKey>(s, 'keys', "agent_sub=$1 AND status='revoked'", [agentSub])) {
         await this.revokeTransactionTokens(s, { kid: key.kid, keyEnrollment: key.enrollment });
@@ -272,8 +404,8 @@ export class PostgresStore implements Store {
     return this.db.mutate('insertKey', async (s) => {
       const old = await this.one<AgentKey>(s, 'keys', 'kid=$1 AND handle=$2', [key.kid,key.handle]);
       if (old) await this.subjectQuotas(s, { kid: old.kid, keyEnrollment: old.enrollment });
-      const now = await s.now();
       if (key.status !== 'pending' || key.agentSub !== authorization.agentSub || !await this.authorized(s, key.handle, authorization)) return 'unauthorized';
+      const now = await s.now();
       if ((await s.query(`SELECT 1 FROM ${s.table('revoked_keys')} WHERE handle=$1 AND kid=$2`, [key.handle, key.kid])).rowCount) return 'revoked';
       if (old && now < old.expiresAt && ((old.status === 'pending' && old.challenge && now < old.challenge.expiresAt) || old.status === 'active')) return 'enrolled';
       if (key.expiresAt <= now || !key.challenge || key.challenge.expiresAt <= now) return 'unauthorized';
@@ -289,11 +421,13 @@ export class PostgresStore implements Store {
       // coordination first, including when this pending enrollment has no transactions.
       await this.subjectQuotas(s, { kid });
       const key = await this.one<AgentKey>(s, 'keys', 'kid=$1 AND enrollment=$2', [kid, enrollment]);
+      const active = await this.one<AgentKey>(s, 'keys', "kid=$1 AND status='active'", [kid]);
+      const subjects = [key,active].filter((entry): entry is AgentKey => entry !== undefined);
+      for (const entry of subjects.sort((a,b) => a.handle < b.handle ? -1 : a.handle > b.handle ? 1 : 0)) await this.lockAgent(s,entry.handle,entry.agentSub);
       const now = await s.now();
       if (assertionWindow && (now < assertionWindow.notBefore || now >= assertionWindow.expiresAt)) throw new AssertionWindowError();
       if (!key || key.status !== 'pending' || key.challenge?.value !== challenge || now >= key.challenge.expiresAt || now >= key.expiresAt) return false;
       if (!await this.one(s, 'agents', 'handle=$1 AND sub=$2', [key.handle, key.agentSub])) return false;
-      const active = await this.one<AgentKey>(s, 'keys', "kid=$1 AND status='active'", [kid]);
       if (active) {
         if (now < active.expiresAt) throw new KeyActivationConflictError();
         await this.invalidate(s, { kid, keyEnrollment: active.enrollment }, 'key_revoked', active.expiresAt);
@@ -322,6 +456,7 @@ export class PostgresStore implements Store {
       const key = await this.one<AgentKey>(s, 'keys', 'kid=$1 AND enrollment=$2', [kid, enrollment]);
       // An explicit revocation must record the reuse ban even after another activation retired this enrollment.
       if (!key) return undefined;
+      if (!auth) await this.lockAgent(s,key.handle,key.agentSub);
       if (auth && (key.agentSub !== auth.agentSub || !await this.authorized(s,key.handle,auth))) return undefined;
       if (key.status === 'revoked') {
         // Also repair bearer hashes retained by stores written before this invalidation rule.
@@ -359,6 +494,7 @@ export class PostgresStore implements Store {
     return this.db.mutate('patchKey', async (s) => {
       const key = await this.one<AgentKey>(s, 'keys', 'kid=$1 AND enrollment=$2', [kid,enrollment]);
       if (!key) return undefined;
+      if (!auth) await this.lockAgent(s,key.handle,key.agentSub);
       if (auth && (key.agentSub !== auth.agentSub || !await this.authorized(s,key.handle,auth))) return undefined;
       if (auth && patch.shareOwner !== undefined && (auth.kind !== 'owner' || !['passkey','oidc','domain','email_factor'].includes(auth.sessionAuth ?? ''))) return undefined;
       await s.checkpoint('management_key_authorized');
@@ -376,6 +512,8 @@ export class PostgresStore implements Store {
         target = (keys.find((key) => key.status === 'active') ?? (keys.length === 1 ? keys[0] : undefined))?.enrollment;
       }
       if (target !== undefined) {
+        const enrolled = await this.one<AgentKey>(s,'keys','kid=$1 AND enrollment=$2',[kid,target]);
+        if (enrolled) await this.lockAgent(s,enrolled.handle,enrolled.agentSub);
         if (pendingExpiredAt === undefined) {
           const key = await this.one<AgentKey>(s, 'keys', "kid=$1 AND enrollment=$2 AND status='revoked'", [kid,target]);
           if (key) await this.revokeTransactionTokens(s, { kid, keyEnrollment: target });
@@ -419,19 +557,20 @@ export class PostgresStore implements Store {
     return undefined;
   }
   private async reserve(s: PgSession, tx: Transaction, max: number, now: number): Promise<boolean> {
+    const peers = await this.quotaOwners(s,tx.ownerId!);
     // Retire invalid/expired reservations during admission. Polling and garbage collection are not quota authorities.
-    await s.query(`DELETE FROM ${s.table('reservations')} r WHERE r.owner_id=$1 AND r.client_id=$2 AND (
+    await s.query(`DELETE FROM ${s.table('reservations')} r WHERE r.owner_id=ANY($1::text[]) AND r.client_id=$2 AND (
       r.expires_at<=$3 OR NOT EXISTS (SELECT 1 FROM ${s.table('transactions')} t
         JOIN ${s.table('keys')} k ON k.kid=t.kid AND k.enrollment=t.key_enrollment AND k.handle=t.handle AND k.agent_sub=t.agent_sub AND k.status='active' AND k.expires_at>$3
         JOIN ${s.table('agents')} a ON a.sub=t.agent_sub AND a.enabled AND a.authorization_version=(t.data->>'agentVersion')::bigint
         LEFT JOIN ${s.table('accounts')} ac ON ac.agent_sub=t.agent_sub AND ac.client_id=t.client_id
         WHERE t.id=r.txn_id AND t.status NOT IN ('completed','denied','expired') AND t.expires_at>$3
-        AND COALESCE(ac.status,'enabled')='enabled' AND COALESCE(ac.authorization_version,0)=(t.data->>'accountVersion')::bigint))`, [tx.ownerId,tx.clientId,now]);
-    const count = await s.query<{ count: string; others: string }>(`SELECT q.count,
+        AND COALESCE(ac.status,'enabled')='enabled' AND COALESCE(ac.authorization_version,0)=(t.data->>'accountVersion')::bigint))`, [peers,tx.clientId,now]);
+    const count = await s.query<{ count: string; others: string }>(`SELECT
+      (SELECT count(DISTINCT event_id) FROM ${s.table('signup_events')} WHERE owner_id=ANY($1::text[]) AND client_id=$2) AS count,
       (SELECT count(DISTINCT r.agent_sub) FROM ${s.table('reservations')} r
-       WHERE r.owner_id=q.owner_id AND r.client_id=q.client_id AND r.expires_at>$3 AND r.agent_sub<>$4
-       AND NOT EXISTS(SELECT 1 FROM ${s.table('accounts')} a WHERE a.agent_sub=r.agent_sub AND a.client_id=r.client_id)) AS others
-      FROM ${s.table('quotas')} q WHERE q.owner_id=$1 AND q.client_id=$2`, [tx.ownerId,tx.clientId,now,tx.agentSub]);
+       WHERE r.owner_id=ANY($1::text[]) AND r.client_id=$2 AND r.expires_at>$3 AND r.agent_sub<>$4
+       AND NOT EXISTS(SELECT 1 FROM ${s.table('accounts')} a WHERE a.agent_sub=r.agent_sub AND a.client_id=r.client_id)) AS others`, [peers,tx.clientId,now,tx.agentSub]);
     if (Number(count.rows[0]?.count ?? 0) + Number(count.rows[0]?.others ?? 0) >= max) return false;
     await s.query(`INSERT INTO ${s.table('reservations')}(txn_id,owner_id,client_id,agent_sub,expires_at) VALUES($1,$2,$3,$4,$5)
       ON CONFLICT(txn_id) DO UPDATE SET expires_at=EXCLUDED.expires_at`, [tx.id,tx.ownerId,tx.clientId,tx.agentSub,tx.expiresAt]);
@@ -457,9 +596,11 @@ export class PostgresStore implements Store {
     return this.db.mutate('updateTransaction', async (s) => {
       produced = undefined;
       if (supplied.ownerId) await this.quota(s,supplied.ownerId,supplied.clientId);
+      if (supplied.handle) await this.lockAgent(s,supplied.handle,supplied.agentSub);
       const cur = await this.one<Transaction>(s,'transactions','id=$1',[supplied.id]);
       if (cur) await this.requireTransactionToken(s,cur,effects.transactionTokenHash);
       if (!cur || cur.version !== expectedVersion || TERMINAL.has(cur.status) || supplied.status === 'completed') return undefined;
+      if (!cur.clientPresentation && supplied.status !== 'denied') throw new TransactionExpiredError();
       let now = await s.now();
       const firstAssertion = cur.status === 'awaiting_agent' && !!supplied.kid;
       const expired = await this.expiration(s,cur,now);
@@ -473,6 +614,7 @@ export class PostgresStore implements Store {
       if (effects.assertionWindow && (now < effects.assertionWindow.notBefore || now >= effects.assertionWindow.expiresAt)) throw new AssertionWindowError();
       if (assertionKey && effects.expectedShareOwner !== undefined && assertionKey.permissions.share_owner !== effects.expectedShareOwner) return undefined;
       let next = clone(supplied);
+      next.clientPresentation = clone(cur.clientPresentation);
       // Approval and retries cannot weaken the request or renew its accepted assertion.
       next.maxAge = cur.maxAge;
       next.assertedAt = cur.assertedAt;
@@ -498,7 +640,8 @@ export class PostgresStore implements Store {
         }
       }
       next.version = expectedVersion + 1;
-      // All conflicting mutations run SERIALIZABLE; the version predicate is a second explicit precondition.
+      // The Agent fence also covers READ COMMITTED hosting invalidations; the
+      // version predicate is a second explicit precondition for this transition.
       const accepted = await s.query(`UPDATE ${s.table('transactions')} SET data=$1::jsonb WHERE id=$2 AND version=$3`, [JSON.stringify(next),next.id,expectedVersion]);
       if (!accepted.rowCount) return undefined;
       if (TERMINAL.has(next.status)) await s.query(`DELETE FROM ${s.table('reservations')} WHERE txn_id=$1`,[next.id]);
@@ -525,16 +668,24 @@ export class PostgresStore implements Store {
     return this.db.mutate('completeTransaction', async (s) => {
       produced = undefined;
       if (supplied.ownerId) await this.quota(s,supplied.ownerId,supplied.clientId);
+      if (supplied.handle) await this.lockAgent(s,supplied.handle,supplied.agentSub);
       const cur = await this.one<Transaction>(s,'transactions','id=$1',[supplied.id]);
       if (cur) await this.requireTransactionToken(s,cur,transactionTokenHash);
       if (!cur || cur.version !== expectedVersion || cur.status !== 'ready') return undefined;
       const now = await s.now();
-      const dead = await this.subject(s,cur,now);
+      const dead = !cur.clientPresentation ? 'access_denied' : await this.subject(s,cur,now);
       const expired = await this.expiration(s,cur,now);
       const account = await this.one<Account>(s,'accounts','agent_sub=$1 AND client_id=$2',[cur.agentSub,cur.clientId]);
       const reservation = await s.query(`SELECT 1 FROM ${s.table('reservations')} WHERE txn_id=$1 AND agent_sub=$2 AND owner_id=$3 AND client_id=$4 AND expires_at>$5`,[cur.id,cur.agentSub,cur.ownerId,cur.clientId,now]);
       const stale = isAuthenticationTooOld(cur.maxAge,cur.assertedAt,now);
-      if (dead || expired || stale || (cur.passedCap && !account && !reservation.rowCount)) {
+      const cap=(await this.one<Client>(s,'clients','client_id=$1',[cur.clientId]))?.maxSignupsPerOwner;
+      const count=Number((await s.query<{count:string}>(`SELECT count(DISTINCT event_id) AS count FROM ${s.table('signup_events')} WHERE owner_id=ANY($1::text[]) AND client_id=$2`,[await this.quotaOwners(s,cur.ownerId!),cur.clientId])).rows[0]?.count??0);
+      const capExceeded=!account && cap!==undefined && count>=cap;
+      const reservationLost=cur.passedCap && !account && !reservation.rowCount;
+      // Every Account creation needs current capacity, even with an owned reservation:
+      // sibling completion/deletion or an address merge may have changed other claims.
+      const newCapacityDenied=!dead && !expired && !stale && !capExceeded && !reservationLost && !account && cap!==undefined && !await this.reserve(s,cur,cap,now);
+      if (dead || expired || stale || capExceeded || reservationLost || newCapacityDenied) {
         const next: Transaction = { ...cur,...expired,status:expired?.status ?? 'denied',reason:expired ? expired.reason : dead ?? (stale ? 'login_required' : 'signup_limit_reached'),terminalAt:expired?.terminalAt ?? now,challenge:undefined,version:cur.version+1 };
         await this.replace(s,'transactions','id',cur.id,next);
         await s.query(`DELETE FROM ${s.table('reservations')} WHERE txn_id=$1`,[cur.id]);
@@ -555,7 +706,10 @@ export class PostgresStore implements Store {
       const nextAccount: Account = account ? { ...account,lastSignedInAt:now,signInCount:account.signInCount+1 } :
         { handle:cur.handle!,clientId:cur.clientId,status:'enabled',authorizationVersion:0,firstSignedInAt:now,lastSignedInAt:now,signInCount:1 };
       await s.query(`INSERT INTO ${s.table('accounts')}(agent_sub,data) VALUES($1,$2::jsonb) ON CONFLICT(agent_sub,client_id) DO UPDATE SET data=EXCLUDED.data`,[cur.agentSub,JSON.stringify(nextAccount)]);
-      if (!account) await s.query(`UPDATE ${s.table('quotas')} SET count=count+1 WHERE owner_id=$1 AND client_id=$2`,[cur.ownerId,cur.clientId]);
+      if (!account) {
+        // Count each Account creation, including recreation of a deleted Agent/client Account.
+        await s.query(`INSERT INTO ${s.table('signup_events')}(owner_id,client_id,event_id) SELECT p,$2,'created:' || $3::text FROM unnest($1::text[]) p ON CONFLICT DO NOTHING`,[await this.quotaOwners(s,cur.ownerId!),cur.clientId,cur.id]);
+      }
       await s.query(`DELETE FROM ${s.table('reservations')} WHERE txn_id=$1`,[cur.id]);
       const acceptedAt = await s.now();
       if (acceptedAt >= cur.expiresAt || await this.subject(s,cur,acceptedAt) || (cur.passedCap && !account && acceptedAt >= cur.expiresAt)) throw new WindowElapsed('expired');
@@ -582,6 +736,7 @@ export class PostgresStore implements Store {
     return this.db.mutate<RedeemResult>('redeemCode', async (s) => {
       const code = await this.one<Code>(s,'codes','hash=$1',[hash]);
       if (!code) return 'unknown';
+      await this.lockAgent(s,code.handle,code.agentSub);
       const now = await s.now();
       if (code.used) {
         await this.replace(s,'codes','hash',hash,{...code,replayed:true});
@@ -609,6 +764,7 @@ export class PostgresStore implements Store {
   insertAccessToken(input: AccessToken, suppliedNow: number) {
     const token = clone(input);
     return this.db.mutate('insertAccessToken', async (s) => {
+      await this.lockAgent(s,token.handle,token.agentSub);
       const row = (await s.query<{data:Code;issuance_until:string}>(`SELECT data,issuance_until FROM ${s.table('codes')} WHERE txn_id=$1`,[token.txnId])).rows[0];
       const now = await s.now();
       if (!row || !row.data.used || row.data.replayed || Number(row.issuance_until)<=now || await this.subject(s,token,now)) return false;
@@ -654,6 +810,7 @@ export class PostgresStore implements Store {
       const a = await this.one<Agent>(s,'agents','handle=$1',[handle]);
       if (!a) return;
       await this.quota(s,a.ownerId,clientId);
+      await this.lockAgent(s,handle,a.sub);
       await s.query(`DELETE FROM ${s.table('accounts')} WHERE agent_sub=$1 AND client_id=$2`,[a.sub,clientId]);
     });
   }
@@ -664,6 +821,7 @@ export class PostgresStore implements Store {
     for (const [name,n] of Object.entries({batchSize:batch,retainFor,consentMaxAge:consentAge})) if (!Number.isSafeInteger(n) || n<1 || (name==='batchSize' && n>10000)) throw new RangeError(`Invalid ${name}`);
     return this.db.mutate('cleanup', async (s) => {
       const start = await s.now();
+      await this.expireOwnerLinks(s,start);
       const candidates = await s.query<{txn_id:string;owner_id:string;client_id:string}>(
         `SELECT txn_id,owner_id,client_id FROM ${s.table('reservations')} WHERE expires_at<=$1 ORDER BY expires_at,txn_id LIMIT $2`,[start,batch]);
       const pairs = await s.query<{owner_id:string;client_id:string}>(`SELECT DISTINCT owner_id,client_id FROM ${s.table('reservations')} WHERE txn_id=ANY($1::text[]) ORDER BY owner_id,client_id`,[candidates.rows.map((r)=>r.txn_id)]);

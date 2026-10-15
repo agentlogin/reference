@@ -42,8 +42,9 @@ and report skip, naming what is missing, without it:
 | `--relay-issuer URL` | a Relay whose metadata the issuer can fetch, with `issuer` and `op_policy_uri` (Section 4.4); a domain name, so that look-alike hosts can be formed | I-45, I-48 |
 | `--email-only-owner-credential CRED` | with `--handle`: a second Owner Credential of the same Owner, obtained through the issuer's one-time-code sign-in alone (library, with `adminToken`: `ownerEmailSignIn(email)`, which performs that sign-in) | I-45 |
 
-Covered today: I-1 to I-4, I-6, I-7, I-9 to I-15, I-17, I-19 to I-24, I-26 to I-28, I-32, I-33, I-37 to I-49, and two checks
+Covered today: I-1 to I-4, I-6, I-7, I-9 to I-15, I-17, I-19 to I-24, I-26 to I-28, I-32, I-33, I-37 to I-49, I-56, and two checks
 of the reference issuer's own surface: M-1 (Delegated Credential binding) and M-2 (the bootstrap `session_auth` marker).
+I-3 includes unknown repeated parameters in GET queries, POST bodies and split query/body requests. I-56 checks required registration metadata, including an explicit token authentication method; private_key_jwt-specific checks run only when advertised.
 I-49 runs last: it audits every response the whole run received from the authorization, transaction, token, UserInfo,
 registration and agents endpoints. Owner approval (I-13, I-45) is exercised through the reference issuer's
 `/owner/transactions/{id}` API, which the specification does not define.

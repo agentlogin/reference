@@ -68,7 +68,7 @@ test('PostgreSQL enrollment cannot commit across handle deletion and ownership r
   const insertionReady = deferred();
   const release = deferred();
   const f = await fixture(t, { async onCheckpoint(event) {
-    if (armed && !stopped && event.operation === 'insertKey' && event.phase === 'beforeCommit') {
+    if (armed && !stopped && event.operation === 'insertKey' && event.phase === 'before_agent_lock') {
       stopped = true;
       insertionReady.resolve();
       await release.promise;

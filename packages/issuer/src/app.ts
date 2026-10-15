@@ -1,4 +1,5 @@
 // HTTP surface of the issuer. Section numbers refer to Agent Login Core 1.0 draft 0.1.
+import { ownerAddressKey } from './owner-address.js';
 import { Hono, type Context } from 'hono';
 import { cors } from 'hono/cors';
 import { getCookie, setCookie } from 'hono/cookie';
@@ -87,15 +88,22 @@ export function createIssuerApp(ctx: IssuerContext): Hono {
         agents_endpoint: `${base}/agents`,
         handle_domains: ctx.handleDomains,
         agent_login_versions_supported: [VERSION],
+        op_policy_uri: ctx.policyUri,
         service_documentation: 'https://github.com/agentlogin/spec',
       },
       200,
       { 'Cache-Control': 'public, max-age=3600' },
     ),
   );
-  app.get('/.well-known/jwks.json', (c) =>
-    c.json({ keys: [{ ...ctx.signingKey.publicJwk, kid: ctx.signingKey.kid, use: 'sig', alg: 'ES256' }] }, 200, { 'Cache-Control': 'public, max-age=3600' }),
+  app.get('/.well-known/jwks.json', async (c) =>
+    c.json({ keys: (await ctx.store.listSigningKeys()).map((key) => ({ ...key.publicJwk,kid:key.kid,use:'sig',alg:'ES256' })) }, 200,
+      { 'Cache-Control': `public, max-age=${ctx.jwksCacheSeconds}` }),
   );
+  app.get('/policy', (c) => c.json({
+    issuer: base,
+    owner_deletion_quota_retention_seconds: ctx.ownerDeletionRetentionSeconds,
+    description: 'Completed sign-ups remain counted while an Owner exists. After deletion, this fixed retention period links a verified address to its counts only; identity, credentials and consent are never inherited. Zero ends inheritance immediately. Each deletion keeps the period in force when it occurred.',
+  },200,{'Cache-Control':'no-store'}));
   // Section 2.2: WebFinger for handles in the served domains (per-handle lookups only).
   app.get('/.well-known/webfinger', async (c) => {
     // The query value is decoded once by the framework; the `acct:` URI inside it carries its own percent-encoding
@@ -153,6 +161,9 @@ export function createIssuerApp(ctx: IssuerContext): Hono {
     let state: string | undefined;
     try {
       state = one('state');
+      // Section 5.2 step 3 applies to every parameter, including unknown extensions and query/body duplicates.
+      // Validate after the client and redirect URI so this error uses the validated redirect target.
+      for (const k of Object.keys(q)) one(k);
       const nonce = one('nonce');
       const codeChallenge = one('code_challenge');
       const method = one('code_challenge_method');
@@ -257,7 +268,7 @@ export function createIssuerApp(ctx: IssuerContext): Hono {
   app.get('/transactions/:id/wait', async (c) => {
     const { t, client, viewer } = await loadTx(c);
     const r = tx.resource(ctx, t, client, viewer);
-    const name = escapeHtml(client.clientName ?? new URL(t.redirectUri).host);
+    const name = escapeHtml(tx.presentedClient(t, client).clientName ?? new URL(t.redirectUri).host);
     const html = page(
       'Sign in with your agent',
       `<p>Signing in to <strong>${name}</strong>.</p><p id="status">Waiting for your agent to sign in.</p>` +
@@ -418,7 +429,7 @@ export function createIssuerApp(ctx: IssuerContext): Hono {
     const cred = await ownerOf(c);
     const t = await tx.loadTransaction(ctx, c.req.param('id') ?? '');
     if (t.ownerId !== cred.ownerId) throw new OAuthError(404, 'invalid_transaction');
-    const client = (await ctx.store.getClient(t.clientId))!;
+    const client = tx.presentedClient(t, (await ctx.store.getClient(t.clientId))!);
     // Section 6.6: the approval view names the client with its redirect_host, the requested Owner Claims and the handle;
     // a client registered with relay_issuer is named as a Relay that forwards the Owner Claims under its op_policy_uri,
     // which Section 4.4 has the Issuer read from the Relay's metadata.
@@ -456,6 +467,7 @@ export function createIssuerApp(ctx: IssuerContext): Hono {
   app.post('/owner/sessions/email', async (c) => {
     const b = await jsonBody(c);
     if (!isPlainObject(b) || typeof b.email !== 'string') throw new OAuthError(400, 'invalid_request', 'email required');
+    try { ownerAddressKey(b.email); } catch { throw new OAuthError(400,'invalid_request','Valid email required'); }
     if (!ctx.sendOwnerCode) throw new OAuthError(501, 'not_supported', 'no delivery channel for one-time codes is configured');
     const owner = await ctx.store.getOwnerByEmail(b.email);
     if (owner) {
@@ -483,6 +495,7 @@ export function createIssuerApp(ctx: IssuerContext): Hono {
     requireAdmin(c);
     const b = await jsonBody(c);
     if (!isPlainObject(b) || typeof b.email !== 'string') throw new OAuthError(400, 'invalid_request', 'email required');
+    try { ownerAddressKey(b.email); } catch { throw new OAuthError(400,'invalid_request','Valid email required'); }
     const id = randomId();
     const via = b.verified_via;
     const sessionAuth = parseSessionAuth(b.session_auth);
@@ -532,7 +545,7 @@ export function createIssuerApp(ctx: IssuerContext): Hono {
     const credential = randomSecret();
     const sessionAuth = kind === 'owner' ? parseSessionAuth(b.session_auth) : undefined;
     if (sessionAuth && strongest(owner.verifiedVia, methodOf(sessionAuth)) !== owner.verifiedVia) {
-      await ctx.store.putOwner({ ...owner, verifiedVia: methodOf(sessionAuth) }); // Section 7.5: the strongest method used
+      await ctx.store.putOwner({ ...owner, verifiedVia: methodOf(sessionAuth) },ctx.now()); // Section 7.5: the strongest method used
     }
     await ctx.store.putCredential({ hash: sha256(credential), ownerId: b.owner_id, kind, handle, sessionAuth, createdAt: ctx.now() });
     return c.json({ credential, kind, handle, session_auth: sessionAuth }, 201, NO_STORE);

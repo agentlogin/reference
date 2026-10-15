@@ -2,7 +2,7 @@
 
 Client library and command line for the [Agent Login](https://github.com/agentlogin/spec) protocol: a software agent
 signs in to a web application with a key it holds, and the application receives a standard OpenID Connect ID Token
-naming the agent and, when registered, its accountable owner. Apache-2.0. Tracks specification draft 0.1.
+naming the agent and, when registered, its accountable owner. Apache-2.0. Implements the direct-sign-in profile against the pinned draft revision in the repository compatibility status; this is not a complete conformance claim.
 
 ```bash
 npm install -g agentlogin

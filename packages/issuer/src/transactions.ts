@@ -39,6 +39,8 @@ export async function createTransaction(ctx: IssuerContext, p: CreateParams): Pr
     version: 0,
     continueSecret: randomSecret(),
     clientId: p.client.clientId,
+    clientPresentation: { type: p.client.type, clientName: p.client.clientName, logoUri: p.client.logoUri,
+      tosUri: p.client.tosUri, policyUri: p.client.policyUri, relayIssuer: p.client.relayIssuer, relayPolicyUri: p.client.relayPolicyUri },
     redirectUri: p.redirectUri,
     scopes: p.scopes,
     state: p.state,
@@ -76,8 +78,16 @@ export async function loadTransaction(ctx: IssuerContext, id: string): Promise<T
   return tx;
 }
 
+/** Keep displayed terms fixed while authentication, review policy and quota continue to use the current Client. */
+export function presentedClient(tx: Transaction, client: Client): Client {
+  const shown = tx.clientPresentation;
+  return { ...client, type: shown?.type ?? client.type, clientName: shown?.clientName, logoUri: shown?.logoUri,
+    tosUri: shown?.tosUri, policyUri: shown?.policyUri, relayIssuer: shown?.relayIssuer, relayPolicyUri: shown?.relayPolicyUri };
+}
+
 /** Section 6.1: the Transaction Resource as seen by `viewer`. */
 export function resource(ctx: IssuerContext, tx: Transaction, client: Client, viewer: Pick<Viewer, 'kind'>): Record<string, unknown> {
+  client = presentedClient(tx, client);
   const base = txUrl(ctx, tx.id);
   const r: Record<string, unknown> = {
     transaction_id: tx.id,
@@ -149,6 +159,7 @@ export function identifyViewer(tx: Transaction, bearer: string | null, cookieSec
  * the client demands a review).
  */
 export function reviewReasons(ctx: IssuerContext, tx: Transaction, client: Client, consent: Consent | undefined, now = ctx.now()): { record: ConsentReason | null; forced: ConsentReason | null } {
+  client = presentedClient(tx, client);
   const record: ConsentReason | null = consentRecordReason(consent, { scopes: tx.scopes, redirectHost: new URL(tx.redirectUri).host,
     clientName: client.clientName, tosUri: client.tosUri, policyUri: client.policyUri }, now - ctx.constants.T_CONSENT) ?? null;
   const forced: ConsentReason | null = tx.prompt === 'consent' ? 'prompt_consent' : client.requireReview ? 'policy' : null;
@@ -157,6 +168,7 @@ export function reviewReasons(ctx: IssuerContext, tx: Transaction, client: Clien
 
 /** Effects committed atomically with the transition; a delayed request cannot grant consent to a replacement Agent. */
 function transitionEffects(ctx: IssuerContext, tx: Transaction, client: Client, grantConsent = false): Omit<TransitionEffects, 'now'> {
+  client = presentedClient(tx, client);
   const consentContext = tx.handle ? { handle: tx.handle, clientId: tx.clientId, scopes: tx.scopes, redirectHost: new URL(tx.redirectUri).host,
     clientName: client.clientName, tosUri: client.tosUri, policyUri: client.policyUri } : undefined;
   return {

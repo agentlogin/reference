@@ -2,10 +2,10 @@
  * Critical lookup/lifecycle fields are stored generated columns, so indexed values cannot drift from payloads.
  * Historical authorizations intentionally do not cascade from live identities; revocation/replay evidence survives.
  */
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 3;
 export const TABLES = [
   'owners', 'agents', 'credentials', 'owner_codes', 'keys', 'revoked_keys', 'clients',
-  'transactions', 'codes', 'access_tokens', 'accounts', 'consents', 'quotas', 'reservations',
+  'transactions', 'codes', 'access_tokens', 'accounts', 'consents', 'quotas', 'reservations', 'signup_events', 'owner_tombstones', 'address_quotas', 'signing_keys', 'signing_state',
 ] as const;
 export type TableName = typeof TABLES[number];
 
@@ -211,5 +211,83 @@ ALTER TABLE ${keys} DROP CONSTRAINT keys_pkey;
 ALTER TABLE ${keys} ADD PRIMARY KEY (handle, kid);
 CREATE INDEX keys_kid ON ${keys} (kid);
 CREATE UNIQUE INDEX keys_active_kid ON ${keys} (kid) WHERE status = 'active';
+`;
+}
+
+/** Durable quota provenance and issuer signing-key lifecycle. */
+export function schemaV3(schema: string, legacySigningOverlapSeconds = 0): string {
+  if (!Number.isSafeInteger(legacySigningOverlapSeconds) || legacySigningOverlapSeconds < 0) throw new TypeError('Invalid legacy signing overlap');
+  const q = (name: string) => `${identifier(schema)}.${identifier(name)}`;
+  return `
+CREATE INDEX transactions_legacy_presentation ON ${q('transactions')} (id)
+  WHERE status NOT IN ('completed','denied','expired') AND NOT (data ? 'clientPresentation');
+ALTER TABLE ${q('owners')} ADD COLUMN address_key text NOT NULL DEFAULT '';
+CREATE INDEX owners_address ON ${q('owners')} (address_key, created_at DESC);
+CREATE TABLE ${q('owner_tombstones')} (
+  owner_id text PRIMARY KEY, owner_sub text NOT NULL UNIQUE,
+  address_key text, expires_at bigint,
+  CHECK ((address_key IS NULL) = (expires_at IS NULL))
+);
+CREATE INDEX owner_tombstones_address ON ${q('owner_tombstones')} (address_key, expires_at) WHERE address_key IS NOT NULL;
+CREATE INDEX owner_tombstones_expiry ON ${q('owner_tombstones')} (expires_at) WHERE expires_at IS NOT NULL;
+CREATE TABLE ${q('signup_events')} (
+  owner_id text NOT NULL, client_id text NOT NULL, event_id text NOT NULL,
+  PRIMARY KEY (owner_id, client_id, event_id)
+);
+INSERT INTO ${q('signup_events')}(owner_id,client_id,event_id)
+  SELECT owner_id,client_id,jsonb_build_array(agent_sub,client_id)::text FROM (
+    SELECT owner_id,client_id,agent_sub FROM ${q('transactions')} WHERE status='completed' AND owner_id IS NOT NULL
+    UNION SELECT a.owner_id,ac.client_id,ac.agent_sub FROM ${q('accounts')} ac JOIN ${q('agents')} a ON a.sub=ac.agent_sub
+  ) known ON CONFLICT DO NOTHING;
+INSERT INTO ${q('signup_events')}(owner_id,client_id,event_id)
+  SELECT q.owner_id,q.client_id,'legacy:' || jsonb_build_array(q.owner_id,q.client_id,n)::text
+  FROM ${q('quotas')} q, LATERAL generate_series(1,GREATEST(0,q.count-(SELECT count(*) FROM ${q('signup_events')} e WHERE e.owner_id=q.owner_id AND e.client_id=q.client_id))) n;
+CREATE TABLE ${q('address_quotas')} (
+  address_key text NOT NULL, client_id text NOT NULL,
+  PRIMARY KEY (address_key, client_id)
+);
+CREATE TABLE ${q('signing_keys')} (kid text PRIMARY KEY, data jsonb NOT NULL);
+CREATE TABLE ${q('signing_state')} (singleton boolean PRIMARY KEY DEFAULT true CHECK(singleton), active_kid text REFERENCES ${q('signing_keys')}(kid), legacy_retire_not_before bigint);
+INSERT INTO ${q('signing_state')}(singleton,legacy_retire_not_before) VALUES(true,${legacySigningOverlapSeconds ? `${q('app_now')}()::bigint + ${legacySigningOverlapSeconds}` : 'NULL'});
+CREATE FUNCTION ${q('invalidate_agent')}(p_handle text, p_sub text, p_now bigint) RETURNS boolean LANGUAGE plpgsql
+SET search_path=pg_catalog AS $$
+BEGIN
+  UPDATE ${q('agents')} SET data=data || jsonb_build_object('enabled',false,'authorizationVersion',authorization_version+1)
+    WHERE handle=p_handle AND sub=p_sub;
+  IF NOT FOUND THEN RETURN false; END IF;
+  -- The Agent update can wait for an in-flight authorization's shared row lock.
+  -- Expiry and terminal retention use the authoritative time after that wait.
+  p_now := ${q('app_now')}()::bigint;
+  WITH affected AS (
+    SELECT t.id,t.expires_at,COALESCE(k.expires_at,9223372036854775807) AS key_expiry
+    FROM ${q('transactions')} t LEFT JOIN ${q('keys')} k ON k.kid=t.kid AND k.enrollment=t.key_enrollment AND k.agent_sub=t.agent_sub AND k.status<>'pending'
+    WHERE t.agent_sub=p_sub AND t.status NOT IN ('completed','denied','expired'))
+  UPDATE ${q('transactions')} t SET data=(t.data-'challenge'-'reason') || jsonb_build_object(
+    'status',CASE WHEN x.expires_at<=p_now AND x.expires_at<=x.key_expiry THEN 'expired' ELSE 'denied' END,
+    'terminalAt',LEAST(x.expires_at,x.key_expiry,p_now),'version',t.version+1) ||
+    CASE WHEN x.expires_at<=p_now AND x.expires_at<=x.key_expiry THEN '{}'::jsonb
+    ELSE jsonb_build_object('reason',CASE WHEN x.key_expiry<=p_now THEN 'key_revoked' ELSE 'access_denied' END) END
+    FROM affected x WHERE t.id=x.id;
+  DELETE FROM ${q('reservations')} WHERE agent_sub=p_sub;
+  UPDATE ${q('codes')} SET data=data || '{"voided":true}'::jsonb WHERE agent_sub=p_sub AND NOT used AND NOT voided;
+  UPDATE ${q('access_tokens')} SET data=data || '{"revoked":true}'::jsonb WHERE agent_sub=p_sub AND NOT revoked;
+  RETURN true;
+END;
+$$;
+CREATE FUNCTION ${q('retire_agent')}(p_handle text, p_sub text, p_now bigint) RETURNS boolean LANGUAGE plpgsql
+SET search_path=pg_catalog AS $$
+BEGIN
+  IF NOT ${q('invalidate_agent')}(p_handle,p_sub,p_now) THEN RETURN false; END IF;
+  UPDATE ${q('transactions')} t SET data=(t.data-'transactionTokenHash') || jsonb_build_object('version',t.version+1)
+    WHERE t.data ? 'transactionTokenHash' AND EXISTS(SELECT 1 FROM ${q('keys')} k WHERE k.agent_sub=p_sub AND k.status='revoked' AND k.kid=t.kid AND k.enrollment=t.key_enrollment);
+  INSERT INTO ${q('revoked_keys')}(handle,kid) SELECT handle,kid FROM ${q('keys')} WHERE agent_sub=p_sub ON CONFLICT DO NOTHING;
+  DELETE FROM ${q('keys')} WHERE agent_sub=p_sub;
+  DELETE FROM ${q('accounts')} WHERE agent_sub=p_sub;
+  DELETE FROM ${q('consents')} WHERE agent_sub=p_sub;
+  DELETE FROM ${q('credentials')} WHERE handle=p_handle AND kind='delegated';
+  DELETE FROM ${q('agents')} WHERE handle=p_handle AND sub=p_sub;
+  RETURN true;
+END;
+$$;
 `;
 }

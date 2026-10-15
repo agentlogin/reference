@@ -3,6 +3,14 @@ import type { AgentIdentity, LiveCheck } from '@agentlogin/rp';
 
 export interface NewSession { agent: AgentIdentity; expiresAt: number; live?: LiveCheck }
 export interface Session extends NewSession { firstSeen: string }
+export interface Note { id: string; text: string; createdAt: number }
+export interface NoteCursor { id: string; createdAt: number }
+export class NoteError extends Error {
+  constructor(readonly code: 'session_expired' | 'reauthentication_required' | 'idempotency_conflict' | 'note_limit') { super(code); }
+}
+export function validateNote(id: string, text: string): void {
+  if (typeof id !== 'string' || !/^[A-Za-z0-9_-]{16,128}$/.test(id) || typeof text !== 'string' || !text.trim() || Buffer.byteLength(text, 'utf8') > 4096 || /[\u0000-\u0008\u000b\u000c\u000e-\u001f]/.test(text)) throw new TypeError('invalid note');
+}
 
 /** Application data, separate from the RP callback claim. Times are Unix seconds. No read renews a deadline. */
 export interface SessionStore {
@@ -12,6 +20,10 @@ export interface SessionStore {
   get(sid: string): Promise<Session | undefined>;
   /** Return only after durable invalidation. A storage failure must not be reported as successful logout. */
   revoke(sid: string): Promise<void>;
+  /** Session authorization and note insertion share one transaction. Reuse id only with identical text. */
+  saveNote(sid: string, id: string, text: string): Promise<Note>;
+  /** Return the newest 100 notes belonging to this authenticated account. */
+  listNotes(sid: string, before?: NoteCursor): Promise<Note[] | undefined>;
   /** A bounded batch of expired sessions and/or expired live-check credentials. */
   cleanup(limit?: number): Promise<number>;
   close(): Promise<void>;
@@ -69,6 +81,7 @@ export class SessionProtection {
 export class MemorySessionStore implements SessionStore {
   private readonly sessions = new Map<string, Session>();
   private readonly accounts = new Map<string, string>();
+  private readonly notes = new Map<string, Map<string, Note>>();
   constructor(private readonly now: () => number = () => Math.floor(Date.now() / 1000)) {}
   async create(sid: string, value: NewSession, previousSid?: string): Promise<Session> {
     validateSession(sid, value);
@@ -91,6 +104,30 @@ export class MemorySessionStore implements SessionStore {
     return structuredClone(session);
   }
   async revoke(sid: string): Promise<void> { this.sessions.delete(sid); }
+  async saveNote(sid: string, id: string, text: string): Promise<Note> {
+    validateNote(id, text);
+    // No await separates authorization from insertion in the in-memory implementation.
+    const s = this.sessions.get(sid), now = this.now();
+    if (!s || s.expiresAt <= now) throw new NoteError('session_expired');
+    if (!s.live || s.live.accessTokenExpiresAt <= now) throw new NoteError('reauthentication_required');
+    const notes = this.notes.get(s.agent.key) ?? new Map<string, Note>();
+    const previous = notes.get(id);
+    if (previous) {
+      if (previous.text !== text) throw new NoteError('idempotency_conflict');
+      return structuredClone(previous);
+    }
+    if (notes.size >= 1000) throw new NoteError('note_limit');
+    const note = { id, text, createdAt: now };
+    notes.set(id, note); this.notes.set(s.agent.key, notes);
+    return structuredClone(note);
+  }
+  async listNotes(sid: string, before?: NoteCursor): Promise<Note[] | undefined> {
+    const s = this.sessions.get(sid);
+    if (!s || s.expiresAt <= this.now()) return undefined;
+    return structuredClone([...(this.notes.get(s.agent.key)?.values() ?? [])]
+      .filter((note) => !before || note.createdAt < before.createdAt || (note.createdAt === before.createdAt && note.id > before.id))
+      .sort((a, b) => b.createdAt - a.createdAt || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)).slice(0, 100));
+  }
   async cleanup(limit = 1000): Promise<number> {
     cleanupLimit(limit);
     const now = this.now();
@@ -102,5 +139,5 @@ export class MemorySessionStore implements SessionStore {
     }
     return changed;
   }
-  async close(): Promise<void> { this.sessions.clear(); this.accounts.clear(); }
+  async close(): Promise<void> { this.sessions.clear(); this.accounts.clear(); this.notes.clear(); }
 }

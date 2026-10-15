@@ -3,6 +3,8 @@
 // count; and lifecycle changes plus invalidation each commit together. No network or cryptographic work runs
 // inside a store operation. Immutable Agent identities and persistent disable versions fence delayed work.
 import type { Scope } from './constants.js';
+import { LEGACY_SIGNING_CACHE_SECONDS, LEGACY_SIGNING_OVERLAP_SECONDS, samePublicSigningKey, validateSigningPublication, type PublishedSigningKey, type SigningKeyPublication } from './signing-state.js';
+import { ownerAddressKey } from './owner-address.js';
 
 export type OwnerVerifiedVia = 'email' | 'oidc' | 'domain' | 'passkey';
 export interface Owner {
@@ -90,6 +92,8 @@ export interface Client {
   fetchedAt?: number;
   cacheUntil?: number;
 }
+/** Public presentation accepted for one transaction; never includes authentication credentials or live policy. */
+export type ClientPresentation = Pick<Client, 'type' | 'clientName' | 'logoUri' | 'tosUri' | 'policyUri' | 'relayIssuer' | 'relayPolicyUri'>;
 export type TxStatus = 'awaiting_agent' | 'awaiting_owner' | 'awaiting_consent' | 'ready' | 'completed' | 'denied' | 'expired';
 export const TERMINAL: ReadonlySet<TxStatus> = new Set(['completed', 'denied', 'expired']);
 export type DenyReason =
@@ -102,6 +106,8 @@ export interface Transaction {
   /** Incremented by every accepted change; a change is accepted only against the version it was computed from. */
   version: number;
   clientId: string;
+  /** Immutable displayed metadata. Missing only on legacy records, which issuer startup cancels without backfilling. */
+  clientPresentation?: ClientPresentation;
   redirectUri: string;
   scopes: Scope[];
   state: string;
@@ -290,10 +296,19 @@ export function isKeyActivationConflictError(error: unknown): error is KeyActiva
 export interface Store {
   /** Authoritative clock for protocol timestamps; local adapters use the supplied application/test clock. */
   currentTime(fallbackNow: number): Promise<number>;
+  /** Shared issuer-key lifecycle. Private keys never enter Store. First initialization may select bootstrapKid. */
+  publishSigningKeys(keys: SigningKeyPublication[], bootstrapKid: string, now: number, cacheLifetime: number): Promise<void>;
+  listSigningKeys(): Promise<PublishedSigningKey[]>;
+  activateSigningKey(kid: string, now: number): Promise<boolean>;
+  removeSigningKey(kid: string, compromised: boolean, now: number): Promise<boolean>;
+  /** Reserves maximum expiration before signing; callers recheck compromise before delivery. */
+  reserveSigningKey(expiresAt: number, now: number): Promise<PublishedSigningKey | undefined>;
   // ---- owners, agents, credentials ----
-  putOwner(o: Owner): Promise<void>;
+  putOwner(o: Owner, now?: number): Promise<void>;
+  /** ATOMIC identity deletion; retained address linkage expires at this fixed deadline. */
+  deleteOwner(id: string, ownerSub: string, now: number, retentionSeconds: number): Promise<boolean>;
   getOwner(id: string): Promise<Owner | undefined>;
-  /** The Owner with this address (compared without regard to case); the most recently created when several share it. */
+  /** The Owner with this address (parsed local-part exact, domain case-insensitive); the most recently created when several share it. */
   getOwnerByEmail(email: string): Promise<Owner | undefined>;
   putOwnerCode(c: OwnerCode): Promise<void>;
   /** ATOMIC. Returns and deletes the Owner's outstanding code. */
@@ -376,6 +391,8 @@ export interface Store {
   updateTransaction(t: Transaction, expectedVersion: number, effects: TransitionEffects): Promise<Transaction | undefined>;
   /** Transactions whose stored status is not terminal (an expired one may still be listed; callers look at `expiresAt`). */
   listOpenTransactions(filter: SubjectFilter): Promise<Transaction[]>;
+  /** Upgrade only: at most limit (1..256) nonterminal records lacking a pinned presentation, from a filtered index. */
+  listLegacyTransactions(limit: number): Promise<Transaction[]>;
 
   /** ATOMIC. Validate subject, reservation, expiry and maxAge; complete, insert code, count Account and release
    * reservation together. Stale authentication ends denied/login_required without code, Account or count changes. */
@@ -415,7 +432,13 @@ export interface Store {
 /** Public operations only: internal reservation/count helpers cannot be called outside their atomic transition. */
 export const STORE_METHODS: readonly (keyof Store)[] = Object.freeze(Object.keys({
   currentTime: true,
+  publishSigningKeys: true,
+  listSigningKeys: true,
+  activateSigningKey: true,
+  removeSigningKey: true,
+  reserveSigningKey: true,
   putOwner: true,
+  deleteOwner: true,
   getOwner: true,
   getOwnerByEmail: true,
   putOwnerCode: true,
@@ -448,6 +471,7 @@ export const STORE_METHODS: readonly (keyof Store)[] = Object.freeze(Object.keys
   readTransaction: true,
   updateTransaction: true,
   listOpenTransactions: true,
+  listLegacyTransactions: true,
   completeTransaction: true,
   getCode: true,
   redeemCode: true,
@@ -467,10 +491,10 @@ export const STORE_METHODS: readonly (keyof Store)[] = Object.freeze(Object.keys
 
 /** Reads never rewrite state, including polling an effectively expired transaction. */
 export const READ_METHODS: ReadonlySet<keyof Store> = new Set<keyof Store>([
-  'currentTime', 'getOwner', 'getOwnerByEmail', 'getAgent', 'listAgentsByOwner', 'getCredential',
+  'currentTime', 'listSigningKeys', 'getOwner', 'getOwnerByEmail', 'getAgent', 'listAgentsByOwner', 'getCredential',
   'listCredentials', 'getKey', 'listKeys', 'wasRevoked', 'getClient', 'getTransaction', 'readTransaction',
   'resolveManagement', 'readManagementKeys', 'readManagementAccounts',
-  'listOpenTransactions', 'getCode', 'getAccessToken', 'getConsent', 'listConsents', 'getAccount',
+  'listOpenTransactions', 'listLegacyTransactions', 'getCode', 'getAccessToken', 'getConsent', 'listConsents', 'getAccount',
   'listAccounts', 'signupsEver',
 ]);
 
@@ -491,6 +515,10 @@ const matches = (x: { kid?: string; keyEnrollment?: string; handle?: string; cli
 export type SyncStore = { [K in keyof Store]: (...args: Parameters<Store[K]>) => Awaited<ReturnType<Store[K]>> };
 
 export class StoreState implements SyncStore {
+  private signingKeys = new Map<string, PublishedSigningKey>();
+  private activeSigningKid?: string;
+  private legacySigningHistory = false;
+  private deletedIdentities = new Map<string, string>();
   private owners = new Map<string, Owner>();
   private agents = new Map<string, Agent>();
   private ownerCodes = new Map<string, OwnerCode>();
@@ -499,17 +527,20 @@ export class StoreState implements SyncStore {
   private revoked = new Set<string>();
   private clients = new Map<string, Client>();
   private transactions = new Map<string, Transaction>();
+  private legacyTransactions = new Set<string>();
   private codes = new Map<string, Code>();
   private tokens = new Map<string, AccessToken>();
   private consents = new Map<string, Consent>();
   private accounts = new Map<string, Account>();
-  private signups = new Map<string, number>();
+  private signups = new Map<string, number>(); // legacy snapshot migration only
+  private signupEvents = new Map<string, string[]>();
+  private deletedOwners = new Map<string, { address: string; expiresAt: number }>();
   private reservations = new Map<string, Map<string, { handle: string; expiresAt: number }>>();
 
   constructor(snapshot?: string) {
     if (snapshot !== undefined) {
       const parsed = JSON.parse(snapshot);
-      if ((parsed.version !== 1 && parsed.version !== 2) || !parsed.maps || !Array.isArray(parsed.revoked)) throw new Error('Unsupported issuer store snapshot');
+      if ((parsed.version !== 1 && parsed.version !== 2 && parsed.version !== 3) || !parsed.maps || !Array.isArray(parsed.revoked)) throw new Error('Unsupported issuer store snapshot');
       for (const name of ['owners', 'agents', 'ownerCodes', 'credentials', 'keys', 'clients', 'transactions', 'codes', 'tokens', 'consents', 'accounts', 'signups'] as const) {
         if (!Array.isArray(parsed.maps[name])) throw new Error(`Invalid store map: ${name}`);
         (this[name] as Map<string, unknown>) = new Map(parsed.maps[name]);
@@ -517,27 +548,130 @@ export class StoreState implements SyncStore {
       // Version 1 originally indexed all keys by kid. Derive the scoped index from each value so existing SQLite
       // snapshots and the newer scoped form both load without losing identity, revocation or transaction history.
       this.keys = new Map([...this.keys.values()].map((key) => [this.keyIndex(key.agentSub, key.kid), key]));
+      this.signingKeys = new Map(parsed.maps.signingKeys ?? []);
+      this.activeSigningKid = parsed.activeSigningKid;
+      this.legacySigningHistory = parsed.legacySigningHistory ?? parsed.maps.signingKeys === undefined;
+      this.deletedIdentities = new Map(parsed.maps.deletedIdentities ?? []);
+      this.signupEvents = new Map(parsed.maps.signupEvents ?? []);
+      if (!parsed.maps.signupEvents) {
+        for (const tx of this.transactions.values()) if (tx.status === 'completed' && tx.ownerId && tx.agentSub) {
+          const key=`${tx.ownerId}\u0000${tx.clientId}`;
+          this.signupEvents.set(key,[...new Set([...(this.signupEvents.get(key)??[]),`${tx.agentSub}\u0000${tx.clientId}`])]);
+        }
+        for (const [key,count] of this.signups) {
+          const known=this.signupEvents.get(key)??[];
+          this.signupEvents.set(key,[...known,...Array.from({length:Math.max(0,count-known.length)},(_,i)=>`legacy:${key}:${i}`)]);
+        }
+      }
+      this.deletedOwners = new Map(parsed.maps.deletedOwners ?? []);
       this.revoked = new Set(parsed.revoked);
       this.reservations = new Map(parsed.reservations.map(([key, entries]: [string, [string, { handle: string; expiresAt: number }][]]) => [key, new Map(entries)]));
+      for (const tx of this.transactions.values()) if (!tx.clientPresentation && !TERMINAL.has(tx.status)) this.legacyTransactions.add(tx.id);
     }
   }
   exportSnapshot(): string {
-    const maps = Object.fromEntries(['owners', 'agents', 'ownerCodes', 'credentials', 'keys', 'clients', 'transactions', 'codes', 'tokens', 'consents', 'accounts', 'signups'].map((name) => [name, [...(this as unknown as Record<string, Map<string, unknown>>)[name]!.entries()]]));
-    return JSON.stringify({ version: 2, maps, revoked: [...this.revoked], reservations: [...this.reservations].map(([key, entries]) => [key, [...entries]]) });
+    const maps = Object.fromEntries(['owners', 'agents', 'ownerCodes', 'credentials', 'keys', 'clients', 'transactions', 'codes', 'tokens', 'consents', 'accounts', 'signups', 'signupEvents', 'deletedOwners', 'signingKeys', 'deletedIdentities'].map((name) => [name, [...(this as unknown as Record<string, Map<string, unknown>>)[name]!.entries()]]));
+    return JSON.stringify({ version: 3, maps, activeSigningKid: this.activeSigningKid, legacySigningHistory: this.legacySigningHistory, revoked: [...this.revoked], reservations: [...this.reservations].map(([key, entries]) => [key, [...entries]]) });
   }
 
   currentTime(fallbackNow: number) { return fallbackNow; }
 
-  putOwner(o: Owner) {
+  publishSigningKeys(keys: SigningKeyPublication[], bootstrapKid: string, now: number, cacheLifetime: number) {
+    if (!Number.isSafeInteger(cacheLifetime) || cacheLifetime < 0 || !keys.some((k) => k.kid === bootstrapKid)) throw new TypeError('Invalid signing publication');
+    for (const key of keys) {
+      validateSigningPublication(key);
+      const previous = this.signingKeys.get(key.kid);
+      if (previous && !samePublicSigningKey(previous.publicJwk,key.publicJwk)) throw new Error('Signing key identifier cannot be reused');
+      if (previous && previous.status !== 'published') throw new Error('Removed signing key cannot be republished');
+    }
+    const bootstrap = this.signingKeys.size === 0;
+    const retireNotBefore = this.legacySigningHistory ? now + LEGACY_SIGNING_OVERLAP_SECONDS : undefined;
+    // Every replica serves the shared key ring. A replica with a longer cache policy
+    // may serve keys another replica stages later, without reloading its own ring.
+    const sharedCacheLifetime = Math.max(cacheLifetime, ...[...this.signingKeys.values()].map((key) => key.cacheLifetime));
+    for (const existing of this.signingKeys.values()) if (existing.status === 'published') existing.cacheLifetime=sharedCacheLifetime;
+    for (const key of keys) {
+      const previous = this.signingKeys.get(key.kid);
+      this.signingKeys.set(key.kid,previous ? {...previous,cacheLifetime:sharedCacheLifetime} : {...copy(key),status:'published',publishedAt:now,cacheLifetime:sharedCacheLifetime,retireNotBefore});
+    }
+    if (bootstrap) this.activeSigningKid = bootstrapKid;
+    this.legacySigningHistory = false;
+  }
+  listSigningKeys() { return copy([...this.signingKeys.values()].filter((k) => k.status === 'published')); }
+  activateSigningKey(kid: string, now: number) {
+    const key=this.signingKeys.get(kid);
+    if (!key || key.status !== 'published' || now <= key.publishedAt) return false;
+    this.activeSigningKid=kid;
+    return true;
+  }
+  removeSigningKey(kid: string, compromised: boolean, now: number) {
+    const key=this.signingKeys.get(kid);
+    if (!key) return false;
+    if (key.status !== 'published') return true;
+    if (!compromised && (this.activeSigningKid === kid || now < Math.max((key.lastIssuedExpiresAt ?? key.publishedAt) + key.cacheLifetime,key.retireNotBefore ?? 0))) return false;
+    key.status=compromised?'compromised':'retired';
+    if (this.activeSigningKid === kid) this.activeSigningKid=undefined;
+    return true;
+  }
+  reserveSigningKey(expiresAt: number, now: number) {
+    const key=this.activeSigningKid ? this.signingKeys.get(this.activeSigningKid) : undefined;
+    if (!key || key.status !== 'published' || !Number.isSafeInteger(expiresAt) || expiresAt <= now) return undefined;
+    key.lastIssuedExpiresAt=Math.max(key.lastIssuedExpiresAt ?? 0,expiresAt);
+    if (key.retireNotBefore !== undefined) key.retireNotBefore=Math.max(key.retireNotBefore,expiresAt+LEGACY_SIGNING_CACHE_SECONDS);
+    return copy(key);
+  }
+  private quotaOwners(ownerId: string): string[] {
+    const owner = this.owners.get(ownerId);
+    if (!owner?.emailVerified) return [ownerId];
+    const address = ownerAddressKey(owner.email);
+    return [...this.owners.values()].filter((o) => o.emailVerified && ownerAddressKey(o.email) === address).map((o) => o.id);
+  }
+  private expireOwnerLinks(now: number) {
+    for (const [id, link] of this.deletedOwners) if (now >= link.expiresAt) {
+      this.deletedOwners.delete(id);
+      for (const key of this.signupEvents.keys()) if (key.startsWith(`${id}\u0000`)) this.signupEvents.delete(key);
+    }
+  }
+  putOwner(o: Owner, now = o.createdAt) {
+    const address = ownerAddressKey(o.email);
     const previous = this.owners.get(o.id);
     if (previous && previous.ownerSub !== o.ownerSub) throw new Error('Owner subject is immutable');
+    if (this.deletedIdentities.has(o.id) || [...this.deletedIdentities.values()].includes(o.ownerSub)) throw new Error('Deleted Owner identity cannot be reused');
     if ([...this.owners.values()].some((owner) => owner.id !== o.id && owner.ownerSub === o.ownerSub)) throw new Error('Owner subject already exists');
+    this.expireOwnerLinks(now);
     this.owners.set(o.id, copy(o));
+    if (o.emailVerified) {
+      const peers = this.quotaOwners(o.id);
+      const sources = new Set([...peers, ...[...this.deletedOwners].filter(([, link]) => link.address === address).map(([id]) => id)]);
+      const totals = new Map<string, Set<string>>();
+      for (const [key, events] of this.signupEvents) {
+        const [id, client] = key.split('\u0000');
+        if (!sources.has(id!)) continue;
+        const all = totals.get(client!) ?? new Set<string>();
+        for (const event of events) all.add(event);
+        totals.set(client!, all);
+      }
+      for (const peer of peers) for (const [client, events] of totals) this.signupEvents.set(`${peer}\u0000${client}`, [...events]);
+    }
+  }
+  deleteOwner(id: string, ownerSub: string, now: number, retentionSeconds: number) {
+    if (!Number.isSafeInteger(retentionSeconds) || retentionSeconds < 0 || !Number.isSafeInteger(now + retentionSeconds)) throw new TypeError('Invalid Owner retention period');
+    const owner = this.owners.get(id);
+    if (!owner || owner.ownerSub !== ownerSub) return false;
+    this.expireOwnerLinks(now);
+    for (const agent of [...this.agents.values()]) if (agent.ownerId === id) this.deleteAgent(agent.handle, agent.sub, now);
+    for (const [hash, credential] of this.credentials) if (credential.ownerId === id) this.credentials.delete(hash);
+    this.ownerCodes.delete(id);
+    this.owners.delete(id);
+    this.deletedIdentities.set(id,ownerSub);
+    if (owner.emailVerified && retentionSeconds > 0) this.deletedOwners.set(id, { address: ownerAddressKey(owner.email), expiresAt: now + retentionSeconds });
+    else for (const key of this.signupEvents.keys()) if (key.startsWith(`${id}\u0000`)) this.signupEvents.delete(key);
+    return true;
   }
   getOwner(id: string) { return copy(this.owners.get(id)); }
   getOwnerByEmail(email: string) {
-    const wanted = email.toLowerCase();
-    return copy([...this.owners.values()].filter((o) => o.email.toLowerCase() === wanted).sort((a, b) => b.createdAt - a.createdAt)[0]);
+    const wanted = ownerAddressKey(email);
+    return copy([...this.owners.values()].filter((o) => ownerAddressKey(o.email) === wanted).sort((a, b) => b.createdAt - a.createdAt)[0]);
   }
   putOwnerCode(c: OwnerCode) { this.ownerCodes.set(c.ownerId, copy(c)); }
   takeOwnerCode(ownerId: string) {
@@ -748,6 +882,7 @@ export class StoreState implements SyncStore {
   insertTransaction(t: Transaction) {
     if (this.transactions.has(t.id)) throw new Error('Transaction already exists');
     this.transactions.set(t.id, copy(t));
+    if (!t.clientPresentation && !TERMINAL.has(t.status)) this.legacyTransactions.add(t.id);
   }
   getTransaction(id: string) { return copy(this.transactions.get(id)); }
   readTransaction(id: string, { now, retainFor }: { now: number; retainFor: number }) {
@@ -770,6 +905,7 @@ export class StoreState implements SyncStore {
     const cur = this.transactions.get(t.id);
     if (cur && effects.transactionTokenHash !== undefined && (effects.transactionTokenHash !== cur.transactionTokenHash || this.transactionTokenRevoked(cur))) throw new TransactionTokenError();
     if (!cur || cur.version !== expectedVersion || TERMINAL.has(cur.status) || t.status === 'completed') return undefined;
+    if (!cur.clientPresentation && t.status !== 'denied') throw new TransactionExpiredError();
     const expired = this.expiredTransaction(cur, effects.now);
     if (cur.status === 'awaiting_agent' && t.kid) {
       if (expired) throw new TransactionExpiredError();
@@ -779,7 +915,7 @@ export class StoreState implements SyncStore {
     if (effects.assertionWindow && (effects.now < effects.assertionWindow.notBefore || effects.now >= effects.assertionWindow.expiresAt)) throw new AssertionWindowError();
     if (cur.status === 'awaiting_agent' && t.kid && effects.expectedShareOwner !== undefined &&
       this.enrollmentKey(t.kid, t.keyEnrollment!)?.permissions.share_owner !== effects.expectedShareOwner) return undefined;
-    const next = { ...copy(expired ?? t), maxAge: cur.maxAge, assertedAt: cur.assertedAt };
+    const next = { ...copy(expired ?? t), clientPresentation: copy(cur.clientPresentation), maxAge: cur.maxAge, assertedAt: cur.assertedAt };
     const deny = (reason: DenyReason) => { next.status = 'denied'; next.reason = reason; next.terminalAt = effects.now; next.challenge = undefined; };
     if (!expired && next.kid) {
       const reason = this.subjectReason(next, effects.now);
@@ -821,14 +957,23 @@ export class StoreState implements SyncStore {
     const cur = this.transactions.get(t.id);
     if (cur && transactionTokenHash !== undefined && (transactionTokenHash !== cur.transactionTokenHash || this.transactionTokenRevoked(cur))) throw new TransactionTokenError();
     if (!cur || cur.version !== expectedVersion || cur.status !== 'ready') return undefined;
-    const dead = this.subjectReason(cur, now);
+    const dead = !cur.clientPresentation ? 'access_denied' : this.subjectReason(cur, now);
     const reservation = cur.ownerId && this.reservations.get(`${cur.ownerId}\u0000${cur.clientId}`)?.get(cur.id);
-    const needsReservation = cur.passedCap && !this.accounts.has(`${cur.handle}\u0000${cur.clientId}`);
+    const hasAccount = this.accounts.has(`${cur.handle}\u0000${cur.clientId}`);
+    const needsReservation = cur.passedCap && !hasAccount;
+    const cap = this.clients.get(cur.clientId)?.maxSignupsPerOwner;
+    const capExceeded = !hasAccount && cap !== undefined && this.signupsEver(cur.ownerId!,cur.clientId) >= cap;
     const staleAuthentication = isAuthenticationTooOld(cur.maxAge, cur.assertedAt, now);
-    if (now >= cur.expiresAt || dead || staleAuthentication || (needsReservation && (!reservation || reservation.expiresAt <= now))) {
+    if (now >= cur.expiresAt || dead || staleAuthentication || capExceeded || (needsReservation && (!reservation || reservation.expiresAt <= now))) {
       return this.updateTransaction({ ...cur, status: 'denied', reason: dead ?? (staleAuthentication ? 'login_required' : 'signup_limit_reached'), terminalAt: now, challenge: undefined }, expectedVersion, { now });
     }
     if (this.codes.has(code.hash)) throw new Error('Authorization code already exists');
+    // Every Account creation needs current capacity, even with an owned reservation:
+    // sibling completion/deletion or an address merge may have changed other claims.
+    if (!hasAccount && cap !== undefined && !this.reserveSignup({
+      ownerId: cur.ownerId!, clientId: cur.clientId, handle: cur.handle!, txnId: cur.id,
+      expiresAt: cur.expiresAt, max: cap, now,
+    })) return this.updateTransaction({ ...cur, status: 'denied', reason: 'signup_limit_reached', terminalAt: now, challenge: undefined }, expectedVersion, { now });
     const next = { ...copy(cur), version: expectedVersion + 1, status: 'completed' as const, terminalAt: now, challenge: undefined, codeIssued: true };
     const issued: Code = { ...copy(code), txnId: cur.id, clientId: cur.clientId, redirectUri: cur.redirectUri,
       codeChallenge: cur.codeChallenge, nonce: cur.nonce, scopes: copy(cur.scopes), handle: cur.handle!, kid: cur.kid!,
@@ -841,6 +986,17 @@ export class StoreState implements SyncStore {
   }
   listOpenTransactions(f: SubjectFilter) {
     return copy([...this.transactions.values()].filter((t) => !TERMINAL.has(t.status) && matches({ ...t, txnId: t.id }, f)));
+  }
+  listLegacyTransactions(limit: number) {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 256) throw new RangeError('Legacy transaction batch must be between 1 and 256');
+    const result: Transaction[] = [];
+    for (const id of this.legacyTransactions) {
+      const tx = this.transactions.get(id);
+      if (!tx || tx.clientPresentation || TERMINAL.has(tx.status)) { this.legacyTransactions.delete(id); continue; }
+      result.push(tx);
+      if (result.length === limit) break;
+    }
+    return copy(result);
   }
 
   getCode(hash: string) { return copy(this.codes.get(hash)); }
@@ -906,18 +1062,19 @@ export class StoreState implements SyncStore {
     return copy(a);
   }
   deleteAccount(handle: string, clientId: string) { this.accounts.delete(`${handle}\u0000${clientId}`); }
-  signupsEver(ownerId: string, clientId: string) { return this.signups.get(`${ownerId}\u0000${clientId}`) ?? 0; }
+  signupsEver(ownerId: string, clientId: string) { return new Set(this.quotaOwners(ownerId).flatMap((id) => this.signupEvents.get(`${id}\u0000${clientId}`) ?? [])).size; }
   private reserveSignup(p: { ownerId: string; clientId: string; handle: string; txnId: string; expiresAt: number; max: number; now: number }) {
     const key = `${p.ownerId}\u0000${p.clientId}`;
     const held = this.reservations.get(key) ?? new Map<string, { handle: string; expiresAt: number }>();
-    for (const [txn, r] of held) {
-      const t = this.transactions.get(txn);
-      // Effective lifecycle expiry releases admission capacity even if nobody polled or persisted a denial.
-      if (r.expiresAt <= p.now || !t || TERMINAL.has(t.status) || (t.kid && this.subjectReason(t, p.now))) held.delete(txn);
-    }
+    const peers = this.quotaOwners(p.ownerId);
     const others = new Set<string>();
-    for (const r of held.values()) if (r.handle !== p.handle && !this.accounts.has(`${r.handle}\u0000${p.clientId}`)) others.add(r.handle);
-    const admitted = (this.signups.get(key) ?? 0) + others.size < p.max;
+    for (const owner of peers) for (const [txn, r] of this.reservations.get(`${owner}\u0000${p.clientId}`) ?? []) {
+      const t = this.transactions.get(txn);
+      if (r.expiresAt <= p.now || !t || TERMINAL.has(t.status) || (t.kid && this.subjectReason(t, p.now))) {
+        this.reservations.get(`${owner}\u0000${p.clientId}`)?.delete(txn);
+      } else if (r.handle !== p.handle && !this.accounts.has(`${r.handle}\u0000${p.clientId}`)) others.add(t.agentSub!);
+    }
+    const admitted = this.signupsEver(p.ownerId, p.clientId) + others.size < p.max;
     if (admitted) held.set(p.txnId, { handle: p.handle, expiresAt: p.expiresAt });
     this.reservations.set(key, held);
     return admitted;
@@ -940,7 +1097,13 @@ export class StoreState implements SyncStore {
       return { created: false };
     }
     this.accounts.set(accountKey, { handle: p.handle, clientId: p.clientId, status: 'enabled', authorizationVersion: 0, firstSignedInAt: p.now, lastSignedInAt: p.now, signInCount: 1 });
-    this.signups.set(key, (this.signups.get(key) ?? 0) + 1);
+    // A deleted Account can be created again for the same Agent/client pair.
+    // Identify this creation, while inherited memberships retain the same event.
+    const event = `created:${p.txnId}`;
+    for (const owner of this.quotaOwners(p.ownerId)) {
+      const membership = `${owner}\u0000${p.clientId}`;
+      this.signupEvents.set(membership, [...new Set([...(this.signupEvents.get(membership) ?? []), event])]);
+    }
     return { created: true };
   }
 }

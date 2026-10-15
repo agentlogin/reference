@@ -217,8 +217,8 @@ as the primary database. This adapter does not solve point-in-time security roll
 Owner/delegated credentials, owner email codes, transaction/session authentication
 secrets, authorization codes, and access tokens are stored as hashes. The transaction
 `continueSecret` must be returned later in the protocol and is stored in its record in
-recoverable form. Owner emails are stored in the owner record, with a lowercase indexed
-copy for lookup; names, consent metadata, and request context can also be personal data.
+recoverable form. Owner emails are stored in the owner record, with an indexed identity
+that preserves parsed local-part octets and lowercases only the A-label domain; names, consent metadata, and request context can also be personal data.
 
 This adapter does not add application-level encryption. Restrict database and backup
 roles, encrypt storage/backups, use authenticated TLS, and redact secrets and personal
@@ -245,3 +245,57 @@ These tests establish correctness evidence, not a capacity claim. Dataset-growth
 benchmarks, deployment sizing, rate limiting, and production owner sign-in remain
 separate work. The RP callback state store is a different interface and package; this
 issuer adapter does not make an RP's callback state shared across hosts.
+
+### Schema version 3: issuer lifecycle and shared-address quotas
+
+Stop every older issuer/adapter instance before applying version 3; do not mix versions during this upgrade.
+
+Version 3 adds indexed address identities, immutable Owner deletion tombstones,
+unique account-event memberships, shared-address quota coordination, and shared
+signing-key lifecycle records. The migration preserves prior permanent counts,
+recovers known account provenance from retained transactions and accounts, and
+represents any remaining legacy counts with distinct conservative historical
+entries. A historical count whose original account identity has already been
+removed cannot be reconstructed by migration. New counts carry provenance from
+their first creation. Private signing keys are never stored by this adapter.
+
+For an existing version 1 or 2 schema, migration also records a fixed legacy
+signing-key retirement deadline of migration time plus 87,000 seconds: Core's
+600-second token lifetime and maximum 86,400-second JWKS cache lifetime. This
+conservatively covers unknown prior signing/cache history without imposing that
+delay on future keys. Stop and drain all older issuers before running migration;
+they must issue no further tokens after this deadline is anchored. Include every
+previously published key needed by outstanding tokens in the first upgrade key
+ring. Its publication atomically attaches this deadline to those keys. Migration
+retries, restarts and later publication do not extend it, and lowering the current
+JWKS cache lifetime cannot shorten it. New signing reservations on a legacy key
+extend its floor to cover the token expiration plus the unknown historical maximum
+cache lifetime (including the PostgreSQL issuance lease). That conservative bound
+stays with the legacy key until retirement and does not propagate to later keys.
+Compromise removal bypasses the deadline.
+Fresh schemas have no legacy delay. Historical lifetimes exceeding Core limits
+require operators to retain the old keys for their longer overlap.
+
+Every mutation remains SERIALIZABLE with bounded rollback retries and
+`synchronous_commit=on`. Admission takes the verified-address/client quota lock
+before the Owner/client lock; unrelated pairs continue independently. Address
+changes and completion revalidate account capacity under the same transaction.
+Deletion-retention inheritance rechecks its deadline after write waits. The
+primary's `app_now()` sets protocol and retention times.
+
+Authority mutations lock their immutable Agent after quota coordination and before
+dependent records. The shared Agent lock conflicts with hosting lifecycle updates,
+including triggers in READ COMMITTED transactions; stale SERIALIZABLE decisions
+retry. The lifecycle functions refresh database time after acquiring that lock.
+Signing-key publication retains the largest cache lifetime declared by any replica
+and applies it to both existing and subsequently staged keys.
+
+Same-database hosting integrations can call
+`schema.invalidate_agent(handle text, agent_sub text, now bigint)` from a
+transaction or trigger to disable one immutable identity and invalidate its
+open transactions, reservations, codes and tokens. `schema.retire_agent` has the
+same arguments and also removes its live keys, accounts, consents, delegated
+credentials and Agent record, preserving quota history and revoked-key
+identities. Call with a fresh database time after locking the authoritative
+hosting records. These functions are trusted integration primitives, not public
+HTTP authorization endpoints; restrict database roles accordingly.

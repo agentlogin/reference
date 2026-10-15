@@ -96,6 +96,7 @@ export async function conformanceRun(store?: Store): Promise<void> {
       'all automated mandatory probes ran; only unobservable entropy and unavailable advisory evidence may be skipped');
     assert.ok(report.passed >= 20, `only ${report.passed} checks passed`);
     for (let i = 38; i <= 49; i += 1) assert.equal(report.results.find((r) => r.id === `I-${i}`)?.outcome, 'pass', `I-${i}`);
+    assert.equal(report.results.find((r) => r.id === 'I-56')?.outcome, 'pass', 'registration authentication method requirements were exercised');
   } finally {
     await new Promise<void>((r) => server.close(() => r()));
     await rp.close();

@@ -12,5 +12,19 @@
   },
   "devDependencies": {
     "@types/pg": "^8.23.1"
+  },
+  "main": "dist/app.js",
+  "types": "dist/app.d.ts",
+  "exports": {
+    ".": "./dist/app.js",
+    "./session-store": "./dist/session-store.js",
+    "./postgres-session-store": "./dist/postgres-session-store.js"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "prepack": "tsc -p tsconfig.build.json"
   }
 }

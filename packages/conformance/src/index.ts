@@ -379,6 +379,48 @@ class Harness {
         expect(r.status === 400 && err === 'invalid_request', `${name}: ${r.status} ${r.text.slice(0, 160)}`);
         if (redirect) expect(redirectMatches(redirect, this.client.redirect_uri) && redirect.searchParams.get('iss') === iss, `${name}: error redirect target`);
       }
+      // Core 5.2 applies to unknown extensions too, including duplicates split across query and POST body.
+      for (const source of ['query', 'body', 'query-and-body'] as const) {
+        for (const accept of ['application/json', 'text/html']) {
+          const a = this.authUrl(this.client);
+          const url = new URL(source === 'query' ? a.url : m.authorization_endpoint);
+          const body = source === 'query' ? undefined : new URLSearchParams();
+          if (body) for (const [name, value] of Object.entries(a.params)) if (value !== undefined) body.append(name, value);
+          const destination = body ?? url.searchParams;
+          destination.append('x-conformance-extension', 'first');
+          (source === 'query-and-body' ? url.searchParams : destination).append('x-conformance-extension', 'second');
+          const r = await call(url.href, { method: body ? 'POST' : 'GET',
+            headers: { accept, ...(body ? { 'content-type': 'application/x-www-form-urlencoded' } : {}) }, body: body?.toString() });
+          const j = obj(r.json);
+          const target = accept === 'text/html' ? r.headers.get('location') : j.redirect;
+          expect(r.status === (accept === 'text/html' ? 303 : 400), `repeated unknown parameter in ${source} (${accept}) → ${r.status}`);
+          expect(typeof target === 'string' && URL.canParse(target) &&
+            authorizationRedirectMatches(new URL(target), this.client.redirect_uri, a.params.state, iss, 'error') &&
+            new URL(target).searchParams.get('error') === 'invalid_request', `repeated unknown parameter in ${source}: error redirect`);
+          if (accept === 'application/json') expect(j.error === 'invalid_request' && j.transaction_id === undefined, `repeated unknown parameter in ${source}: JSON error`);
+        }
+      }
+    });
+    await this.check('I-56', 'Registration requires an explicit supported authentication method and its conditional metadata', async () => {
+      if (!this.o.adminToken || typeof m.registration_endpoint !== 'string') throw new Skip('needs an authenticated registration endpoint');
+      const reg = (metadata: Record<string, unknown>) => call(m.registration_endpoint, { method: 'POST',
+        headers: { authorization: `Bearer ${this.o.adminToken}` }, json: { redirect_uris: ['https://rp-method.example/cb'], ...metadata } });
+      const methods = m.token_endpoint_auth_methods_supported as string[];
+      const invalid: Array<[string, Record<string, unknown>]> = [
+        ['missing method', {}], ['null method', { token_endpoint_auth_method: null }],
+        ['empty method', { token_endpoint_auth_method: '' }], ['public client method', { token_endpoint_auth_method: 'none' }],
+      ];
+      if (methods.includes('private_key_jwt')) invalid.push(['private_key_jwt without keys', { token_endpoint_auth_method: 'private_key_jwt' }]);
+      for (const [name, metadata] of invalid) {
+        const r = await reg(metadata);
+        const body = obj(r.json);
+        expect(r.status === 400 && body.error === 'invalid_client_metadata' && body.client_id === undefined && body.client_secret === undefined,
+          `${name} → ${r.status} ${body.error ?? ''}`);
+      }
+      for (const method of ['client_secret_basic', 'client_secret_post'].filter((value) => methods.includes(value))) {
+        const r = await reg({ token_endpoint_auth_method: method });
+        expect(r.status === 201 && obj(r.json).token_endpoint_auth_method === method, `explicit ${method} → ${r.status}`);
+      }
     });
     await this.check('I-4', 'Does not redirect on a mismatched redirect_uri; answers 400 directly', async () => {
       const a = this.authUrl(this.client, { redirect_uri: 'https://attacker.example/cb' });
@@ -1658,9 +1700,9 @@ class Harness {
         expect(onHost.status === 201 && obj(onHost.json).relay_issuer === relay.issuer, `relay_issuer with redirect URIs on its host → ${onHost.status} ${obj(onHost.json).error ?? ''} ${obj(onHost.json).error_description ?? ''}`);
       }
 
-      // Section 3.2: id_token_signed_response_alg is ES256, an advertised EdDSA, or refused.
-      const offered: string[] = (m.id_token_signing_alg_values_supported as string[]).filter((alg) => alg === 'ES256' || alg === 'EdDSA');
-      for (const alg of ['RS256', 'none', 'HS256', 'PS256', 'ES384', 'EdDSA', 'es256'].filter((x) => !offered.includes(x))) {
+      // Section 3.2: id_token_signed_response_alg is ES256, an advertised Ed25519, or refused.
+      const offered: string[] = (m.id_token_signing_alg_values_supported as string[]).filter((alg) => alg === 'ES256' || alg === 'Ed25519');
+      for (const alg of ['RS256', 'none', 'HS256', 'PS256', 'ES384', 'EdDSA', 'Ed25519', 'es256'].filter((x) => !offered.includes(x))) {
         const r = await reg({ id_token_signed_response_alg: alg });
         expect(r.status === 400 && obj(r.json).error === 'invalid_client_metadata', `id_token_signed_response_alg ${alg} → ${r.status} ${r.text.slice(0, 120)}`);
       }

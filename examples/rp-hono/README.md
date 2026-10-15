@@ -83,18 +83,19 @@ Expiry is enforced at reads and transitions regardless of cleanup; retained live
 and never returned after their expiry. Keep the application hosts and database clocks synchronized.
 
 Use a migration role to create the schema, and a separate runtime role with `USAGE` on the application schema,
-`SELECT`, `INSERT`, `UPDATE`, and `DELETE` on `app_accounts` and `app_sessions`, `SELECT` on
+`SELECT`, `INSERT`, `UPDATE`, and `DELETE` on `app_accounts`, `app_sessions` and `app_notes`, `SELECT` on
 `app_schema_migrations`, and `EXECUTE` on `app_now()`. Restrict schema creation and changes to the migration role.
 The [callback adapter guide](../../packages/rp-store-postgres/README.md) describes its separate runtime grants.
 The application schema is scoped by `BASE_URL`; changing the public origin creates a separate account/session
 namespace. Schema migrations are explicit and are independent of the issuer's database migrations.
 
-`/me`, `/notes`, `/logout` and authentication responses are marked `no-store, private`. `/notes` demonstrates
+`/workspace`, `/me`, `/notes`, `/logout` and authentication responses are marked `no-store, private`. `/notes` demonstrates
 [Core Section 9](https://github.com/agentlogin/spec/blob/main/agent-login-core.md#9-relying-party-requirements): it calls UserInfo before accepting
 an action, then rereads the session to detect logout or expiry during that request. Revocation or an expired
 Access Token requires a new sign-in. Temporary Issuer or database errors return `503`; they neither claim a
-successful logout nor clear a still-valid session. The `/notes` response is illustrative: this example does not
-persist notes. A real business write needs to check session authorization within its own database transaction.
+successful logout nor clear a still-valid session. The workspace at `/workspace` stores actual private notes. `POST /notes` accepts JSON `{ "id": "<16-128 URL-safe characters>", "text": "<up to 4096 UTF-8 bytes>" }`. The client generates the ID before its first attempt and reuses it only for identical content. Session validity, credential expiry, the per-account limit of 1,000 notes and the note insert share one transaction. Logout serializes against that write. A lost acknowledgement can be reconciled by retrying the same ID; changed content returns `409`. `GET /notes` returns a page of up to 100 notes, bounded to 48 KiB of note JSON, for the signed-in `(iss, sub)` account. When `next_cursor` is present, pass it as `?before=` to read the next page. Invalid cursors return `400`; pagination never changes the account boundary. The request envelope allows 32 KiB so JSON escaping can represent every valid 4 KiB note. Notes survive logout and application restarts.
+
+Application migration version 2 adds notes without changing existing accounts or sessions. It upgrades version 1 explicitly; runtime startup never changes the schema. This is a working pilot application, not evidence that an outside organisation has integrated Agent Login.
 
 POST requests to `/notes` and `/logout` check the browser's Origin and Fetch Metadata headers against the exact
 application origin, rejecting sibling origins too. Agent requests without browser headers remain supported.

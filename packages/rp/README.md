@@ -172,7 +172,7 @@ whose discovery designates `home_iss`. Callers using `validateIdToken` directly 
 - The per-sign-in record (state, nonce, PKCE verifier, issuer) travels in an encrypted `__Host-` cookie. The shared
   callback store holds only opaque state digests, expiry times and consumption flags. Changing `stateSecret` ends
   the sign-ins in progress.
-- Not implemented: `private_key_jwt` client authentication, the DNS fallback of Section 2.3. EdDSA ID Tokens are
-  accepted only when you set `idTokenAlgs`.
+- This release accepts ES256 ID Tokens. The optional draft 0.2 Ed25519 algorithm is not enabled; legacy
+  `EdDSA` is rejected. `private_key_jwt` client authentication and the DNS fallback of Section 2.3 are not implemented.
 
 See `examples/rp-hono` for a runnable application.

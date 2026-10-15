@@ -3,6 +3,7 @@ import { test } from 'node:test';
 import { PgDatabase } from '../src/runtime.js';
 import { SCHEMA_VERSION, schemaV1 } from '../src/schema.js';
 import { PostgresStore } from '../src/postgres-store.js';
+import { ownerAddressKey } from '../../issuer/src/owner-address.js';
 import type { Transaction } from '../../issuer/src/store.js';
 import { asserted, codeFor, fixture, pending, prepareAgent, quote, skipPostgres, tokenFor } from './helpers.js';
 
@@ -18,7 +19,7 @@ test('PostgreSQL constraints preserve immutable owner and agent identities', { s
   }
   const owner = await f.store.getOwner('owner');
   assert.ok(owner);
-  await assert.rejects(f.admin.query(`INSERT INTO ${quote(f.schema)}.owners(data) VALUES($1::jsonb)`, [{ ...owner, id: 'other-owner' }]), hasSqlState('23505'));
+  await assert.rejects(f.admin.query(`INSERT INTO ${quote(f.schema)}.owners(data,address_key) VALUES($1::jsonb,$2)`, [{ ...owner, id: 'other-owner' },ownerAddressKey(owner.email)]), hasSqlState('23505'));
   await f.store.putOwner({ ...owner, name: 'Updated display name' });
   assert.equal((await f.store.getOwner(owner.id))?.name, 'Updated display name');
   assert.deepEqual(await f.store.getAgent(agent.handle), agent);
@@ -59,7 +60,7 @@ test('PostgreSQL lifecycle reads quote a reserved-word schema name', { skip: ski
   }
 });
 
-test('schema version 2 upgrades existing key enrollments and their authorizations without loss', { skip: skipPostgres }, async (t) => {
+test('schema migrations upgrade existing key enrollments and their authorizations without loss', { skip: skipPostgres }, async (t) => {
   const f = await fixture(t);
   const subject = await prepareAgent(f.store, f.now(), 'existing');
   const raw = await pending(f.store, f.now(), 'existing');
@@ -87,7 +88,7 @@ test('schema version 2 upgrades existing key enrollments and their authorization
     for (const [table, data] of Object.entries(records)) {
       assert.deepEqual((await f.admin.query(`SELECT data FROM ${quote(schema)}.${quote(table)}`)).rows[0].data, JSON.parse(JSON.stringify(data)), `${table} must survive migration`);
     }
-    assert.deepEqual((await f.admin.query(`SELECT version FROM ${quote(schema)}.schema_migrations ORDER BY version`)).rows.map((row) => row.version), [1, 2]);
+    assert.deepEqual((await f.admin.query(`SELECT version FROM ${quote(schema)}.schema_migrations ORDER BY version`)).rows.map((row) => row.version), [1, 2, 3]);
     const other = await prepareAgent(legacy, f.now(), 'other');
     const contender = { ...other.key, kid: key.kid, enrollment: 'new-pending' };
     assert.equal(await legacy.insertKey(contender, f.now(), other.authorization), 'ok');

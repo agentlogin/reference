@@ -79,7 +79,7 @@ for (const operation of ['patchKey', 'revokeKey'] as const) {
     const f = await fixture(t, { async onCheckpoint(event) {
       if (!armed || event.operation !== operation) return;
       if (event.phase === 'afterBegin') attempts.push(event.attempt);
-      if (event.phase === 'management_key_authorized' && event.attempt === 0) {
+      if (event.phase === 'before_agent_lock' && event.attempt === 0) {
         checked.resolve();
         await release.promise;
       }

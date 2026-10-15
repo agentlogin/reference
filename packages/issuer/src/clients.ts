@@ -164,7 +164,8 @@ export async function registerClient(ctx: ClientContext, body: unknown): Promise
   }
   if (body.grant_types !== undefined && !(Array.isArray(body.grant_types) && body.grant_types.every((g) => g === 'authorization_code'))) throw new OAuthError(400, 'invalid_client_metadata', 'grant_types');
   if (body.response_types !== undefined && !(Array.isArray(body.response_types) && body.response_types.every((r) => r === 'code'))) throw new OAuthError(400, 'invalid_client_metadata', 'response_types');
-  const method = body.token_endpoint_auth_method ?? 'client_secret_basic';
+  // Core 4.3 requires an explicit method, overriding RFC 7591 Section 2's omission default.
+  const method = body.token_endpoint_auth_method;
   if (method !== 'client_secret_basic' && method !== 'client_secret_post') throw new OAuthError(400, 'invalid_client_metadata', 'token_endpoint_auth_method');
   // Section 4.4: a Relay registering as a client names itself; every redirect URI must be on the Relay's host, and the
   // Relay's `op_policy_uri` is taken from its metadata for the approval page of Section 6.6.

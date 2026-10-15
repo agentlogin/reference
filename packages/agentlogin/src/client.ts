@@ -541,7 +541,9 @@ export class AgentLogin {
     headers.delete('authorization');
     let res: Response;
     try {
-      res = await run(() => fetch(u, { ...init, headers, redirect: 'manual', signal: AbortSignal.timeout(Math.min(this.opts.timeoutMs ?? 10_000, budget?.left() ?? Infinity)) }));
+      const timeout = AbortSignal.timeout(Math.min(this.opts.timeoutMs ?? 10_000, budget?.left() ?? Infinity));
+      const signal = init.signal ? AbortSignal.any([init.signal, timeout]) : timeout;
+      res = await run(() => fetch(u, { ...init, headers, redirect: 'manual', signal }));
     } catch (e) {
       if (e instanceof AgentLoginError && e.code === 'timeout') throw e;
       throw new AgentLoginError(`request to ${u.host} failed: ${(e as Error).message}`, 'network_error');

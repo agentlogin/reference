@@ -156,7 +156,7 @@ test('independent SQLite writer processes lose no successful writes and cannot e
   }
 });
 
-test('SQLite loads legacy key indexes, preserves history, and persists scoped keys in a version 2 snapshot', async () => {
+test('SQLite loads legacy key indexes, preserves history, and persists scoped keys in a version 3 snapshot', async () => {
   const f = await fixture();
   let store = new SQLiteStore(f.path);
   const database = new DatabaseSync(f.path);
@@ -186,7 +186,7 @@ test('SQLite loads legacy key indexes, preserves history, and persists scoped ke
     const credential = (await store.getCredential('credential-second'))!;
     assert.equal(await store.insertKey(pending, 3, { ...credential, agentSub: 'second' }), 'ok');
     const migrated = JSON.parse(database.prepare('SELECT snapshot FROM agentlogin_state WHERE id = 1').get()!.snapshot as string);
-    assert.equal(migrated.version, 2, 'older binaries must reject the new key representation');
+    assert.equal(migrated.version, 3, 'older binaries must reject the new key representation');
     const { keys: _oldKeys, ...oldMaps } = snapshot.maps;
     const { keys: _newKeys, ...newMaps } = migrated.maps;
     assert.deepEqual(newMaps, oldMaps);
