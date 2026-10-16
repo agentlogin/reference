@@ -1,6 +1,35 @@
 {
   "version": 1,
   "kind": "providers",
-  "updatedAt": "2026-10-15T00:00:00Z",
-  "entries": []
+  "updatedAt": "2026-10-16T00:00:00Z",
+  "entries": [
+    {
+      "id": "sentfromai",
+      "kind": "provider",
+      "protocol": "agent-login",
+      "name": "SentFrom.ai",
+      "operator": "SentFrom.ai",
+      "homepage": "https://sentfrom.ai",
+      "issuer": "https://identity.sentfrom.ai",
+      "handleDomains": ["mail.sentfrom.ai"],
+      "status": "candidate",
+      "specRevision": "a000e29c7af91d3fd8a5a4ad6241e2b10aabcc78",
+      "evidence": [],
+      "updatedAt": "2026-10-16T00:00:00Z"
+    },
+    {
+      "id": "agentid",
+      "kind": "provider",
+      "protocol": "agentid",
+      "name": "AgentID by AgentMail",
+      "operator": "AgentMail, Inc.",
+      "homepage": "https://www.agentid.com",
+      "issuer": "https://auth.agentid.com",
+      "handleDomains": ["agentmail.to"],
+      "status": "candidate",
+      "protocolReference": "https://docs.agentmail.to/agentid-sign-in",
+      "evidence": [],
+      "updatedAt": "2026-10-16T00:00:00Z"
+    }
+  ]
 }

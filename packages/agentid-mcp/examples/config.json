@@ -1,0 +1,6 @@
+{
+  "version": 1,
+  "inbox": "your-agent@agentmail.to",
+  "credentialEnv": "AGENTMAIL_API_KEY",
+  "applications": {}
+}

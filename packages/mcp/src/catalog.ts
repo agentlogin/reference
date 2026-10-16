@@ -20,26 +20,51 @@ const openClientId = https.refine((value) => {
     !path.split('/').some((segment) => /^(?:\.|%2e){1,2}$/i.test(segment)));
 }, 'Use a Client ID Metadata Document URL with a domain and a path, without dot path segments');
 const instant = z.string().datetime({ offset: true });
-const evidence = z.object({
+const evidenceFields = {
   kind: z.enum(['domain_control', 'protocol_test', 'independent_interop', 'operational_review']),
   url: https,
   observedAt: instant,
   expiresAt: instant,
   reviewer: z.string().min(1).max(200),
+};
+const evidenceDates = (e: { observedAt: string; expiresAt: string }) => Date.parse(e.observedAt) < Date.parse(e.expiresAt);
+const coreEvidence = z.object({
+  ...evidenceFields,
+  protocol: z.literal('agent-login').optional(),
   revision: z.string().regex(/^[a-f0-9]{40}$/),
-}).strict().refine((e) => Date.parse(e.observedAt) < Date.parse(e.expiresAt), 'Evidence expiry must follow observation');
+}).strict().refine(evidenceDates, 'Evidence expiry must follow observation');
+const agentIdEvidence = z.object({
+  ...evidenceFields,
+  protocol: z.literal('agentid'),
+  reference: https,
+}).strict().refine(evidenceDates, 'Evidence expiry must follow observation');
 const common = {
   id: identifier,
   name: z.string().min(1).max(128),
   operator: z.string().min(1).max(200),
   homepage: https,
   status: z.enum(['candidate', 'reviewed', 'suspended']),
-  specRevision: z.string().regex(/^[a-f0-9]{40}$/),
-  evidence: z.array(evidence).max(20),
   updatedAt: instant,
 };
-const provider = z.object({ ...common, kind: z.literal('provider'), issuer: issuerIdentifier, handleDomains: z.array(z.string().regex(/^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/)).min(1).max(128) }).strict();
-const applicationFields = { ...common, kind: z.literal('application'), initiateLoginUri: https };
+const coreFields = {
+  ...common,
+  // Legacy records omit protocol; that continues to mean Agent Login Core.
+  protocol: z.literal('agent-login').optional(),
+  specRevision: z.string().regex(/^[a-f0-9]{40}$/),
+  evidence: z.array(coreEvidence).max(20),
+};
+const providerFields = {
+  kind: z.literal('provider'), issuer: issuerIdentifier,
+  handleDomains: z.array(z.string().regex(/^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/)).min(1).max(128),
+};
+const provider = z.object({ ...coreFields, ...providerFields }).strict();
+const agentIdProvider = z.object({
+  ...common, ...providerFields,
+  protocol: z.literal('agentid'),
+  protocolReference: https,
+  evidence: z.array(agentIdEvidence).max(20),
+}).strict();
+const applicationFields = { ...coreFields, kind: z.literal('application'), initiateLoginUri: https };
 const openApplication = z.object({ ...applicationFields, clientType: z.literal('open').default('open'), clientId: openClientId }).strict();
 const registeredApplication = z.object({
   ...applicationFields,
@@ -51,7 +76,7 @@ export const CatalogSchema = z.object({
   version: z.literal(1),
   kind: z.enum(['providers', 'applications']),
   updatedAt: instant,
-  entries: z.array(z.union([provider, openApplication, registeredApplication])).max(10_000),
+  entries: z.array(z.union([provider, agentIdProvider, openApplication, registeredApplication])).max(10_000),
 }).strict().superRefine((c, ctx) => {
   const ids = new Set<string>();
   const subjects = new Set<string>();
@@ -63,7 +88,9 @@ export const CatalogSchema = z.object({
       : JSON.stringify(['open', e.clientId]);
     if (ids.has(e.id) || subjects.has(subject)) issue('Duplicate identifier or subject');
     ids.add(e.id); subjects.add(subject);
-    if (e.evidence.some((v) => v.revision !== e.specRevision)) issue('Evidence must refer to the listed specification revision');
+    if (e.protocol === 'agentid') {
+      if (e.evidence.some((v) => v.reference !== e.protocolReference)) issue('AgentID evidence must refer to the listed protocol reference');
+    } else if (e.evidence.some((v) => v.revision !== e.specRevision)) issue('Evidence must refer to the listed specification revision');
     if (e.status === 'reviewed' && !['domain_control', 'protocol_test'].every((kind) => e.evidence.some((v) => v.kind === kind))) issue('Reviewed entries require domain-control and protocol-test evidence');
   }
 });
@@ -84,6 +111,7 @@ export function readCatalog(file: string): Catalog {
 export function catalogView(catalogs: Catalog[], now = Date.now()) {
   return catalogs.flatMap((catalog) => catalog.entries.map((entry) => ({
     ...entry,
+    protocol: entry.protocol ?? 'agent-login',
     effectiveStatus: entry.status === 'reviewed' && entry.evidence.some((e) => Date.parse(e.observedAt) > now || Date.parse(e.expiresAt) <= now) ? 'review_expired' : entry.status,
     automaticTrust: false,
   })));

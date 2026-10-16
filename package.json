@@ -10,9 +10,9 @@
   ],
   "type": "module",
   "scripts": {
-    "build": "tsc -b packages/issuer packages/conformance packages/agentlogin packages/rp packages/store-postgres packages/rp-store-postgres packages/mcp && tsc -p examples/rp-hono/tsconfig.build.json",
+    "build": "tsc -b packages/issuer packages/conformance packages/agentlogin packages/rp packages/store-postgres packages/rp-store-postgres packages/mcp packages/agentid-mcp && tsc -p examples/rp-hono/tsconfig.build.json",
     "typecheck": "npm run build",
-    "test": "npm run build && node --import tsx --test --test-concurrency=1 packages/issuer/test/*.test.ts packages/agentlogin/test/*.test.ts packages/rp/test/*.test.ts packages/conformance/test/*.test.ts packages/store-postgres/test/*.test.ts packages/rp-store-postgres/test/*.test.ts examples/rp-hono/test/*.test.ts packages/mcp/test/*.test.ts",
+    "test": "npm run build && node --import tsx --test --test-concurrency=1 packages/issuer/test/*.test.ts packages/agentlogin/test/*.test.ts packages/rp/test/*.test.ts packages/conformance/test/*.test.ts packages/store-postgres/test/*.test.ts packages/rp-store-postgres/test/*.test.ts examples/rp-hono/test/*.test.ts packages/mcp/test/*.test.ts packages/agentid-mcp/test/*.test.ts",
     "issuer": "node --import tsx packages/issuer/src/server.ts",
     "conformance": "node packages/conformance/bin/agentlogin-conformance.js",
     "agentlogin": "node packages/agentlogin/bin/agentlogin.js",

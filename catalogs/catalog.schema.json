@@ -52,6 +52,15 @@
                   "suspended"
                 ]
               },
+              "updatedAt": {
+                "type": "string",
+                "format": "date-time",
+                "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
+              },
+              "protocol": {
+                "type": "string",
+                "const": "agent-login"
+              },
               "specRevision": {
                 "type": "string",
                 "pattern": "^[a-f0-9]{40}$"
@@ -90,6 +99,10 @@
                       "minLength": 1,
                       "maxLength": 200
                     },
+                    "protocol": {
+                      "type": "string",
+                      "const": "agent-login"
+                    },
                     "revision": {
                       "type": "string",
                       "pattern": "^[a-f0-9]{40}$"
@@ -105,11 +118,6 @@
                   ],
                   "additionalProperties": false
                 }
-              },
-              "updatedAt": {
-                "type": "string",
-                "format": "date-time",
-                "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
               },
               "kind": {
                 "type": "string",
@@ -135,9 +143,9 @@
               "operator",
               "homepage",
               "status",
+              "updatedAt",
               "specRevision",
               "evidence",
-              "updatedAt",
               "kind",
               "issuer",
               "handleDomains"
@@ -173,6 +181,146 @@
                   "suspended"
                 ]
               },
+              "updatedAt": {
+                "type": "string",
+                "format": "date-time",
+                "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
+              },
+              "kind": {
+                "type": "string",
+                "const": "provider"
+              },
+              "issuer": {
+                "type": "string",
+                "format": "uri"
+              },
+              "handleDomains": {
+                "minItems": 1,
+                "maxItems": 128,
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "pattern": "^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$"
+                }
+              },
+              "protocol": {
+                "type": "string",
+                "const": "agentid"
+              },
+              "protocolReference": {
+                "type": "string",
+                "format": "uri"
+              },
+              "evidence": {
+                "maxItems": 20,
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "kind": {
+                      "type": "string",
+                      "enum": [
+                        "domain_control",
+                        "protocol_test",
+                        "independent_interop",
+                        "operational_review"
+                      ]
+                    },
+                    "url": {
+                      "type": "string",
+                      "format": "uri"
+                    },
+                    "observedAt": {
+                      "type": "string",
+                      "format": "date-time",
+                      "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
+                    },
+                    "expiresAt": {
+                      "type": "string",
+                      "format": "date-time",
+                      "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
+                    },
+                    "reviewer": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 200
+                    },
+                    "protocol": {
+                      "type": "string",
+                      "const": "agentid"
+                    },
+                    "reference": {
+                      "type": "string",
+                      "format": "uri"
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "url",
+                    "observedAt",
+                    "expiresAt",
+                    "reviewer",
+                    "protocol",
+                    "reference"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            },
+            "required": [
+              "id",
+              "name",
+              "operator",
+              "homepage",
+              "status",
+              "updatedAt",
+              "kind",
+              "issuer",
+              "handleDomains",
+              "protocol",
+              "protocolReference",
+              "evidence"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "pattern": "^[a-z][a-z0-9_-]{0,63}$"
+              },
+              "name": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128
+              },
+              "operator": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 200
+              },
+              "homepage": {
+                "type": "string",
+                "format": "uri"
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "candidate",
+                  "reviewed",
+                  "suspended"
+                ]
+              },
+              "updatedAt": {
+                "type": "string",
+                "format": "date-time",
+                "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
+              },
+              "protocol": {
+                "type": "string",
+                "const": "agent-login"
+              },
               "specRevision": {
                 "type": "string",
                 "pattern": "^[a-f0-9]{40}$"
@@ -211,6 +359,10 @@
                       "minLength": 1,
                       "maxLength": 200
                     },
+                    "protocol": {
+                      "type": "string",
+                      "const": "agent-login"
+                    },
                     "revision": {
                       "type": "string",
                       "pattern": "^[a-f0-9]{40}$"
@@ -226,11 +378,6 @@
                   ],
                   "additionalProperties": false
                 }
-              },
-              "updatedAt": {
-                "type": "string",
-                "format": "date-time",
-                "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
               },
               "kind": {
                 "type": "string",
@@ -256,9 +403,9 @@
               "operator",
               "homepage",
               "status",
+              "updatedAt",
               "specRevision",
               "evidence",
-              "updatedAt",
               "kind",
               "initiateLoginUri",
               "clientId"
@@ -294,6 +441,15 @@
                   "suspended"
                 ]
               },
+              "updatedAt": {
+                "type": "string",
+                "format": "date-time",
+                "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
+              },
+              "protocol": {
+                "type": "string",
+                "const": "agent-login"
+              },
               "specRevision": {
                 "type": "string",
                 "pattern": "^[a-f0-9]{40}$"
@@ -332,6 +488,10 @@
                       "minLength": 1,
                       "maxLength": 200
                     },
+                    "protocol": {
+                      "type": "string",
+                      "const": "agent-login"
+                    },
                     "revision": {
                       "type": "string",
                       "pattern": "^[a-f0-9]{40}$"
@@ -347,11 +507,6 @@
                   ],
                   "additionalProperties": false
                 }
-              },
-              "updatedAt": {
-                "type": "string",
-                "format": "date-time",
-                "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
               },
               "kind": {
                 "type": "string",
@@ -382,9 +537,9 @@
               "operator",
               "homepage",
               "status",
+              "updatedAt",
               "specRevision",
               "evidence",
-              "updatedAt",
               "kind",
               "initiateLoginUri",
               "clientType",

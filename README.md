@@ -17,6 +17,7 @@ The implementation milestones are:
 | Package | Purpose |
 | --- | --- |
 | `packages/mcp` | Local MCP tools and skills for enrollment, sign-in, configured application operations and logout |
+| `packages/agentid-mcp` | Separate AgentID by AgentMail integration for documented browser sign-in handoffs to configured applications |
 | `catalogs` | Optional provider/application records, review policy, validation and static directory |
 | `packages/agentlogin` | Agent CLI and client library (npm `agentlogin`): discovery, enrollment, sign-in, cookie jar |
 | `packages/store-postgres` | PostgreSQL issuer adapter: indexed records, serializable mutations, shared contracts and database concurrency tests |
@@ -67,3 +68,9 @@ test user with schema-creation and role-creation privileges.
 The clean-consumer test installs into a new npm cache using the exact tested lockfile resolutions and locally
 packed workspaces. It needs registry access to fetch the locked third-party tarballs; a warm development cache
 is neither required nor sufficient evidence of a clean installation.
+
+For AgentMail's existing AgentID service, use the separate
+[AgentID sign-in adapter](packages/agentid-mcp/README.md). It creates browser
+handoffs through documented AgentMail APIs. The provider directory labels this
+OIDC integration separately from Agent Login Core; listing either protocol never
+changes a website's accepted providers automatically.

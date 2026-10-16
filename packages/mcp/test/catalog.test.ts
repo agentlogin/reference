@@ -10,6 +10,22 @@ const common = {
 const catalog = (...entries: unknown[]) => ({ version: 1, kind: 'applications', updatedAt: common.updatedAt, entries });
 const open = { ...common, clientId: 'https://app.example/client.json' };
 const registered = { ...common, clientType: 'registered', clientId: 's6BhdRkqt3', issuer: 'https://issuer.example/tenant' };
+const coreProvider = {
+  kind: 'provider', id: 'core', name: 'Core provider', operator: 'Example',
+  homepage: 'https://issuer.example', issuer: 'https://issuer.example', handleDomains: ['example.com'],
+  status: 'candidate', specRevision: common.specRevision, evidence: [], updatedAt: common.updatedAt,
+};
+const agentIdProvider = {
+  kind: 'provider', protocol: 'agentid', id: 'agentid', name: 'AgentID by AgentMail', operator: 'AgentMail, Inc.',
+  homepage: 'https://www.agentid.com', issuer: 'https://auth.agentid.com', handleDomains: ['agentmail.to'],
+  status: 'candidate', protocolReference: 'https://docs.agentmail.to/agentid-sign-in',
+  evidence: [], updatedAt: common.updatedAt,
+};
+const providers = (...entries: unknown[]) => ({ ...catalog(...entries), kind: 'providers' });
+const evidenceFields = {
+  url: 'https://reviewer.example/report', observedAt: '2026-10-14T00:00:00Z',
+  expiresAt: '2026-11-14T00:00:00Z', reviewer: 'Example reviewer',
+};
 
 test('application catalogs distinguish open clients and issuer-scoped registered clients', () => {
   const parsed = CatalogSchema.parse(catalog(open, { ...registered, id: 'registered' }));
@@ -72,4 +88,63 @@ test('editor schema retains both application forms and the legacy open-client de
   assert.equal(openSchema.required.includes('clientType'), false);
   assert.equal(registeredSchema.required.includes('clientType'), true);
   assert.equal(registeredSchema.required.includes('issuer'), true);
+});
+
+test('catalogs distinguish AgentID integration from legacy and explicit Agent Login Core providers', () => {
+  const parsed = CatalogSchema.parse(providers(coreProvider, agentIdProvider));
+  assert.deepEqual(parsed.entries, [coreProvider, agentIdProvider]);
+  const view = catalogView([parsed]);
+  assert.deepEqual(view.map((entry) => entry.protocol), ['agent-login', 'agentid']);
+  assert.equal(view.every((entry) => entry.automaticTrust === false && entry.effectiveStatus === 'candidate'), true);
+  assert.equal('specRevision' in view[1]!, false);
+  assert.equal(CatalogSchema.safeParse(providers({ ...coreProvider, protocol: 'agent-login' })).success, true);
+  assert.equal(CatalogSchema.safeParse(providers({ ...agentIdProvider, specRevision: common.specRevision })).success, false);
+  assert.equal(CatalogSchema.safeParse(providers({ ...agentIdProvider, protocol: undefined })).success, false);
+  assert.equal(CatalogSchema.safeParse(providers({ ...agentIdProvider, protocolReference: undefined })).success, false);
+  assert.equal(CatalogSchema.safeParse(providers({ ...agentIdProvider, protocolReference: 'http://docs.example' })).success, false);
+  assert.equal(CatalogSchema.safeParse(providers({ ...coreProvider, protocol: 'agentid' })).success, false);
+  assert.equal(CatalogSchema.safeParse(catalog(agentIdProvider)).success, false);
+  assert.equal(CatalogSchema.safeParse(catalog({ ...open, protocol: 'agentid' })).success, false);
+  // An issuer cannot acquire a second listing just by changing its protocol label.
+  assert.equal(CatalogSchema.safeParse(providers(coreProvider, { ...agentIdProvider, issuer: coreProvider.issuer })).success, false);
+});
+
+test('reviewed AgentID listings require explicitly matching AgentID evidence, never Core revision evidence', () => {
+  const agentIdEvidence = ['domain_control', 'protocol_test'].map((kind) => ({
+    ...evidenceFields, kind, protocol: 'agentid', reference: agentIdProvider.protocolReference,
+  }));
+  const coreEvidence = ['domain_control', 'protocol_test'].map((kind) => ({
+    ...evidenceFields, kind, revision: common.specRevision,
+  }));
+  const reviewed = { ...agentIdProvider, status: 'reviewed', evidence: agentIdEvidence };
+  const parsed = CatalogSchema.parse(providers(reviewed));
+  assert.equal(catalogView([parsed], Date.parse(common.updatedAt))[0]?.effectiveStatus, 'reviewed');
+  assert.equal(catalogView([parsed], Date.parse('2026-12-01T00:00:00Z'))[0]?.effectiveStatus, 'review_expired');
+  assert.equal(catalogView([parsed], Date.parse('2026-10-01T00:00:00Z'))[0]?.effectiveStatus, 'review_expired');
+  assert.equal(CatalogSchema.safeParse(providers({ ...reviewed, evidence: [] })).success, false);
+  assert.equal(CatalogSchema.safeParse(providers({ ...reviewed, evidence: agentIdEvidence.slice(0, 1) })).success, false);
+  assert.equal(CatalogSchema.safeParse(providers({ ...reviewed, evidence: coreEvidence })).success, false);
+  for (const change of [
+    { protocol: 'agent-login' }, { protocol: undefined }, { reference: 'https://docs.example/other' },
+    { revision: common.specRevision }, { expiresAt: evidenceFields.observedAt },
+  ]) {
+    assert.equal(CatalogSchema.safeParse(providers({ ...reviewed, evidence: agentIdEvidence.map((e) => ({ ...e, ...change })) })).success, false);
+  }
+  assert.equal(CatalogSchema.safeParse(providers({ ...coreProvider, status: 'reviewed', evidence: coreEvidence })).success, true);
+  assert.equal(CatalogSchema.safeParse(providers({ ...coreProvider, status: 'reviewed', evidence: agentIdEvidence })).success, false);
+});
+
+test('editor schema makes AgentID protocol and reference explicit without a Core specification revision', () => {
+  const schema = catalogJsonSchema() as any;
+  const variants = schema.properties.entries.items.anyOf;
+  const core = variants.find((variant: any) => variant.properties.kind.const === 'provider' && variant.properties.protocol.const === 'agent-login');
+  const agentid = variants.find((variant: any) => variant.properties.protocol.const === 'agentid');
+  assert.equal(core.required.includes('protocol'), false);
+  assert.equal(core.required.includes('specRevision'), true);
+  assert.equal(agentid.required.includes('protocol'), true);
+  assert.equal(agentid.required.includes('protocolReference'), true);
+  assert.equal('specRevision' in agentid.properties, false);
+  assert.equal(agentid.properties.evidence.items.required.includes('protocol'), true);
+  assert.equal(agentid.properties.evidence.items.required.includes('reference'), true);
+  assert.equal('revision' in agentid.properties.evidence.items.properties, false);
 });

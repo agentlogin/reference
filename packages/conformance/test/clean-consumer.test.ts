@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url';
 
 const run = promisify(execFile);
 const root = fileURLToPath(new URL('../../..', import.meta.url));
-const packages = ['issuer', 'agentlogin', 'rp', 'store-postgres', 'rp-store-postgres', 'conformance', 'mcp'];
+const packages = ['issuer', 'agentlogin', 'rp', 'store-postgres', 'rp-store-postgres', 'conformance', 'mcp', 'agentid-mcp'];
 
 test('clean consumer installs only declared packed dependencies and runs the PostgreSQL pilot', { timeout: 180_000 }, async (t) => {
   const out = mkdtempSync(join(tmpdir(), 'agentlogin-consumer-'));
@@ -59,7 +59,7 @@ test('clean consumer installs only declared packed dependencies and runs the Pos
   for (const name of Object.keys(dependencies)) {
     assert.equal(lstatSync(join(out, 'node_modules', name)).isSymbolicLink(), false);
   }
-  await run(process.execPath, ['--input-type=module', '-e', "await Promise.all(['@agentlogin/issuer','agentlogin','@agentlogin/rp','@agentlogin/store-postgres','@agentlogin/rp-store-postgres','@agentlogin/mcp','agentlogin-example-rp-hono'].map(p=>import(p)))"], { cwd: out, signal: t.signal, timeout: 15_000 });
+  await run(process.execPath, ['--input-type=module', '-e', "await Promise.all(['@agentlogin/issuer','agentlogin','@agentlogin/rp','@agentlogin/store-postgres','@agentlogin/rp-store-postgres','@agentlogin/mcp','@agentlogin/agentid-mcp','agentlogin-example-rp-hono'].map(p=>import(p)))"], { cwd: out, signal: t.signal, timeout: 15_000 });
   if (!process.env.AGENTLOGIN_TEST_POSTGRES_URL) {
     assert.notEqual(process.env.REQUIRE_POSTGRES_TESTS, '1', 'The required PostgreSQL consumer pilot needs AGENTLOGIN_TEST_POSTGRES_URL');
     t.diagnostic('Clean installation verified; PostgreSQL pilot not run because AGENTLOGIN_TEST_POSTGRES_URL is absent.');

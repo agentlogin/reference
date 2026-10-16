@@ -141,3 +141,24 @@ The independent reviewer traced all 20 retained registry records to the eight
 packed packages, found no missing or extra dependency, and reported no further
 actionable finding. This verifies their integrated installation, not each package
 in isolation.
+
+## Follow-up: provider candidates and AgentID integration, 16 October 2026
+
+SentFrom.ai and AgentID by AgentMail are now unreviewed directory candidates.
+The catalog explicitly distinguishes Agent Login Core from AgentID's separate
+OIDC integration and requires evidence appropriate to each protocol. Neither entry
+has review evidence or grants automatic acceptance. An independent catalog review
+passed the schema, compatibility, evidence-boundary and generated-directory checks.
+
+The new AgentID MCP adapter uses published AgentMail app-connect APIs and leaves
+completion to the browser. It does not drive undocumented wait-page endpoints or
+claim to observe an application session. Raw transaction-token authorization is
+omitted because the documented API gives this adapter no independent way to bind
+that token to its configured application.
+
+Independent adapter review corrected opaque API-key identifiers, malformed status
+types, the documented absent-or-disabled account status, and UUID case handling.
+All 20 adapter tests passed after those fixes, including actual MCP stdio and
+adverse HTTP behavior. The clean-consumer fixture now packs and imports the new
+workspace alongside the existing packages. No live authenticated AgentID sign-in
+or provider endorsement is inferred from these tests or directory entries.
