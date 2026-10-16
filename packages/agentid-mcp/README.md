@@ -54,7 +54,9 @@ Inject the API key through the host's protected environment/secret facility as
 for connect, `api_key_read` for credential status, and `inbox_read` for account
 history. `app_share_owner` is needed only when authorizing a disclosure of owner
 details. Never paste credentials into this config, tool arguments or chat. This
-adapter cannot create accounts, recover keys or grant permissions.
+adapter cannot create AgentMail organizations or inboxes, recover keys or change
+permissions. Completing the browser flow can create an account at the selected
+app when the inbox has not signed in there before.
 
 Validate and launch:
 
@@ -116,6 +118,13 @@ revoke provider keys or end a browser session. Stored key activation is distinct
 from application session state. Account records report sign-in history only.
 Poll no faster than every five seconds. Empty catalog/account pages can still
 have a `nextCursor`; stop pagination only when it is absent.
+
+The app allowlist limits this helper's requests, not the authority of the
+browser's resulting sign-in key. AgentMail copies `app_connect` and
+`app_share_owner` permissions from the creating bearer key. Deleting or changing
+that bearer key does not revoke the sign-in keys it created. Revoke those keys
+separately through AgentMail; existing app sessions have their own lifetimes.
+See AgentMail's [credential lifecycle](https://docs.agentmail.to/agentid-sign-in#credential-lifetimes).
 
 There is no `authorize_inbox` tool. Although AgentMail documents that endpoint,
 it accepts a transaction token without an independent documented API for this

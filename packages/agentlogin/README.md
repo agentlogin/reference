@@ -41,6 +41,13 @@ ones) when the application's callback lives elsewhere.
 application's cookies, and takes the Authentication Request the application redirects to. If you already hold an
 Authentication Request URL, use `signIn({ authorizationUrl, expectedHost })` (CLI: `--authorization-url --site`).
 
+`signInAt` and `follow` cancel unused application redirect bodies after storing their cookies. `follow` returns
+at most 1 MiB of decoded response-body bytes; an oversized response is canceled and fails with
+`response_too_large`, without returning a partial page. Set the positive integer `maxFollowBodyBytes` constructor
+option when a different limit is needed. The per-request timeout also applies while reading the body. The
+lower-level `fetch` method returns a streaming `Response`; its caller must consume or cancel it and enforce an
+appropriate byte limit.
+
 What it does, by specification section: WebFinger discovery of the handle's Issuer over HTTPS with the fetch
 protections of 2.2 (A-1); sends the Authentication Request itself on the JSON path (5.3) so it is the Session Holder
 and never sets `deliver_to_session` (A-4); verifies `iss`, the transaction URLs and the client's `redirect_host`

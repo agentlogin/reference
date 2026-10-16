@@ -18,6 +18,8 @@ new UUID `attempt`. Reuse that UUID and identical inputs if the result is
 uncertain; do not silently start another attempt. Set `acceptDisclosure: false`
 unless the user has authorized the specific disclosure. Owner data needs its
 own authorized disclosure; general sign-in intent does not imply sharing it.
+Completing this flow can create an account at the selected app on first use;
+respect any user restriction against signup.
 
 The returned URL is a sensitive, single-use browser handoff. Show it only to the
 requesting operator. Never auto-open it, forward it to another service, publish
@@ -38,5 +40,8 @@ app. Use the configured app's connect handoff and provider browser flow. Do not
 drive undocumented wait-page endpoints or treat AgentID as a Core issuer.
 
 For setup, scopes and exact limitations, read the package's
-[README](../../README.md). No mail, account signup, revocation or application
-actions are implied by this skill.
+[README](../../README.md). Its app allowlist limits this helper, not the
+provider-managed browser key's authority. Changing or deleting the bearer key
+does not revoke sign-in keys it created. No mail, AgentMail organization or
+inbox creation, revocation, or other application actions are implied by this
+skill.

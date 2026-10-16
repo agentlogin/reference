@@ -60,6 +60,42 @@ test('callback credentials and HTML stay private; authenticated session is verif
   assert.deepEqual(await f.jars.get('alice')!.list(), []);
 });
 
+test('response redaction omits secret-bearing property names without renaming collisions', async () => {
+  const jwt = 'eyJhbGciOiJFUzI1NiJ9.eyJzdWIiOiJhZ2VudCJ9.c2lnbmF0dXJl';
+  const secretNames = {
+    PRIVATE_SESSION: 'cookie as a key',
+    prefix_PRIVATE_SESSION_suffix: 'cookie inside a key',
+    [jwt]: 'JWT as a key',
+    'Bearer synthetic-upstream-credential': 'bearer as a key',
+  };
+  const f = fixture({ response: () => Response.json({ value: {
+    ...secretNames, '[redacted]': 'legitimate field', safe: 'ordinary value',
+    nested: [{ ...secretNames, safe: 'PRIVATE_SESSION', access_token: 'UNKNOWN_PRIVATE_TOKEN' }],
+  } }) });
+  await f.runtime.settled(f.runtime.start('alice', 'notes').operation);
+  const response = await f.runtime.request('alice', 'notes', 'save');
+  assert.deepEqual(response.data, { value: {
+    '[redacted]': 'legitimate field', safe: 'ordinary value',
+    nested: [{ safe: '[redacted]', access_token: '[redacted]' }],
+  } });
+  assert.doesNotMatch(JSON.stringify(response), /PRIVATE_SESSION|UNKNOWN_PRIVATE_TOKEN|synthetic-upstream-credential|eyJ/);
+});
+
+test('response redaction treats prototype property names as data and redacts before truncating', async () => {
+  const value = JSON.parse('{"__proto__":{"polluted":"PRIVATE_SESSION"},"constructor":{"prototype":{"polluted":"PRIVATE_SESSION"}}}');
+  value.long = `${'x'.repeat(8190)}PRIVATE_SESSION`;
+  const f = fixture({ response: () => Response.json({ value }) });
+  await f.runtime.settled(f.runtime.start('alice', 'notes').operation);
+  const response = await f.runtime.request('alice', 'notes', 'save');
+  const actual = response.data!.value as Record<string, unknown>;
+  assert.equal(Object.getPrototypeOf(actual), Object.prototype);
+  assert.equal(Object.hasOwn(actual, '__proto__'), true);
+  assert.deepEqual(actual.__proto__, { polluted: '[redacted]' });
+  assert.equal(Object.hasOwn(Object.prototype, 'polluted'), false);
+  assert.doesNotMatch(JSON.stringify(response), /PRIVATE_SESSION/);
+  assert.equal(actual.long, `${'x'.repeat(8190)}[r`);
+});
+
 test('same host on another scheme or port is not an allowed callback origin', async () => {
   for (const callback of ['https://notes.example:444/cb?code=secret', 'https://attacker.example/cb?code=secret']) {
     const f = fixture({ callback });

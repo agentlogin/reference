@@ -57,15 +57,21 @@ export async function readJson(response: Response, maxBytes = 64 * 1024): Promis
   } finally { await reader.cancel().catch(() => {}); }
 }
 
+function redactString(value: string, secrets: string[]): string {
+  let result = value;
+  for (const secret of secrets) if (secret) result = result.split(secret).join('[redacted]');
+  return result.replace(/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g, '[redacted]').replace(/Bearer\s+\S+/gi, 'Bearer [redacted]');
+}
+
 function sanitized(value: unknown, secrets: string[], depth = 0): unknown {
   if (depth > 12) return '[omitted]';
-  if (typeof value === 'string') {
-    let result = value.slice(0, 8192);
-    for (const secret of secrets) if (secret) result = result.split(secret).join('[redacted]');
-    return result.replace(/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g, '[redacted]').replace(/Bearer\s+\S+/gi, 'Bearer [redacted]');
-  }
+  if (typeof value === 'string') return redactString(value, secrets).slice(0, 8192);
   if (Array.isArray(value)) return value.slice(0, 100).map((v) => sanitized(v, secrets, depth + 1));
-  if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).slice(0, 100).map(([k, v]) => [k, sensitiveName(k) ? '[redacted]' : sanitized(v, secrets, depth + 1)]));
+  if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).slice(0, 100)
+    // JSON property names are upstream data too. Omit secret-bearing names instead of renaming them, which
+    // could collide with a legitimate field or another redacted name. fromEntries treats __proto__ as data.
+    .filter(([k]) => redactString(k, secrets) === k)
+    .map(([k, v]) => [k, sensitiveName(k) ? '[redacted]' : sanitized(v, secrets, depth + 1)]));
   return value;
 }
 

@@ -122,6 +122,8 @@ export interface AgentLoginOptions {
   allowInsecure?: boolean;
   /** Per-request timeout, default 10 s. */
   timeoutMs?: number;
+  /** Maximum decoded response-body bytes returned by follow(), default 1 MiB. Must be a positive safe integer. */
+  maxFollowBodyBytes?: number;
   log?: (message: string) => void;
 }
 export interface SignInOptions {
@@ -170,6 +172,7 @@ export class AgentLogin {
   private readonly keystore: Keystore;
   readonly cookies: CookieJar;
   private readonly disc: DiscoveryOptions;
+  private readonly maxFollowBodyBytes: number;
   private located?: { issuer: string; until: number };
 
   constructor(private readonly opts: AgentLoginOptions) {
@@ -179,6 +182,10 @@ export class AgentLogin {
     this.keystore = opts.keystore ?? new MemoryKeystore();
     this.cookies = opts.cookies ?? new MemoryCookieJar();
     this.disc = { allowInsecure: opts.allowInsecure, timeoutMs: opts.timeoutMs };
+    this.maxFollowBodyBytes = opts.maxFollowBodyBytes ?? 1024 * 1024;
+    if (!Number.isSafeInteger(this.maxFollowBodyBytes) || this.maxFollowBodyBytes <= 0) {
+      throw new AgentLoginError('maxFollowBodyBytes must be a positive safe integer', 'invalid_request');
+    }
   }
   static async open(opts: AgentLoginOptions): Promise<AgentLogin> {
     return new AgentLogin(opts);
@@ -487,7 +494,9 @@ export class AgentLogin {
     const ae = new URL(metadata.authorization_endpoint);
     for (let hop = 0; hop < 5; hop += 1) {
       const res = await this.rpFetch(url, {}, budget);
-      await budget.run(() => res.arrayBuffer());
+      // Only status and Location are needed. Cancel instead of buffering an arbitrary application page,
+      // including error responses; rpFetch has already persisted any Set-Cookie headers.
+      await budget.run(async () => { await res.body?.cancel().catch(() => {}); });
       const location = res.headers.get('location');
       if (!(res.status >= 300 && res.status < 400) || !location) {
         throw new AgentLoginError(`the application did not redirect to a sign-in (status ${res.status})`, 'no_authorization_request', res.status);
@@ -505,7 +514,8 @@ export class AgentLogin {
 
   /**
    * Fetches the code-bearing redirect with the cookie jar for that host and follows redirects within that host.
-   * No Authorization header is sent (A-9). The returned URL never includes a query string.
+   * No Authorization header is sent (A-9). The returned URL never includes a query string. Redirect bodies are
+   * canceled; the final body is limited to maxFollowBodyBytes after HTTP content decoding.
    */
   async follow(result: SignInResult, maxRedirects = 5): Promise<FollowResult> {
     let url = new URL(result.redirectUrl);
@@ -515,15 +525,37 @@ export class AgentLogin {
       const res = await this.rpFetch(url);
       const location = res.headers.get('location');
       if (res.status >= 300 && res.status < 400 && location) {
+        await res.body?.cancel().catch(() => {});
         const next = new URL(location, url);
-        await res.arrayBuffer();
         if (i >= maxRedirects) throw new AgentLoginError('too many redirects at the application after the callback', 'callback_failed', res.status);
         if (next.protocol === 'http:' && url.protocol === 'https:') throw new AgentLoginError('redirect downgraded to http', 'insecure_redirect');
         if (next.host !== host) return { status: res.status, url: `${url.origin}${url.pathname}`, body: '', headers: res.headers }; // do not leave the application
         url = next;
         continue;
       }
-      return { status: res.status, url: `${url.origin}${url.pathname}`, body: await res.text(), headers: res.headers };
+      return { status: res.status, url: `${url.origin}${url.pathname}`, body: await this.followBody(res), headers: res.headers };
+    }
+  }
+  private async followBody(response: Response): Promise<string> {
+    const reader = response.body?.getReader();
+    if (!reader) return '';
+    const chunks: Uint8Array[] = [];
+    let size = 0;
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        size += value.byteLength;
+        if (size > this.maxFollowBodyBytes) {
+          throw new AgentLoginError('application response exceeded maxFollowBodyBytes', 'response_too_large', response.status);
+        }
+        chunks.push(value);
+      }
+      // Like Response.text(), decode UTF-8 once, preserving split code points and removing a leading BOM.
+      return new TextDecoder().decode(Buffer.concat(chunks, size));
+    } finally {
+      try { await reader.cancel().catch(() => {}); }
+      finally { reader.releaseLock(); }
     }
   }
   /** A request to the application with the stored session cookies. Redirects are not followed. */
