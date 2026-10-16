@@ -170,7 +170,10 @@ explains consent and output boundaries; endpoint access is enforced by the helpe
 `agentlogin_catalog` reads explicitly configured, locally reviewed catalog files.
 Validate a file with `agentlogin-mcp --check-catalog /absolute/catalog.json`.
 See [catalog policy and format](../../catalogs/README.md) for evidence requirements.
-The shipped public lists are empty until real participants submit reviewable evidence.
+The provider list includes unreviewed candidates; candidate status supplies no
+review evidence or automatic trust. AgentID entries describe a separate OIDC
+integration and require the [AgentID adapter](../agentid-mcp/README.md); this Core
+helper does not treat those listings as compatible issuer metadata.
 Application listings distinguish open metadata clients from registered clients, whose
 opaque identifiers are scoped to their exact registering issuer. Neither form changes
 the helper's explicit application or identity configuration.
