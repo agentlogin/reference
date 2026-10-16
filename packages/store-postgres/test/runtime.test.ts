@@ -65,6 +65,55 @@ test('runtime bounds rollback retries and releases every checked-out connection'
   } finally { await db.close(); }
 });
 
+test('host authorization rejects after mutation work without committing or reconciling', async () => {
+  const pool = new ConnectionPool();
+  const expired = new Error('owner session expired');
+  const order: string[] = [];
+  const db = new PgDatabase({ pool: pool.asPool(),
+    onCheckpoint: ({ phase }) => { if (phase === 'beforeCommit') order.push('wait finished'); },
+    beforeMutationCommit: async (session) => {
+      order.push('authorization');
+      assert.equal(session.client, pool.connections[0]);
+      assert.equal(session.operation, 'owner approval');
+      await session.query('SELECT authoritative_session');
+      throw expired;
+    },
+  });
+  let reconciled = false;
+  try {
+    await assert.rejects(db.mutate('owner approval', async (session) => {
+      order.push('mutation');
+      await session.query('INSERT pending_key');
+      return 'must not escape';
+    }, async () => { reconciled = true; return { resolved: true, value: 'wrong' }; }), (e) => e === expired);
+    assert.deepEqual(order, ['mutation', 'wait finished', 'authorization']);
+    assert.equal(reconciled, false);
+    assert.equal(pool.connections.length, 1);
+    assert.equal(pool.connections[0].statements.at(-1), 'ROLLBACK');
+    assert(!pool.connections[0].statements.includes('COMMIT'));
+    assert.equal(pool.connections[0].released, false);
+  } finally { await db.close(); }
+});
+
+test('authorization is repeated with the whole transaction after its serialization rollback', async () => {
+  const pool = new ConnectionPool();
+  const attempts: number[] = [];
+  let mutations = 0;
+  const db = new PgDatabase({ pool: pool.asPool(), retryBaseMs: 0, beforeMutationCommit: (session) => {
+    attempts.push(session.attempt);
+    assert.equal(session.client, pool.connections[session.attempt]);
+    if (session.attempt === 0) throw Object.assign(new Error('session changed'), { code: '40001' });
+  } });
+  try {
+    assert.equal(await db.mutate('retry authority', async () => ++mutations), 2);
+    assert.deepEqual(attempts, [0, 1]);
+    assert.equal(pool.connections[0].statements.at(-1), 'ROLLBACK');
+    assert.equal(pool.connections[1].statements.at(-1), 'COMMIT');
+    await db.read(async () => true);
+    assert.deepEqual(attempts, [0, 1], 'ordinary reads do not acquire mutation authorization');
+  } finally { await db.close(); }
+});
+
 test('COMMIT that answers ROLLBACK cannot report a successful mutation', async () => {
   const pool = new ConnectionPool();
   pool.commitCommand = 'ROLLBACK';
@@ -80,7 +129,8 @@ test('COMMIT that answers ROLLBACK cannot report a successful mutation', async (
 test('an unknown COMMIT discards its connection and reconciles once without repeating the mutation', async () => {
   const pool = new ConnectionPool();
   pool.commitFailure = Object.assign(new Error('connection lost'), { code: 'ECONNRESET' });
-  const db = new PgDatabase({ pool: pool.asPool() });
+  let authorizations = 0;
+  const db = new PgDatabase({ pool: pool.asPool(), beforeMutationCommit: () => { authorizations++; } });
   let calls = 0, reconciliations = 0;
   try {
     const value = await db.mutate('uncertain', async () => { calls += 1; return 'candidate'; }, async () => {
@@ -91,6 +141,7 @@ test('an unknown COMMIT discards its connection and reconciles once without repe
     assert.equal(value, 'durable-result');
     assert.equal(calls, 1);
     assert.equal(reconciliations, 1);
+    assert.equal(authorizations, 1, 'recovery observes an already committed operation without renewing its authority');
     assert.equal(pool.connections.length, 2);
     assert.equal(pool.connections[0].released, true);
     assert(pool.connections[1].statements.includes('BEGIN ISOLATION LEVEL READ COMMITTED READ ONLY'));

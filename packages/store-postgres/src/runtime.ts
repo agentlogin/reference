@@ -24,6 +24,13 @@ export interface PgOptions {
   retryBaseMs?: number;
   /** Fault injection / scheduling for tests; no hooks are installed by default. Never log query values here. */
   onCheckpoint?: (event: PgCheckpoint) => Promise<void> | void;
+  /**
+   * Optional host authorization check on the same transaction, after mutation work and immediately before COMMIT.
+   * Runs on every attempt; throwing rolls back all writes. Use this session for authoritative reads/locks and
+   * obtain fresh time after waits. Must not perform network calls or other effects outside the transaction.
+   * Does not run for reads, migrations or reconciliation of a commit that already took place.
+   */
+  beforeMutationCommit?: (session: PgSession) => Promise<void> | void;
   /** Optional reporting for idle connection errors, which also cause the pool to discard the connection. */
   onPoolError?: (error: Error) => void;
 }
@@ -95,6 +102,7 @@ export class PgDatabase {
   private readonly ownedPool: boolean;
   private readonly options: Required<Pick<PgOptions, 'statementTimeoutMs' | 'lockTimeoutMs' | 'idleTransactionTimeoutMs' | 'maxRetries' | 'retryBaseMs'>>;
   private readonly hook?: PgOptions['onCheckpoint'];
+  private readonly beforeMutationCommit?: PgOptions['beforeMutationCommit'];
   private readonly poolErrorHandler: (error: Error) => void;
   private closed = false;
 
@@ -116,6 +124,7 @@ export class PgDatabase {
       idleTimeoutMillis: 30_000,
     });
     this.hook = options.onCheckpoint;
+    this.beforeMutationCommit = options.beforeMutationCommit;
     this.poolErrorHandler = (error: Error) => { options.onPoolError?.(error); };
     this.pool.on('error', this.poolErrorHandler);
   }
@@ -180,6 +189,7 @@ export class PgDatabase {
         connection.check();
         const result = await fn(session);
         await session.checkpoint('beforeCommit');
+        await this.beforeMutationCommit?.(session);
         connection.check();
         committing = true;
         const commit = await client.query('COMMIT');

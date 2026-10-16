@@ -124,6 +124,15 @@ No discovery request, signature verification, signing operation, or external cal
 runs inside a database transaction. Tests can use `onCheckpoint` to stop a transaction
 at documented phases; production has no checkpoint hooks by default.
 
+A host with its own Owner sessions can supply `beforeMutationCommit(session)` to
+revalidate that authority on the same connection after mutation work and before
+commit. Throwing rolls back the mutation; the check runs again on each serialization
+retry. Read and lock the original session record, then check its unchanged identity
+and deadline against fresh database time. The callback must use the supplied session
+and perform no external side effects. It does not run for ordinary reads, migrations,
+or reconciliation of an already committed mutation; hosts must authorize protected
+reads separately. This hook supplements the store's protocol checks.
+
 ## Time contract
 
 `app_now()` wraps `floor(extract(epoch FROM clock_timestamp()))`; it does not use
