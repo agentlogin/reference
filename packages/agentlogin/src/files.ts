@@ -1,6 +1,6 @@
 // Private files (keys, cookies): directory 0700, file 0600, written atomically, never through a symbolic link.
-import { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, utimesSync, writeSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { closeSync, existsSync, fsyncSync, linkSync, lstatSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeSync } from 'node:fs';
+import { dirname } from 'node:path';
 import { randomBytes } from 'node:crypto';
 
 const uid = typeof process.getuid === 'function' ? process.getuid() : undefined;
@@ -15,7 +15,8 @@ export function readPrivateJson<T>(path: string, fallback: T): T {
 
 /**
  * Writes `value` to `path` atomically (temporary file, then rename). `guard`, when given, runs immediately before the
- * rename and may throw to abandon the write: a writer that has lost its lock uses it to leave the file untouched.
+ * rename and may throw to abandon the write. This check is defense in depth; mutual exclusion is provided by
+ * withFileLock, which never evicts a live writer.
  */
 export function writePrivateJson(path: string, value: unknown, guard?: () => void): void {
   const dir = dirname(path);
@@ -26,123 +27,112 @@ export function writePrivateJson(path: string, value: unknown, guard?: () => voi
   const tmp = `${path}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`;
   const fd = openSync(tmp, 'wx', 0o600); // exclusive create: never follows an existing link
   try {
-    writeSync(fd, JSON.stringify(value, null, 1));
-    fsyncSync(fd);
-    closeSync(fd);
+    try {
+      writeSync(fd, JSON.stringify(value, null, 1));
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
     guard?.();
+    renameSync(tmp, path);
   } catch (e) {
-    try { closeSync(fd); } catch { /* closed already */ }
     try { unlinkSync(tmp); } catch { /* gone already */ }
     throw e;
   }
-  renameSync(tmp, path);
 }
 
-const LOCK_STALE_MS = 15_000; // a holder that has not refreshed its lock for this long is taken for dead
-const LOCK_HEARTBEAT_MS = 2_000;
-const LOCK_WAIT_MS = 60_000; // longer than the staleness threshold, so a waiter outlasts a dead holder
+const LOCK_WAIT_MS = 60_000;
 
-/** The time as the file system that holds `dir` stamps it: a lock's age is judged by the clock that wrote its mtime. */
-function fileSystemNow(dir: string): number {
-  const probe = join(dir, `.now.${process.pid}.${randomBytes(6).toString('hex')}`);
-  const fd = openSync(probe, 'wx', 0o600);
-  closeSync(fd);
+function readLock(lock: string): string | undefined {
   try {
-    return statSync(probe).mtimeMs;
-  } finally {
-    try { unlinkSync(probe); } catch { /* gone already */ }
+    return readFileSync(lock, 'utf8');
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+    throw e;
   }
 }
-function readLock(lock: string): { content: string; mtimeMs: number } | undefined {
-  try {
-    return { content: readFileSync(lock, 'utf8'), mtimeMs: statSync(lock).mtimeMs };
-  } catch {
-    return undefined; // released in between
-  }
-}
-function processAlive(pid: number): boolean {
+/** Unknown/malformed owners and reused PIDs fail closed. Only ESRCH proves a local process cannot resume. */
+function holderIsDead(content: string): boolean {
+  const owner = /^([1-9]\d*):[a-zA-Z0-9-]+$/.exec(content);
+  if (!owner) return false;
+  const pid = Number(owner[1]);
+  if (!Number.isSafeInteger(pid) || pid > 0x7fffffff) return false;
   try {
     process.kill(pid, 0);
-    return true;
+    return false;
   } catch (e) {
-    return (e as NodeJS.ErrnoException).code === 'EPERM';
+    return (e as NodeJS.ErrnoException).code === 'ESRCH';
   }
 }
-/** A lock is stale when its holder's process is gone, or when nobody has refreshed it for LOCK_STALE_MS. */
-function isStale(seen: { content: string; mtimeMs: number }, dir: string): boolean {
-  const pid = Number.parseInt(seen.content, 10);
-  if (Number.isInteger(pid) && pid > 0 && !processAlive(pid)) return true;
-  return fileSystemNow(dir) - seen.mtimeMs > LOCK_STALE_MS;
+/** Publish a complete owner token atomically: a crash cannot leave a newly acquired lock with an empty owner. */
+function createLock(lock: string, token: string): void {
+  const candidate = `${lock}.${token.replace(':', '.')}.owner`;
+  const fd = openSync(candidate, 'wx', 0o600);
+  try {
+    try {
+      writeSync(fd, token);
+    } finally {
+      closeSync(fd);
+    }
+    linkSync(candidate, lock); // exclusive, atomic link; the candidate and lock are on the same local file system
+  } finally {
+    unlinkSync(candidate);
+  }
 }
 /**
- * Removes a stale lock as a compare-and-swap: only one process at a time may break locks (a second exclusive file),
- * and it removes the lock only if it still is the one that was judged stale. Without this, two waiters that both
- * saw the stale lock could each remove it, the second one removing the lock the first had just taken.
+ * Serialize recovery and check identity again inside that critical section. The recovery lock is never stolen:
+ * if a process dies in this tiny section, subsequent writers fail closed until an operator stops all writers
+ * and removes the abandoned .takeover file. Recovering that lock with another check/unlink would recreate the race.
  */
-function breakStaleLock(lock: string, staleContent: string, dir: string): void {
+function breakDeadLock(lock: string, deadContent: string): void {
   const breaker = `${lock}.takeover`;
   try {
     closeSync(openSync(breaker, 'wx', 0o600));
   } catch (e) {
     if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e;
-    try {
-      if (fileSystemNow(dir) - statSync(breaker).mtimeMs > LOCK_STALE_MS) unlinkSync(breaker); // its owner died mid-takeover
-    } catch { /* released in between */ }
     return;
   }
   try {
     const current = readLock(lock);
-    if (current && current.content === staleContent && isStale(current, dir)) unlinkSync(lock);
+    if (current === deadContent && holderIsDead(current)) unlinkSync(lock);
   } finally {
-    try { unlinkSync(breaker); } catch { /* gone already */ }
+    unlinkSync(breaker);
   }
 }
 
 /**
- * Runs `fn` while holding an exclusive lock on `path`, across processes. Atomic replacement alone does not protect a
- * read-modify-write: two processes that read the same old content each write back their own version and one is lost.
- *
- * The lock is a file created with O_EXCL that names its holder (process id and a random token) and that the holder
- * refreshes while it works. `fn` receives a guard to call right before it commits: it throws if the lock is no
- * longer this holder's (it was suspended long enough to be taken for dead), so a holder that lost its lock neither
- * writes nor, on the way out, removes the lock of whoever holds it now.
+ * Runs `fn` with an exclusive local-file-system lock, shared by processes on the same host/PID namespace.
+ * A live process never loses ownership, even if it is suspended between a guard check and the final rename.
+ * Age/heartbeats cannot establish that a writer is dead and are deliberately not used as fencing.
+ * Dead process locks are recovered; hung/live processes, unknown owners and PID reuse cause a bounded failure.
+ * All writers must use this protocol; do not manually remove locks while any writer can still resume.
  */
 export async function withFileLock<T>(path: string, fn: (guard: () => void) => T | Promise<T>): Promise<T> {
   const dir = dirname(path);
   mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const ds = lstatSync(dir);
+  if (!ds.isDirectory() || (uid !== undefined && (ds.uid !== uid || (ds.mode & 0o077) !== 0))) throw new Error(`${dir} must be a directory owned by you with mode 0700`);
   const lock = `${path}.lock`;
   const token = `${process.pid}:${randomBytes(12).toString('hex')}`;
-  const deadline = Date.now() + LOCK_WAIT_MS;
+  const deadline = performance.now() + LOCK_WAIT_MS;
   for (;;) {
     try {
-      const fd = openSync(lock, 'wx', 0o600);
-      writeSync(fd, token);
-      closeSync(fd);
+      createLock(lock, token);
       break;
     } catch (e) {
       if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e;
     }
+    if (performance.now() >= deadline) throw new Error(`could not lock ${path}: another process holds ${lock}, or lock recovery requires manual cleanup`);
     const seen = readLock(lock);
-    if (seen && isStale(seen, dir)) breakStaleLock(lock, seen.content, dir);
-    else if (Date.now() > deadline) throw new Error(`could not lock ${path}: another process holds ${lock}`);
-    else await new Promise((r) => setTimeout(r, 5 + Math.floor(Math.random() * 25)));
+    if (seen && holderIsDead(seen)) breakDeadLock(lock, seen);
+    await new Promise((r) => setTimeout(r, 5 + Math.floor(Math.random() * 25)));
   }
-  const holds = (): boolean => readLock(lock)?.content === token;
-  const skew = fileSystemNow(dir) - Date.now(); // refresh the mtime in the file system's own time
-  const beat = setInterval(() => {
-    try {
-      if (holds()) { const t = new Date(Date.now() + skew); utimesSync(lock, t, t); }
-    } catch { /* released or taken over */ }
-  }, LOCK_HEARTBEAT_MS);
-  beat.unref();
+  const holds = (): boolean => readLock(lock) === token;
   try {
     return await fn(() => {
-      if (!holds()) throw new Error(`lost the lock on ${path}: another process took it over; nothing was written`);
+      if (!holds()) throw new Error(`lost the lock on ${path}: lock files were modified externally; nothing was written`);
     });
   } finally {
-    clearInterval(beat);
-    if (holds()) {
-      try { unlinkSync(lock); } catch { /* gone already */ }
-    }
+    if (holds()) unlinkSync(lock);
   }
 }

@@ -5,11 +5,14 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { randomBytes } from 'node:crypto';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { serve } from '@hono/node-server';
 import { SignJWT, calculateJwkThumbprint, exportJWK, generateKeyPair, type CryptoKey, type JWK } from 'jose';
 import { AgentLogin, AgentLoginError, MemoryCookieJar, MemoryKeystore } from 'agentlogin';
 import { createIssuer } from '../../issuer/src/index.js';
-import { RelyingParty, RelyingPartyError, createHandlers, safeReturnTo, signInForm, type SignIn } from '../src/index.js';
+import { RelyingParty, RelyingPartyError, MemoryCallbackStateStore, SqliteCallbackStateStore, createHandlers, safeReturnTo, signInForm, type SignIn } from '../src/index.js';
 
 const rnd = (n = 16) => randomBytes(n).toString('base64url');
 async function freePort(): Promise<number> {
@@ -71,6 +74,7 @@ before(async () => {
     allowInsecure: true,
   });
   const h = createHandlers(rp, {
+    callbackStore: new MemoryCallbackStateStore(),
     metadata: { clientName: 'Kit Test App', maxSignupsPerOwner: 5 },
     onSignIn: (signIn) => {
       const sid = rnd();
@@ -194,6 +198,52 @@ test('the callback validates state and iss before anything else and presents err
   assert.equal(first.status, 502);
   assert.match(first.text, /token_request_failed/);
   assert.match((await cb(`code=not-a-code&state=${s2.state}&iss=${iss}`, s2.cookie)).text, /duplicate_callback/, 'state is consumed');
+});
+
+test('callback claims span handler instances and restarts without revoking the successful session', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'agentlogin-rp-replay-'));
+  const filename = join(directory, 'callbacks.sqlite');
+  const firstStore = new SqliteCallbackStateStore(filename);
+  const secondStore = new SqliteCallbackStateStore(filename);
+  let secondClosed = false;
+  let completed: SignIn | undefined;
+  let signedIn = 0;
+  const handlers = (store: SqliteCallbackStateStore) => createHandlers(new RelyingParty({ ...rp.options }), {
+    callbackStore: store,
+    onSignIn: (s) => { signedIn += 1; completed = s; return new Response('signed in'); },
+  });
+  try {
+    const first = handlers(firstStore);
+    const second = handlers(secondStore);
+    const start = await first.login(new Request(`${rpUrl}/auth/agent/login?handle=scout%40example.com`));
+    assert.equal(start.status, 302);
+    const cookie = start.headers.get('set-cookie')!.split(';')[0]!;
+    const al = newAgent();
+    await al.enroll({ credential: owner.credential });
+    const result = await al.signIn({ authorizationUrl: start.headers.get('location')!, expectedHost: new URL(rpUrl).host });
+    const callback = () => new Request(result.redirectUrl, { headers: { cookie } });
+    const responses = await Promise.all([first.callback(callback()), second.callback(callback())]);
+    assert.deepEqual(responses.map((r) => r.status).sort(), [200, 400]);
+    assert.match(await responses.find((r) => r.status === 400)!.text(), /duplicate_callback/);
+    assert.equal(signedIn, 1);
+    await rp.recheck(completed!);
+
+    // Restart with a fresh RP, handlers and database connection: a saved browser cookie must remain consumed.
+    secondStore.close();
+    secondClosed = true;
+    const reopenedStore = new SqliteCallbackStateStore(filename);
+    try {
+      const replay = await handlers(reopenedStore).callback(callback());
+      assert.equal(replay.status, 400);
+      assert.match(await replay.text(), /duplicate_callback/);
+      assert.equal(signedIn, 1);
+      await rp.recheck(completed!); // a code replay reaching the Issuer would revoke this Access Token
+    } finally { reopenedStore.close(); }
+  } finally {
+    firstStore.close();
+    if (!secondClosed) secondStore.close();
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 test('ID Token validation (Section 5.7) and the handle binding (Section 2.5)', async () => {

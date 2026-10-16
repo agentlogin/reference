@@ -83,6 +83,35 @@ export class AgentLoginError extends Error {
   }
 }
 
+/** One monotonic budget for discovery, redirects, callbacks and protocol requests. */
+class SignInBudget {
+  private readonly deadline: number;
+  constructor(ms = 600_000) {
+    if (!Number.isFinite(ms) || ms <= 0) throw this.timeout();
+    this.deadline = performance.now() + ms;
+  }
+  private timeout() { return new AgentLoginError('sign-in did not finish before the deadline', 'timeout'); }
+  left(): number {
+    const ms = this.deadline - performance.now();
+    if (ms <= 0) throw this.timeout();
+    return Math.ceil(ms);
+  }
+  async run<T>(operation: () => Promise<T> | T): Promise<T> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>((_, reject) => { timer = setTimeout(() => reject(this.timeout()), this.left()); });
+    try {
+      const result = await Promise.race([Promise.resolve().then(() => { this.left(); return operation(); }), timeout]);
+      this.left();
+      return result;
+    } catch (e) {
+      this.left(); // an expired network exchange is reported consistently as timeout
+      throw e;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+}
+
 export interface AgentLoginOptions {
   handle: string;
   keystore?: Keystore;
@@ -93,6 +122,8 @@ export interface AgentLoginOptions {
   allowInsecure?: boolean;
   /** Per-request timeout, default 10 s. */
   timeoutMs?: number;
+  /** Maximum decoded response-body bytes returned by follow(), default 1 MiB. Must be a positive safe integer. */
+  maxFollowBodyBytes?: number;
   log?: (message: string) => void;
 }
 export interface SignInOptions {
@@ -110,7 +141,7 @@ export interface SignInOptions {
   onReview?: (transaction: TransactionView) => Promise<'allow' | 'deny'> | 'allow' | 'deny';
   /** Called once when the Owner must approve. */
   onOwnerApproval?: (transaction: TransactionView) => void;
-  /** Overall deadline for waiting states, default 10 minutes. */
+  /** Overall sign-in deadline, including discovery, application redirects and callbacks; default 10 minutes. */
   deadlineMs?: number;
 }
 export interface SignInResult {
@@ -141,6 +172,7 @@ export class AgentLogin {
   private readonly keystore: Keystore;
   readonly cookies: CookieJar;
   private readonly disc: DiscoveryOptions;
+  private readonly maxFollowBodyBytes: number;
   private located?: { issuer: string; until: number };
 
   constructor(private readonly opts: AgentLoginOptions) {
@@ -150,6 +182,10 @@ export class AgentLogin {
     this.keystore = opts.keystore ?? new MemoryKeystore();
     this.cookies = opts.cookies ?? new MemoryCookieJar();
     this.disc = { allowInsecure: opts.allowInsecure, timeoutMs: opts.timeoutMs };
+    this.maxFollowBodyBytes = opts.maxFollowBodyBytes ?? 1024 * 1024;
+    if (!Number.isSafeInteger(this.maxFollowBodyBytes) || this.maxFollowBodyBytes <= 0) {
+      throw new AgentLoginError('maxFollowBodyBytes must be a positive safe integer', 'invalid_request');
+    }
   }
   static async open(opts: AgentLoginOptions): Promise<AgentLogin> {
     return new AgentLogin(opts);
@@ -161,16 +197,21 @@ export class AgentLogin {
    * as long as their responses allow (five minutes at most for the former within one process).
    */
   async discover(): Promise<{ issuer: string; metadata: IssuerMetadata }> {
+    return this.discoverWithin();
+  }
+  private async discoverWithin(budget?: SignInBudget): Promise<{ issuer: string; metadata: IssuerMetadata }> {
+    const options = () => ({ ...this.disc, timeoutMs: Math.min(this.disc.timeoutMs ?? 10_000, budget?.left() ?? Infinity) });
+    const run = <T>(operation: () => Promise<T>) => budget ? budget.run(operation) : operation();
     try {
       let issuer: string;
       if (this.opts.issuer) issuer = this.opts.issuer;
       else if (this.located && Date.now() < this.located.until) issuer = this.located.issuer;
       else {
-        const found = await lookupIssuer(this.handle, this.disc);
+        const found = await run(() => lookupIssuer(this.handle, options()));
         issuer = found.issuer;
         this.located = { issuer, until: Date.now() + Math.min(found.maxAge, 300) * 1000 };
       }
-      const metadata = await fetchMetadata(issuer, this.disc);
+      const metadata = await run(() => fetchMetadata(issuer, options()));
       if (this.opts.issuer) {
         const h = parseHandle(this.handle)!;
         if (!domainServed(h.domain, metadata.handle_domains)) throw new AgentLoginError(`${issuer} does not serve ${h.domain}`, 'issuer_mismatch');
@@ -288,6 +329,9 @@ export class AgentLogin {
   }
   async activeKey(): Promise<StoredKey> {
     const { issuer } = await this.discover();
+    return this.keyForIssuer(issuer);
+  }
+  private async keyForIssuer(issuer: string): Promise<StoredKey> {
     const now = Math.floor(Date.now() / 1000);
     const keys = (await this.keystore.list(this.handle)).filter((k) => k.status === 'active' && k.issuer === issuer && (k.expiresAt === undefined || k.expiresAt > now + 60));
     if (keys.length === 0) throw new AgentLoginError(`no usable key for ${this.handle} at ${issuer}; enroll one first`, 'no_key');
@@ -311,27 +355,13 @@ export class AgentLogin {
 
   // ---- sign-in (Sections 5, 6) -------------------------------------------------------------------------
   async signIn(o: SignInOptions): Promise<SignInResult> {
-    // One budget for the whole sign-in: every request and every wait draws on what is left of it, and nothing, the
-    // completion included, starts once it is spent.
-    const deadline = Date.now() + (o.deadlineMs ?? 600_000);
-    const left = (): number => {
-      const ms = deadline - Date.now();
-      if (ms <= 0) throw new AgentLoginError('sign-in did not finish before the deadline', 'timeout');
-      return ms;
-    };
-    const ask = async (url: string, init: { method?: string; headers?: Record<string, string>; body?: unknown } = {}) => {
-      const timeoutMs = left();
-      try {
-        return await this.json(url, { ...init, timeoutMs });
-      } catch (e) {
-        left(); // a request cut short by the deadline is a timeout, not a network failure
-        throw e;
-      }
-    };
-    const pause = async (ms: number): Promise<void> => {
-      await sleep(Math.min(ms, left()));
-      left();
-    };
+    return this.signInWithin(o, new SignInBudget(o.deadlineMs));
+  }
+  private async signInWithin(o: SignInOptions, budget: SignInBudget, discovered?: { issuer: string; metadata: IssuerMetadata }): Promise<SignInResult> {
+    const left = () => budget.left();
+    const ask = (url: string, init: { method?: string; headers?: Record<string, string>; body?: unknown } = {}) =>
+      budget.run(() => this.json(url, { ...init, timeoutMs: left() }));
+    const pause = (ms: number) => budget.run(() => sleep(Math.min(ms, left())));
     // Everything that can be decided locally is decided before the Issuer is asked to create a transaction.
     if (!o.unsafeSkipHostCheck && !o.expectedHost) throw new AgentLoginError('expectedHost is required: the host of the application you are signing in to', 'expected_host_required');
     let authUrl: URL;
@@ -340,7 +370,7 @@ export class AgentLogin {
     } catch {
       throw new AgentLoginError('authorizationUrl is not a URL', 'invalid_request');
     }
-    const { issuer, metadata } = await this.discover();
+    const { issuer, metadata } = discovered ?? await this.discoverWithin(budget);
     // A transaction this client starts itself (Section 6.3): its own Authentication Request, sent to the published
     // authorization_endpoint and answered on the JSON path of Section 5.3. Any other URL at the Issuer, for example a
     // Transaction Resource someone else started, is refused, and so is a response without a session_token.
@@ -348,7 +378,7 @@ export class AgentLogin {
     if (authUrl.origin !== ae.origin || authUrl.pathname !== ae.pathname || authUrl.username || authUrl.password) {
       throw new AgentLoginError(`not the authorization endpoint of this Agent's Issuer (${issuer})`, 'wrong_issuer');
     }
-    const key = await this.activeKey();
+    const key = await budget.run(() => this.keyForIssuer(issuer));
     const start = await ask(authUrl.href);
     if (start.status >= 300 && start.status < 400) throw new AgentLoginError('the Issuer answered with a redirect: it does not offer the JSON response of Section 5.3', 'protocol_error', start.status);
     if (start.status !== 200) throw this.error('the Issuer refused the Authentication Request', start);
@@ -362,14 +392,16 @@ export class AgentLogin {
 
     // Section 6.3: the assertion. deliver_to_session is never set: this client is itself the Session Holder (A-4).
     const now = Math.floor(Date.now() / 1000);
-    const assertion = await new SignJWT({ txn: tx.transaction_id, nonce: tx.challenge, jti: rnd(), accept_disclosure: o.acceptDisclosure !== false })
+    const assertion = await budget.run(async () => new SignJWT({ txn: tx.transaction_id, nonce: tx.challenge, jti: rnd(), accept_disclosure: o.acceptDisclosure !== false })
       .setProtectedHeader({ alg: 'ES256', typ: 'agent-login+jwt', kid: key.kid })
       .setIssuer(this.handle).setSubject(this.handle).setAudience(issuer).setIssuedAt(now).setExpirationTime(now + 60)
-      .sign(await importJWK(key.privateJwk, 'ES256'));
+      .sign(await importJWK(key.privateJwk, 'ES256')));
     const a = await ask(tx.next.url, { method: 'POST', body: { assertion } });
     if (a.status !== 200) {
       const code = (a.json as { error?: string } | undefined)?.error;
-      if (code === 'key_revoked' || code === 'unknown_key') await this.keystore.put({ ...key, status: 'revoked' }); // the Issuer no longer accepts this key
+      // unknown_key can reflect interrupted Agent authority (for example disable/re-enable), not revocation
+      // of this enrollment. Keep the key available for a fresh sign-in unless revocation is explicit.
+      if (code === 'key_revoked') await this.keystore.put({ ...key, status: 'revoked' });
       throw this.error('assertion refused', a);
     }
     const asserted = parseResource(a.json);
@@ -392,7 +424,7 @@ export class AgentLogin {
       left();
       if (tx.status === 'awaiting_consent') {
         if (!tx.next.url) throw new AgentLoginError('review step without a URL', 'protocol_error', undefined, tx);
-        const decision = o.onReview ? await o.onReview(view(tx)) : o.acceptDisclosure === false ? 'deny' : 'allow';
+        const decision = o.onReview ? await budget.run(() => o.onReview!(view(tx))) : o.acceptDisclosure === false ? 'deny' : 'allow';
         this.log(`review (${tx.consent_reason}): ${decision}`);
         const r = await ask(tx.next.url, { method: 'POST', headers: bearer, body: { decision } });
         if (r.status !== 200) throw this.error('review refused', r);
@@ -444,7 +476,9 @@ export class AgentLogin {
    * kept in the cookie jar, so an application that binds `state` to a cookie can complete the callback in follow().
    */
   async signInAt(loginUrl: string, o: SignInAtOptions = {}): Promise<SignInResult> {
-    const { issuer, metadata } = await this.discover();
+    const budget = new SignInBudget(o.deadlineMs);
+    const discovered = await this.discoverWithin(budget);
+    const { issuer, metadata } = discovered;
     let url: URL;
     try {
       url = new URL(loginUrl);
@@ -459,15 +493,17 @@ export class AgentLogin {
     }
     const ae = new URL(metadata.authorization_endpoint);
     for (let hop = 0; hop < 5; hop += 1) {
-      const res = await this.rpFetch(url);
-      await res.arrayBuffer();
+      const res = await this.rpFetch(url, {}, budget);
+      // Only status and Location are needed. Cancel instead of buffering an arbitrary application page,
+      // including error responses; rpFetch has already persisted any Set-Cookie headers.
+      await budget.run(async () => { await res.body?.cancel().catch(() => {}); });
       const location = res.headers.get('location');
       if (!(res.status >= 300 && res.status < 400) || !location) {
         throw new AgentLoginError(`the application did not redirect to a sign-in (status ${res.status})`, 'no_authorization_request', res.status);
       }
       const next = new URL(location, url);
       if (next.origin === ae.origin && next.pathname === ae.pathname) {
-        return this.signIn({ ...o, authorizationUrl: next.href, expectedHost: o.expectedHost ?? site });
+        return this.signInWithin({ ...o, authorizationUrl: next.href, expectedHost: o.expectedHost ?? site }, budget, discovered);
       }
       if (next.host !== site) throw new AgentLoginError(`the application redirected to ${next.host}, which is not this Agent's Issuer`, 'wrong_issuer');
       if (next.protocol !== 'https:' && !this.opts.allowInsecure) throw new AgentLoginError('redirect is not https', 'insecure_redirect');
@@ -478,7 +514,8 @@ export class AgentLogin {
 
   /**
    * Fetches the code-bearing redirect with the cookie jar for that host and follows redirects within that host.
-   * No Authorization header is sent (A-9). The returned URL never includes a query string.
+   * No Authorization header is sent (A-9). The returned URL never includes a query string. Redirect bodies are
+   * canceled; the final body is limited to maxFollowBodyBytes after HTTP content decoding.
    */
   async follow(result: SignInResult, maxRedirects = 5): Promise<FollowResult> {
     let url = new URL(result.redirectUrl);
@@ -488,15 +525,37 @@ export class AgentLogin {
       const res = await this.rpFetch(url);
       const location = res.headers.get('location');
       if (res.status >= 300 && res.status < 400 && location) {
+        await res.body?.cancel().catch(() => {});
         const next = new URL(location, url);
-        await res.arrayBuffer();
         if (i >= maxRedirects) throw new AgentLoginError('too many redirects at the application after the callback', 'callback_failed', res.status);
         if (next.protocol === 'http:' && url.protocol === 'https:') throw new AgentLoginError('redirect downgraded to http', 'insecure_redirect');
         if (next.host !== host) return { status: res.status, url: `${url.origin}${url.pathname}`, body: '', headers: res.headers }; // do not leave the application
         url = next;
         continue;
       }
-      return { status: res.status, url: `${url.origin}${url.pathname}`, body: await res.text(), headers: res.headers };
+      return { status: res.status, url: `${url.origin}${url.pathname}`, body: await this.followBody(res), headers: res.headers };
+    }
+  }
+  private async followBody(response: Response): Promise<string> {
+    const reader = response.body?.getReader();
+    if (!reader) return '';
+    const chunks: Uint8Array[] = [];
+    let size = 0;
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        size += value.byteLength;
+        if (size > this.maxFollowBodyBytes) {
+          throw new AgentLoginError('application response exceeded maxFollowBodyBytes', 'response_too_large', response.status);
+        }
+        chunks.push(value);
+      }
+      // Like Response.text(), decode UTF-8 once, preserving split code points and removing a leading BOM.
+      return new TextDecoder().decode(Buffer.concat(chunks, size));
+    } finally {
+      try { await reader.cancel().catch(() => {}); }
+      finally { reader.releaseLock(); }
     }
   }
   /** A request to the application with the stored session cookies. Redirects are not followed. */
@@ -504,20 +563,24 @@ export class AgentLogin {
     return this.rpFetch(new URL(url), init);
   }
   /** One request to a Relying Party: jar cookies in, Set-Cookie stored, no redirect following, bounded in time. */
-  private async rpFetch(u: URL, init: RequestInit = {}): Promise<Response> {
+  private async rpFetch(u: URL, init: RequestInit = {}, budget?: SignInBudget): Promise<Response> {
+    const run = <T>(operation: () => Promise<T>) => budget ? budget.run(operation) : operation();
     if (u.protocol !== 'https:' && !this.opts.allowInsecure) throw new AgentLoginError('non-https URL', 'insecure_url');
-    const cookie = await this.cookies.header(u);
+    const cookie = await run(() => this.cookies.header(u));
     const headers = new Headers(init.headers);
     if (!headers.has('accept')) headers.set('accept', 'text/html, application/json;q=0.9, */*;q=0.1');
     if (cookie) headers.set('cookie', cookie);
     headers.delete('authorization');
     let res: Response;
     try {
-      res = await fetch(u, { ...init, headers, redirect: 'manual', signal: AbortSignal.timeout(this.opts.timeoutMs ?? 10_000) });
+      const timeout = AbortSignal.timeout(Math.min(this.opts.timeoutMs ?? 10_000, budget?.left() ?? Infinity));
+      const signal = init.signal ? AbortSignal.any([init.signal, timeout]) : timeout;
+      res = await run(() => fetch(u, { ...init, headers, redirect: 'manual', signal }));
     } catch (e) {
+      if (e instanceof AgentLoginError && e.code === 'timeout') throw e;
       throw new AgentLoginError(`request to ${u.host} failed: ${(e as Error).message}`, 'network_error');
     }
-    await this.cookies.store(u, res.headers.getSetCookie());
+    await run(() => this.cookies.store(u, res.headers.getSetCookie()));
     return res;
   }
 
@@ -525,8 +588,11 @@ export class AgentLogin {
   /** A-3: the resource must come from this Agent's Issuer and point into its transaction endpoint; the client must be the one the agent set out to sign in to. */
   private check(tx: TransactionResource, issuer: string, m: IssuerMetadata, o: SignInOptions) {
     if (tx.iss !== issuer) throw new AgentLoginError(`transaction iss ${tx.iss} is not ${issuer}`, 'wrong_issuer', undefined, tx);
+    const action = { awaiting_agent: 'assert', awaiting_owner: 'await_owner', awaiting_consent: 'review', ready: 'continue',
+      completed: 'none', denied: 'continue', expired: 'continue' }[tx.status];
+    if (!action || tx.next?.action !== action) throw new AgentLoginError('transaction status and next action disagree', 'protocol_error', undefined, tx);
     this.assertUnder(tx.url, m.transaction_endpoint);
-    if (tx.next?.url) this.assertUnder(tx.next.url, m.transaction_endpoint);
+    if (tx.next?.url && tx.next.action !== 'none') this.assertUnder(tx.next.url, m.transaction_endpoint);
     if (typeof tx.client?.redirect_host !== 'string') throw new AgentLoginError('transaction without client.redirect_host', 'protocol_error');
     if (!o.unsafeSkipHostCheck) {
       const ok = [o.expectedHost!, ...(o.acceptHosts ?? [])].map((h) => h.toLowerCase());
@@ -543,7 +609,7 @@ export class AgentLogin {
     }
     const b = new URL(base);
     const basePath = b.pathname.replace(/\/$/, '');
-    if (u.origin !== b.origin || u.username || u.password || !(u.pathname === basePath || u.pathname.startsWith(`${basePath}/`))) {
+    if (u.origin !== b.origin || u.username || u.password || u.hash || !(u.pathname === basePath || u.pathname.startsWith(`${basePath}/`))) {
       throw new AgentLoginError(`a URL from the Issuer is not under ${base}`, 'wrong_issuer');
     }
     if (u.protocol !== 'https:' && !this.opts.allowInsecure) throw new AgentLoginError('non-https URL from the Issuer', 'insecure_url');

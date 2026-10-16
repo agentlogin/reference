@@ -81,17 +81,23 @@ async function world(opts: { name?: string | null; constants?: Record<string, nu
   return { app, ctx, req, admin, cred, owner, agent, client, start, assertOn, cont, token, signIn, advance: (s: number) => { clock += s; } };
 }
 
-test('#1 an authorization code is redeemed once under concurrent Token Requests', async () => {
+test('#1 an authorization code is redeemed at most once under concurrent Token Requests', async () => {
   const w = await world();
   const a = await w.agent('scout@example.com');
   const c = await w.client();
+  const ordinary = await w.signIn(c, a);
+  assert.equal((await w.token(c, ordinary.code, ordinary.verifier)).status, 200, 'a non-replayed code succeeds');
   const { code, verifier } = await w.signIn(c, a);
   const results = await Promise.all([w.token(c, code, verifier), w.token(c, code, verifier), w.token(c, code, verifier)]);
   const ok = results.filter((r) => r.status === 200);
-  assert.equal(ok.length, 1, `statuses ${results.map((r) => r.status).join(',')}`);
+  // Section 5.6 says at most once. Replay may invalidate the winning redemption before it can mint tokens.
+  assert.ok(ok.length <= 1, `statuses ${results.map((r) => r.status).join(',')}`);
+  const stored = await w.ctx.store.getCode(createHash('sha256').update(code).digest('base64url'));
+  assert.equal(stored?.used, true);
+  assert.equal(stored?.replayed, true);
   for (const r of results.filter((x) => x.status !== 200)) assert.equal(r.json.error, 'invalid_grant');
   // Section 5.4: the token issued for a code that was presented again is revoked.
-  assert.equal((await w.req('GET', '/userinfo', { headers: { authorization: `Bearer ${ok[0]!.json.access_token}` } })).status, 401);
+  for (const issued of ok) assert.equal((await w.req('GET', '/userinfo', { headers: { authorization: `Bearer ${issued.json.access_token}` } })).status, 401);
 });
 
 test('#2 prompt=consent and require_review force the review even on a first visit with accept_disclosure', async () => {
@@ -207,7 +213,7 @@ test('#9 a requested Owner Claim that the Issuer cannot supply ends the sign-in 
 test('cap: a completion racing another Agent\'s first sign-in cannot admit both', async () => {
   // The check and the reservation are one store operation, and so is the completion that turns a reservation into an
   // Account: wherever the completion falls relative to the other Agent's assertion, one place is one place.
-  for (const at of ['getAgent', 'getAccount', 'reserveSignup'] as const) {
+  for (const at of ['getAgent', 'getAccount', 'updateTransaction'] as const) {
     const h = hookable(snapshotting(new MemoryStore()));
     const w = await world({ store: h.store });
     const a = await w.agent('one@example.com');
@@ -271,4 +277,18 @@ test('a sign-in that ends denied does not renew the Consent Record', async () =>
   const allowed = (await w.assertOn((await w.start(strict)).tx, a)).json;
   await w.req('POST', allowed.next.url, { json: { decision: 'allow' }, headers: { authorization: `Bearer ${allowed.transaction_token}` } });
   assert.equal(await record(), t0 + 600, 'a completed review renews it');
+});
+
+
+test('replacing expired consent cannot revive scopes from the expired record', async () => {
+  const w = await world({ constants: { T_CONSENT: 10 } });
+  const agent = await w.agent('scout@example.com');
+  const client = await w.client();
+  await w.signIn(client, agent, { scope: 'openid email profile' });
+  w.advance(11);
+  await w.signIn(client, agent, { scope: 'openid email' });
+  assert.deepEqual((await w.ctx.store.getConsent(agent.handle, client.client_id))?.scopes, ['openid', 'email']);
+  const started = await w.start(client, { scope: 'openid email profile' });
+  const result = await w.assertOn(started.tx, agent, { accept_disclosure: false });
+  assert.equal(result.json.status, 'awaiting_consent', 'profile needs fresh consent');
 });

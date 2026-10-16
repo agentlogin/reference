@@ -3,5 +3,28 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
-  "dependencies": { "@agentlogin/rp": "^0.1.0", "@hono/node-server": "^1.19.0", "hono": "^4.9.0" }
+  "dependencies": {
+    "@agentlogin/rp": "^0.1.0",
+    "@agentlogin/rp-store-postgres": "^0.1.0",
+    "@hono/node-server": "^1.19.0",
+    "hono": "^4.9.0",
+    "pg": "^8.16.3"
+  },
+  "devDependencies": {
+    "@types/pg": "^8.23.1"
+  },
+  "main": "dist/app.js",
+  "types": "dist/app.d.ts",
+  "exports": {
+    ".": "./dist/app.js",
+    "./session-store": "./dist/session-store.js",
+    "./postgres-session-store": "./dist/postgres-session-store.js"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "prepack": "tsc -p tsconfig.build.json"
+  }
 }

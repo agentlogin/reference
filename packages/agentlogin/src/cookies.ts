@@ -55,8 +55,12 @@ export class MemoryCookieJar implements CookieJar {
       const now = Date.now();
       let next = all.filter((c) => c.expires === undefined || c.expires > now);
       for (const c of incoming) {
-        next = next.filter((x) => !(x.name === c.name && x.host === c.host && x.path === c.path));
-        if (c.expires === undefined || c.expires > now) next.push(c);
+        const at = next.findIndex((x) => x.name === c.name && x.host === c.host && x.path === c.path);
+        // RFC 6265 5.3: replacing a cookie preserves its creation order, including after loading a file jar.
+        if (c.expires !== undefined && c.expires <= now) {
+          if (at >= 0) next.splice(at, 1);
+        } else if (at >= 0) next[at] = c;
+        else next.push(c);
       }
       return next;
     });
@@ -64,6 +68,8 @@ export class MemoryCookieJar implements CookieJar {
   async header(url: URL) {
     const now = Date.now();
     const match = (await this.load()).filter((c) => c.host === url.hostname && (c.expires === undefined || c.expires > now) && (!c.secure || url.protocol === 'https:') && (url.pathname === c.path || url.pathname.startsWith(c.path.endsWith('/') ? c.path : `${c.path}/`)));
+    // RFC 6265 5.4: longest paths first; stable sort preserves earlier creation order for equal paths.
+    match.sort((a, b) => b.path.length - a.path.length);
     return match.length ? match.map((c) => `${c.name}=${c.value}`).join('; ') : undefined;
   }
   async list(host?: string) { const now = Date.now(); return (await this.load()).filter((c) => (!host || c.host === host) && (c.expires === undefined || c.expires > now)); }

@@ -1,0 +1,1075 @@
+// One behavioral contract for local state machines and database adapters. Database-specific transaction barriers,
+// rollback/recovery failures and process tests supplement this suite; they must not replace it.
+import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
+import { test, type TestContext } from 'node:test';
+import {
+  isAssertionSubjectError, isAssertionWindowError, isKeyActivationConflictError, isTransactionExpiredError, isTransactionTokenError, type AccessToken, type Agent, type AgentKey, type Client, type Code,
+  type ManagementAuthorization, type Owner, type Store, type Transaction, type TransitionEffects,
+} from '../src/store.js';
+
+export interface StoreContractFixture {
+  store: Store;
+  /** A second connection to the same database, or the same MemoryStore. */
+  peer: Store;
+  now(): number;
+  /** Advance the adapter's authoritative test clock before resolving. */
+  advance(seconds: number): Promise<void>;
+  close?(): void | Promise<void>;
+}
+export type StoreContractFactory = (t: TestContext) => Promise<StoreContractFixture>;
+
+const hash = (value: string) => createHash('sha256').update(value).digest('base64url');
+
+async function subject(f: StoreContractFixture, label = 'first', ownerId = 'owner') {
+  const now = f.now();
+  const owner: Owner = { id: ownerId, ownerSub: `sub-${ownerId}`, email: `${ownerId}@example.test`, emailVerified: true,
+    verifiedVia: 'passkey', createdAt: now };
+  await f.store.putOwner(owner);
+  const agent: Agent = { handle: `${label}@example.test`, local: label, domain: 'example.test', sub: `identity-${label}`,
+    ownerId, preferredUsername: label, enabled: true, authorizationVersion: 0, createdAt: now };
+  assert.equal(await f.store.putAgent(agent), true);
+  const authorization: ManagementAuthorization = { hash: hash(`credential-${label}`), ownerId, kind: 'owner',
+    sessionAuth: 'passkey', agentSub: agent.sub, createdAt: now };
+  await f.store.putCredential(authorization);
+  const pending: AgentKey = { kid: hash(`key-${label}`), enrollment: `enrollment-${label}`, agentSub: agent.sub,
+    handle: agent.handle, status: 'pending', permissions: { share_owner: false }, createdAt: now, expiresAt: now + 3600,
+    challenge: { value: `challenge-${label}`, expiresAt: now + 60 }, jwk: { kty: 'EC', crv: 'P-256', x: hash(`x-${label}`), y: hash(`y-${label}`) } };
+  assert.equal(await f.store.insertKey(pending, now, authorization), 'ok');
+  assert.equal(await f.store.activateKey(pending.kid, pending.enrollment, pending.challenge!.value, now), true);
+  return { owner, agent, authorization, key: (await f.store.getKey(pending.kid))! };
+}
+
+type Subject = Awaited<ReturnType<typeof subject>>;
+async function client(f: StoreContractFixture, maxSignups = 1): Promise<Client> {
+  const record: Client = { clientId: 'client', type: 'registered', redirectUris: ['https://rp.example/cb'],
+    tokenEndpointAuthMethod: 'none', requireReview: false, maxSignupsPerOwner: maxSignups };
+  await f.store.putClient(record);
+  return record;
+}
+
+async function pending(f: StoreContractFixture, c: Client, id: string, ttl = 300, maxAge?: number): Promise<Transaction> {
+  const tx: Transaction = { id, version: 0, clientId: c.clientId, redirectUri: c.redirectUris[0]!, scopes: ['openid'],
+    state: `state-${id}`, nonce: `nonce-${id}`, codeChallenge: hash(`pkce-${id}`), disclosure: [], clientPresentation: { type: c.type }, status: 'awaiting_agent',
+    challenge: `challenge-${id}`, createdAt: f.now(), expiresAt: f.now() + ttl, acceptDisclosure: false,
+    deliverToSession: false, ownerApprovalOutstanding: false, reviewOutstanding: false, passedCap: false,
+    sessionSecretHash: hash(`session-${id}`), continueSecret: `continue-${id}`, codeIssued: false, ...(maxAge === undefined ? {} : { maxAge }) };
+  await f.store.insertTransaction(tx);
+  return tx;
+}
+
+function asserted(f: StoreContractFixture, tx: Transaction, s: Subject): Transaction {
+  return { ...tx, status: 'ready', challenge: undefined, handle: s.agent.handle, kid: s.key.kid,
+    keyEnrollment: s.key.enrollment, agentSub: s.agent.sub, agentVersion: s.agent.authorizationVersion,
+    accountVersion: 0, ownerId: s.owner.id, assertedAt: f.now(), transactionTokenHash: hash(`assertion-${tx.id}`) };
+}
+
+async function ready(f: StoreContractFixture, c: Client, s: Subject, id: string, effects: Partial<TransitionEffects> = {}) {
+  const tx = await pending(f, c, id);
+  const accepted = await f.store.updateTransaction(asserted(f, tx, s), tx.version, { now: f.now(), maxSignups: c.maxSignupsPerOwner, ...effects });
+  assert.ok(accepted);
+  return accepted;
+}
+
+function codeFor(f: StoreContractFixture, tx: Transaction, suffix = ''): Code {
+  return { hash: hash(`code-${tx.id}${suffix}`), txnId: tx.id, clientId: tx.clientId, redirectUri: tx.redirectUri,
+    codeChallenge: tx.codeChallenge, nonce: tx.nonce, scopes: tx.scopes, handle: tx.handle!, kid: tx.kid!,
+    keyEnrollment: tx.keyEnrollment!, agentSub: tx.agentSub!, agentVersion: tx.agentVersion!, accountVersion: tx.accountVersion!,
+    authTime: tx.assertedAt!, expiresAt: f.now() + 60, used: false, voided: false };
+}
+
+async function complete(f: StoreContractFixture, tx: Transaction) {
+  const code = codeFor(f, tx);
+  const result = await f.store.completeTransaction({ ...tx, status: 'completed', codeIssued: true }, tx.version, code, f.now());
+  assert.equal(result?.status, 'completed');
+  return code;
+}
+
+function tokenFor(f: StoreContractFixture, code: Code, label = 'token'): AccessToken {
+  return { hash: hash(label), txnId: code.txnId, clientId: code.clientId, handle: code.handle, kid: code.kid,
+    keyEnrollment: code.keyEnrollment, agentSub: code.agentSub, agentVersion: code.agentVersion,
+    accountVersion: code.accountVersion, scopes: code.scopes, expiresAt: f.now() + 600, revoked: false };
+}
+
+export function registerStoreContract(name: string, factory: StoreContractFactory): void {
+  const check = (description: string, run: (f: StoreContractFixture) => Promise<void>) => {
+    test(`${name} store contract: ${description}`, async (t) => {
+      const f = await factory(t);
+      if (f.close) t.after(() => f.close!());
+      await run(f);
+    });
+  };
+
+  check('public transaction presentation survives persistence and cannot change on transition', async (f) => {
+    const a = await subject(f); const c = await client(f);
+    const base = await pending(f, c, 'presentation-base');
+    const tx = { ...base, id: 'presentation-pinned', sessionSecretHash: undefined, clientPresentation: { type: c.type, clientName: 'Displayed name', policyUri: 'https://rp.example/policy-a' } };
+    await f.store.insertTransaction(tx);
+    await f.peer.putClient({ ...c, clientName: 'Changed name', policyUri: 'https://rp.example/policy-b' });
+    const accepted = await f.peer.updateTransaction({ ...asserted(f, tx, a), clientPresentation: { type: c.type, policyUri: 'https://rp.example/policy-b' } }, tx.version, { now: f.now() });
+    assert.deepEqual(accepted?.clientPresentation, tx.clientPresentation);
+    assert.deepEqual((await f.store.readTransaction(tx.id, { now: f.now(), retainFor: 30 }))?.clientPresentation, tx.clientPresentation);
+    await complete(f, accepted!);
+    assert.deepEqual((await f.peer.getTransaction(tx.id))?.clientPresentation, tx.clientPresentation);
+  });
+
+  check('legacy presentation cancellation is bounded, preserves expiry and has fixed retention', async (f) => {
+    const c = await client(f);
+    const base = await pending(f, c, 'legacy-base');
+    const { clientPresentation: _pin, ...legacy } = { ...base, sessionSecretHash: undefined };
+    await f.store.insertTransaction({ ...legacy, id: 'legacy-a' });
+    await f.store.insertTransaction({ ...legacy, id: 'legacy-b', expiresAt: f.now() + 1 });
+    await f.store.insertTransaction({ ...legacy, id: 'legacy-terminal', status: 'denied', reason: 'cancelled', terminalAt: f.now() });
+    await f.advance(2);
+    const before = await f.peer.listLegacyTransactions(1);
+    assert.equal(before.length, 1);
+    for (;;) {
+      const batch = await f.peer.listLegacyTransactions(1);
+      if (!batch.length) break;
+      assert.equal(batch.length, 1);
+      const tx = batch[0]!;
+      await f.store.updateTransaction({ ...tx, status: 'denied', reason: 'access_denied', terminalAt: f.now(), challenge: undefined }, tx.version, { now: f.now() });
+    }
+    const denied = (await f.store.getTransaction('legacy-a'))!;
+    assert.equal(denied.status, 'denied');
+    assert.equal(denied.terminalAt, f.now());
+    const expired = (await f.store.getTransaction('legacy-b'))!;
+    assert.equal(expired.status, 'expired');
+    assert.equal(expired.terminalAt, base.createdAt + 1);
+    await f.advance(31);
+    assert.deepEqual(await f.peer.listLegacyTransactions(256), []);
+    assert.equal((await f.store.getTransaction('legacy-a'))?.terminalAt, denied.terminalAt);
+    assert.equal(await f.peer.readTransaction('legacy-a', { now: f.now(), retainFor: 30 }), undefined);
+    assert.equal((await f.store.getTransaction('legacy-terminal'))?.reason, 'cancelled');
+  });
+
+  check('legacy unpinned assertions and completions cannot gain authority', async (f) => {
+    const a = await subject(f); const c = await client(f);
+    const base = await pending(f, c, 'legacy-authority-base');
+    const { clientPresentation: _pin, ...legacy } = { ...base, id: 'legacy-assertion', sessionSecretHash: undefined };
+    await f.store.insertTransaction(legacy);
+    await assert.rejects(f.peer.updateTransaction(asserted(f, legacy, a), legacy.version, { now: f.now() }), isTransactionExpiredError);
+    const readyLegacy = asserted(f, { ...legacy, id: 'legacy-completion' }, a);
+    await f.store.insertTransaction(readyLegacy);
+    const code = codeFor(f, readyLegacy);
+    const completed = await f.peer.completeTransaction({ ...readyLegacy, status: 'completed' }, readyLegacy.version, code, f.now());
+    assert.equal(completed?.status, 'denied');
+    assert.equal(completed?.reason, 'access_denied');
+    assert.equal(await f.store.getCode(code.hash), undefined);
+    assert.equal(await f.store.getAccount(a.agent.handle, c.clientId), undefined);
+  });
+
+  check('verified address quotas share pending capacity and permanent counts without folding local-part case', async(f)=>{
+    const c=await client(f,1);
+    const a=await subject(f,'first','owner-a'),b=await subject(f,'second','owner-b'),different=await subject(f,'third','owner-c');
+    await f.store.putOwner({...a.owner,email:'Person@EXAMPLE.test'},f.now());
+    await f.store.putOwner({...b.owner,email:'"Person"@example.test'},f.now());
+    await f.store.putOwner({...different.owner,email:'person@example.test'},f.now());
+    assert.ok([a.owner.id,b.owner.id].includes((await f.store.getOwnerByEmail('Person@example.TEST'))!.id));
+    const first=await ready(f,c,a,'address-first');
+    assert.equal((await ready(f,c,b,'address-second')).reason,'signup_limit_reached');
+    assert.equal((await ready(f,c,different,'address-case')).status,'ready');
+    await complete(f,first);
+    assert.equal(await f.peer.signupsEver(b.owner.id,c.clientId),1);
+  });
+  check('address changes inherit each account once and deleted-owner expiry cannot erase live inherited history',async(f)=>{
+    const c=await client(f,10),a=await subject(f,'first','owner-a'),b=await subject(f,'second','owner-b');
+    await complete(f,await ready(f,c,a,'old-address'));
+    await complete(f,await ready(f,c,b,'new-address'));
+    await f.store.putOwner({...b.owner,email:a.owner.email},f.now());
+    assert.equal(await f.peer.signupsEver(a.owner.id,c.clientId),2);
+    assert.equal(await f.peer.signupsEver(b.owner.id,c.clientId),2);
+    await f.store.putOwner(b.owner,f.now());
+    await f.store.putOwner({...b.owner,email:a.owner.email},f.now());
+    assert.equal(await f.peer.signupsEver(b.owner.id,c.clientId),2);
+    assert.equal(await f.store.deleteOwner(a.owner.id,a.owner.ownerSub,f.now(),10),true);
+    await f.advance(11);
+    await f.store.putOwner(b.owner,f.now());
+    assert.equal(await f.peer.signupsEver(b.owner.id,c.clientId),2);
+    const fresh={...a.owner,id:'fresh-owner',ownerSub:'fresh-sub',createdAt:f.now()};
+    await f.store.putOwner(fresh,f.now());
+    assert.equal(await f.peer.signupsEver(fresh.id,c.clientId),0);
+    await assert.rejects(f.store.putOwner(a.owner,f.now()),/identity/);
+  });
+  check('Account recreation consumes another signup and inherited creation counts cannot be reset',async(f)=>{
+    const c=await client(f,2),a=await subject(f,'first','owner-a'),b=await subject(f,'second','owner-b');
+    await complete(f,await ready(f,c,a,'account-first-creation'));
+    await f.store.deleteAccount(a.agent.handle,c.clientId);
+    assert.equal(await f.peer.signupsEver(a.owner.id,c.clientId),1);
+    await complete(f,await ready(f,c,a,'account-second-creation'));
+    assert.equal(await f.peer.signupsEver(a.owner.id,c.clientId),2);
+    await f.store.deleteAccount(a.agent.handle,c.clientId);
+    assert.equal((await ready(f,c,a,'account-third-creation')).reason,'signup_limit_reached');
+    assert.equal(await f.peer.getAccount(a.agent.handle,c.clientId),undefined);
+    await f.store.putOwner({...b.owner,email:a.owner.email},f.now());
+    assert.equal(await f.peer.signupsEver(b.owner.id,c.clientId),2);
+    await f.store.putOwner(b.owner,f.now());
+    await f.store.putOwner({...b.owner,email:a.owner.email},f.now());
+    assert.equal(await f.peer.signupsEver(b.owner.id,c.clientId),2);
+    await f.store.deleteOwner(a.owner.id,a.owner.ownerSub,f.now(),0);
+    assert.equal((await ready(f,c,b,'inherited-account-creation')).reason,'signup_limit_reached');
+    assert.equal(await f.peer.signupsEver(b.owner.id,c.clientId),2);
+  });
+  check('Account deletion after assertion cannot bypass an exhausted signup cap',async(f)=>{
+    const c=await client(f,1),a=await subject(f);
+    await complete(f,await ready(f,c,a,'existing-account'));
+    const returning=await ready(f,c,a,'returning-account');
+    assert.equal(returning.passedCap,false);
+    await f.peer.deleteAccount(a.agent.handle,c.clientId);
+    const proposed=codeFor(f,returning);
+    const denied=await f.store.completeTransaction(returning,returning.version,proposed,f.now());
+    assert.equal(denied?.reason,'signup_limit_reached');
+    assert.equal(await f.peer.getCode(proposed.hash),undefined);
+    assert.equal(await f.peer.getAccount(a.agent.handle,c.clientId),undefined);
+    assert.equal(await f.peer.signupsEver(a.owner.id,c.clientId),1);
+  });
+  check('Account deletion after assertion cannot take another Agent pending signup place',async(f)=>{
+    const c=await client(f,2),a=await subject(f,'first'),b=await subject(f,'second');
+    await complete(f,await ready(f,c,a,'existing-account'));
+    const returning=await ready(f,c,a,'returning-account');
+    const admitted=await ready(f,c,b,'other-agent');
+    assert.equal(returning.passedCap,false);
+    assert.equal(admitted.passedCap,true);
+    await f.peer.deleteAccount(a.agent.handle,c.clientId);
+    const proposed=codeFor(f,returning);
+    const denied=await f.store.completeTransaction(returning,returning.version,proposed,f.now());
+    assert.equal(denied?.reason,'signup_limit_reached');
+    assert.equal(await f.peer.getCode(proposed.hash),undefined);
+    await complete(f,admitted);
+    assert.equal(await f.peer.signupsEver(a.owner.id,c.clientId),2);
+    assert.equal(await f.peer.getAccount(a.agent.handle,c.clientId),undefined);
+  });
+  check('an admitted sibling cannot reuse its reservation after Account creation and deletion to take another Agent place',async(f)=>{
+    const c=await client(f,2),a=await subject(f,'first'),b=await subject(f,'second');
+    const first=await ready(f,c,a,'first-account-creation');
+    const sibling=await ready(f,c,a,'admitted-sibling');
+    assert.equal(first.passedCap,true);
+    assert.equal(sibling.passedCap,true);
+    await complete(f,first);
+    const other=await ready(f,c,b,'other-agent-reservation');
+    assert.equal(other.passedCap,true);
+    await f.peer.deleteAccount(a.agent.handle,c.clientId);
+
+    const proposed=codeFor(f,sibling);
+    const denied=await f.peer.completeTransaction(sibling,sibling.version,proposed,f.now());
+    assert.equal(denied?.status,'denied');
+    assert.equal(denied?.reason,'signup_limit_reached');
+    assert.equal(await f.store.getCode(proposed.hash),undefined);
+    assert.equal(await f.store.getAccount(a.agent.handle,c.clientId),undefined);
+    assert.equal(await f.store.signupsEver(a.owner.id,c.clientId),1);
+    assert.equal((await f.store.getTransaction(other.id))?.status,'ready');
+    await complete(f,other);
+    assert.equal(await f.peer.signupsEver(a.owner.id,c.clientId),2);
+    assert.equal((await f.peer.getAccount(b.agent.handle,c.clientId))?.signInCount,1);
+  });
+  check('completion revalidates previously admitted capacity after verified addresses merge',async(f)=>{
+    const c=await client(f,1),a=await subject(f,'first','owner-a'),b=await subject(f,'second','owner-b');
+    const first=await ready(f,c,a,'before-address-merge-a');
+    const other=await ready(f,c,b,'before-address-merge-b');
+    assert.equal(first.passedCap,true);
+    assert.equal(other.passedCap,true);
+    await f.peer.putOwner({...b.owner,email:a.owner.email},f.now());
+
+    const proposed=codeFor(f,first);
+    const denied=await f.store.completeTransaction(first,first.version,proposed,f.now());
+    assert.equal(denied?.status,'denied');
+    assert.equal(denied?.reason,'signup_limit_reached');
+    assert.equal(await f.peer.getCode(proposed.hash),undefined);
+    assert.equal(await f.peer.getAccount(a.agent.handle,c.clientId),undefined);
+    assert.equal(await f.peer.signupsEver(a.owner.id,c.clientId),0);
+    assert.equal((await f.peer.getTransaction(other.id))?.status,'ready');
+    await complete(f,other);
+    assert.equal(await f.peer.signupsEver(a.owner.id,c.clientId),1);
+    assert.equal(await f.peer.signupsEver(b.owner.id,c.clientId),1);
+  });
+  check('concurrent completions after Account deletion consume only one remaining signup place',async(f)=>{
+    const c=await client(f,2),a=await subject(f);
+    await complete(f,await ready(f,c,a,'existing-account'));
+    const first=await ready(f,c,a,'returning-first'),second=await ready(f,c,a,'returning-second');
+    assert.equal(first.passedCap,false);
+    assert.equal(second.passedCap,false);
+    await f.peer.deleteAccount(a.agent.handle,c.clientId);
+    const results=await Promise.all([
+      f.store.completeTransaction(first,first.version,codeFor(f,first),f.now()),
+      f.peer.completeTransaction(second,second.version,codeFor(f,second),f.now()),
+    ]);
+    assert.deepEqual(results.map((result)=>result?.status),['completed','completed']);
+    assert.equal(await f.peer.signupsEver(a.owner.id,c.clientId),2);
+    assert.equal((await f.peer.getAccount(a.agent.handle,c.clientId))?.signInCount,2);
+  });
+  check('Owner deletion retains only counts for its fixed period and never credentials or Agent identity',async(f)=>{
+    const c=await client(f,10),a=await subject(f);
+    const code=await complete(f,await ready(f,c,a,'before-owner-deletion'));
+    assert.equal(await f.store.deleteOwner(a.owner.id,'wrong-sub',f.now(),10),false);
+    assert.equal(await f.store.deleteOwner(a.owner.id,a.owner.ownerSub,f.now(),10),true);
+    assert.equal(await f.peer.getOwner(a.owner.id),undefined);
+    assert.equal(await f.peer.getAgent(a.agent.handle),undefined);
+    assert.equal(await f.peer.getCredential(a.authorization.hash),undefined);
+    assert.notEqual(await f.peer.redeemCode(code.hash,f.now()),'ok');
+    const fresh={...a.owner,id:'new-owner',ownerSub:'new-sub',createdAt:f.now()};
+    await f.store.putOwner(fresh,f.now());
+    assert.equal(await f.peer.signupsEver(fresh.id,c.clientId),1);
+    assert.equal(await f.store.deleteOwner(fresh.id,fresh.ownerSub,f.now(),0),true);
+    await f.advance(10);
+    await f.store.putOwner({...fresh,id:'third-owner',ownerSub:'third-sub'},f.now());
+    assert.equal(await f.peer.signupsEver('third-owner',c.clientId),0);
+  });
+  check('merging addresses after admission rechecks completed Account counts at completion',async(f)=>{
+    const c=await client(f,1),a=await subject(f,'first','owner-a'),b=await subject(f,'second','owner-b');
+    const first=await ready(f,c,a,'merge-first'),second=await ready(f,c,b,'merge-second');
+    await complete(f,first);
+    await f.store.putOwner({...b.owner,email:a.owner.email},f.now());
+    const denied=await f.store.completeTransaction(second,second.version,codeFor(f,second),f.now());
+    assert.equal(denied?.reason,'signup_limit_reached');
+    assert.equal(await f.peer.signupsEver(b.owner.id,c.clientId),1);
+  });
+  check('signing-key publication, rotation overlap and emergency withdrawal are shared and irreversible',async(f)=>{
+    const first={kid:'first',publicJwk:{kty:'EC',crv:'P-256',x:'first-x',y:'first-y'}};
+    const second={kid:'second',publicJwk:{kty:'EC',crv:'P-256',x:'second-x',y:'second-y'}};
+    await f.store.publishSigningKeys([first],first.kid,f.now(),100);
+    const issued=await f.peer.reserveSigningKey(f.now()+600,f.now());
+    assert.equal(issued?.kid,first.kid);
+    await f.store.publishSigningKeys([second],second.kid,f.now(),100);
+    assert.equal(await f.peer.activateSigningKey(second.kid,f.now()),false);
+    await f.advance(1);
+    assert.equal(await f.peer.activateSigningKey(second.kid,f.now()),true);
+    assert.equal((await f.store.reserveSigningKey(f.now()+600,f.now()))?.kid,second.kid);
+    assert.equal(await f.store.removeSigningKey(first.kid,false,f.now()),false);
+    assert.equal(await f.store.removeSigningKey(second.kid,true,f.now()),true);
+    assert.equal(await f.peer.reserveSigningKey(f.now()+600,f.now()),undefined);
+    assert.equal((await f.peer.listSigningKeys()).some((k)=>k.kid===second.kid),false);
+    await assert.rejects(f.store.publishSigningKeys([second],second.kid,f.now(),100),/republished/);
+    await assert.rejects(f.store.publishSigningKeys([{...first,publicJwk:second.publicJwk}],first.kid,f.now(),100),/reused/);
+    await f.advance(1000);
+    assert.equal(await f.peer.removeSigningKey(first.kid,false,f.now()),true);
+  });
+  check('new signing keys inherit the longest JWKS cache policy declared by any replica',async(f)=>{
+    const key=(kid:string)=>({kid,publicJwk:{kty:'EC',crv:'P-256',x:`${kid}-x`,y:`${kid}-y`}});
+    await f.store.publishSigningKeys([key('long-cache')],'long-cache',f.now(),3600);
+    await f.peer.publishSigningKeys([key('short-cache')],'short-cache',f.now(),0);
+    assert.equal((await f.store.listSigningKeys()).find((entry)=>entry.kid==='short-cache')?.cacheLifetime,3600);
+    await f.advance(1);
+    assert.equal(await f.peer.activateSigningKey('short-cache',f.now()),true);
+    const expiresAt=f.now()+600;
+    await f.peer.reserveSigningKey(expiresAt,f.now());
+    await f.peer.publishSigningKeys([key('next')],'next',f.now(),0);
+    await f.advance(1);
+    assert.equal(await f.peer.activateSigningKey('next',f.now()),true);
+    await f.advance(600);
+    assert.equal(await f.peer.removeSigningKey('short-cache',false,f.now()),false);
+    await f.advance(3660);
+    assert.equal(await f.peer.removeSigningKey('short-cache',false,f.now()),true);
+    await f.store.publishSigningKeys([key('next')],'next',f.now(),7200);
+    assert.ok((await f.peer.listSigningKeys()).every((entry)=>entry.cacheLifetime===7200));
+    await f.peer.publishSigningKeys([key('later')],'later',f.now(),0);
+    assert.equal((await f.store.listSigningKeys()).find((entry)=>entry.kid==='later')?.cacheLifetime,7200);
+  });
+  check('authentication age and first assertion time stay immutable through transitions and code binding', async (f) => {
+    const a = await subject(f); const c = await client(f);
+    const original = await pending(f, c, 'immutable-authentication-age', 300, 10);
+    const authTime = f.now();
+    const tx = (await f.store.updateTransaction({ ...asserted(f, original, a), maxAge: 0, assertedAt: authTime + 100 }, 0,
+      { now: f.now(), maxSignups: 1 }))!;
+    assert.equal(tx.assertedAt, authTime);
+    assert.equal(tx.maxAge, 10);
+    await f.advance(3);
+    const updated = (await f.peer.updateTransaction({ ...tx, assertedAt: f.now(), maxAge: undefined }, tx.version, { now: f.now() }))!;
+    assert.equal(updated.assertedAt, authTime, 'review, approval and retry never refresh authentication');
+    assert.equal(updated.maxAge, 10);
+    await f.advance(7);
+    const proposedCode = { ...codeFor(f, updated), maxAge: 0, authTime: f.now() };
+    const completed = await f.store.completeTransaction({ ...updated, maxAge: 0, assertedAt: f.now() }, updated.version, proposedCode, f.now());
+    assert.equal(completed?.status, 'completed', 'positive age equality is allowed');
+    const code = (await f.peer.getCode(proposedCode.hash))!;
+    assert.equal(code.maxAge, 10);
+    assert.equal(code.authTime, authTime);
+    assert.equal(await f.peer.redeemCode(code.hash, f.now()), 'ok');
+    assert.equal(await f.store.insertAccessToken(tokenFor(f, code), f.now()), true);
+  });
+
+  check('stale authentication denies completion without code or account and releases only its own reservation', async (f) => {
+    const a = await subject(f); const b = await subject(f, 'second'); const c = await client(f);
+    const original = await pending(f, c, 'stale-authentication', 300, 1);
+    const tx = (await f.store.updateTransaction(asserted(f, original, a), 0, { now: f.now(), maxSignups: 1 }))!;
+    const sibling = await ready(f, c, a, 'same-agent-reservation');
+    await f.advance(2);
+    const deniedAt = f.now();
+    const code = codeFor(f, tx);
+    const result = await f.peer.completeTransaction({ ...tx, maxAge: 0, assertedAt: f.now() }, tx.version, { ...code, authTime: f.now(), maxAge: 0 }, f.now());
+    assert.equal(result?.status, 'denied');
+    assert.equal(result?.reason, 'login_required');
+    assert.equal(result?.terminalAt, deniedAt);
+    assert.equal(result?.expiresAt, tx.expiresAt);
+    assert.equal(result?.assertedAt, tx.assertedAt);
+    assert.equal(await f.store.getCode(code.hash), undefined);
+    assert.equal(await f.store.getAccount(a.agent.handle, c.clientId), undefined);
+    assert.equal(await f.store.signupsEver(a.owner.id, c.clientId), 0);
+    assert.equal((await ready(f, c, b, 'other-agent-blocked')).reason, 'signup_limit_reached', 'sibling reservation still holds capacity');
+    await f.peer.updateTransaction({ ...sibling, status: 'denied', reason: 'cancelled' }, sibling.version, { now: f.now() });
+    assert.equal((await ready(f, c, b, 'other-agent-admitted')).status, 'ready', 'stale transaction did not leave a reservation');
+    await f.advance(31);
+    assert.equal(await f.store.readTransaction(tx.id, { now: f.now(), retainFor: 30 }), undefined);
+    assert.equal((await f.peer.getTransaction(tx.id))?.terminalAt, deniedAt);
+  });
+
+  check('authentication age is rechecked at code redemption and token insertion', async (f) => {
+    const a = await subject(f); const c = await client(f);
+    const codes: Code[] = [];
+    for (const id of ['redeem-late', 'insert-late']) {
+      const tx = await pending(f, c, id, 300, 10);
+      const accepted = (await f.store.updateTransaction(asserted(f, tx, a), 0, { now: f.now(), maxSignups: 1 }))!;
+      codes.push(await complete(f, accepted));
+    }
+    await f.advance(10);
+    assert.equal(await f.store.redeemCode(codes[1]!.hash, f.now()), 'ok', 'redemption accepts equality');
+    await f.advance(1);
+    assert.equal(await f.peer.redeemCode(codes[0]!.hash, f.now()), 'expired');
+    assert.equal((await f.store.getCode(codes[0]!.hash))?.used, false);
+    const token = tokenFor(f, codes[1]!);
+    assert.equal(await f.peer.insertAccessToken(token, f.now()), false);
+    assert.equal(await f.store.getAccessToken(token.hash), undefined);
+  });
+
+  for (const maxAge of [0, undefined]) {
+    check(`${maxAge === 0 ? 'zero' : 'absent'} max_age permits delayed approval and preserves original authentication`, async (f) => {
+      const a = await subject(f); const c = await client(f);
+      const tx = await pending(f, c, 'delayed-approval', 300, maxAge);
+      const accepted = (await f.store.updateTransaction({ ...asserted(f, tx, a), status: 'awaiting_owner', ownerApprovalOutstanding: true }, 0, { now: f.now(), maxSignups: 1 }))!;
+      await f.advance(60);
+      const approved = (await f.peer.updateTransaction({ ...accepted, status: 'ready', ownerApprovalOutstanding: false, assertedAt: f.now(), maxAge: 1 }, accepted.version, { now: f.now() }))!;
+      assert.equal(approved.assertedAt, accepted.assertedAt);
+      assert.equal(approved.maxAge, maxAge, 'legacy transactions cannot acquire a caller-supplied age bound');
+      const code = await complete(f, approved);
+      await f.advance(30);
+      assert.equal(await f.store.redeemCode(code.hash, f.now()), 'ok');
+      assert.equal(await f.peer.insertAccessToken(tokenFor(f, code), f.now()), true);
+      assert.equal((await f.store.getCode(code.hash))?.authTime, accepted.assertedAt);
+    });
+  }
+
+  check('records are copied and handle identity cannot be overwritten or reused by stale authorization', async (f) => {
+    const s = await subject(f);
+    const owner = (await f.peer.getOwner(s.owner.id))!;
+    owner.email = 'changed@example.test';
+    assert.equal((await f.store.getOwner(s.owner.id))?.email, s.owner.email);
+    assert.equal(await f.peer.putAgent({ ...s.agent, sub: 'replacement' }), false);
+    assert.equal(await f.peer.deleteAgent(s.agent.handle, 'wrong-identity', f.now()), false);
+    assert.equal(await f.peer.deleteAgent(s.agent.handle, s.agent.sub, f.now()), true);
+    assert.equal(await f.peer.putAgent({ ...s.agent, sub: 'replacement' }), true);
+    assert.equal(await f.store.insertKey({ ...s.key, kid: hash('fresh-key'), enrollment: 'fresh-enrollment' }, f.now(), s.authorization), 'unauthorized');
+    assert.equal((await f.store.getAgent(s.agent.handle))?.sub, 'replacement');
+  });
+
+  check('immutable subjects and transaction IDs cannot be reused to overwrite existing identities', async (f) => {
+    const a = await subject(f); const c = await client(f);
+    await assert.rejects(f.peer.putOwner({ ...a.owner, ownerSub: 'changed-owner-subject' }));
+    assert.equal((await f.store.getOwner(a.owner.id))?.ownerSub, a.owner.ownerSub);
+    assert.equal(await f.peer.putAgent({ ...a.agent, handle: 'other@example.test', local: 'other' }), false);
+    const tx = await pending(f, c, 'unique-transaction');
+    await assert.rejects(f.peer.insertTransaction({ ...tx, nonce: 'replacement-nonce' }));
+    assert.equal((await f.store.getTransaction(tx.id))?.nonce, tx.nonce);
+  });
+
+  check('management snapshots and individual key mutations reject revoked credentials and permission downgrades', async (f) => {
+    const a = await subject(f); const b = await subject(f, 'second'); const c = await client(f);
+    await complete(f, await ready(f, c, a, 'management-account'));
+    const credential = { hash: hash('delegated'), ownerId: a.owner.id, kind: 'delegated' as const, handle: a.agent.handle, createdAt: f.now() };
+    await f.store.putCredential(credential);
+    assert.equal(await f.peer.resolveManagement('missing', a.agent.handle), 'invalid_token');
+    assert.equal(await f.peer.resolveManagement(credential.hash, b.agent.handle), 'not_found');
+    const authorization = await f.peer.resolveManagement(credential.hash, a.agent.handle);
+    assert.ok(typeof authorization !== 'string');
+    assert.equal(authorization.agentSub, a.agent.sub);
+    assert.equal((await f.peer.readManagementKeys(a.agent.handle, authorization, a.key.kid))?.[0]?.enrollment, a.key.enrollment);
+    assert.equal((await f.peer.readManagementAccounts(a.agent.handle, authorization))?.[0]?.clientId, c.clientId);
+    assert.equal(await f.peer.readManagementKeys(b.agent.handle, authorization), undefined);
+    assert.deepEqual(await f.peer.readManagementKeys(a.agent.handle, authorization, 'unknown-key'), []);
+    assert.equal(await f.store.patchKey(a.key.kid, a.key.enrollment, { shareOwner: true }, authorization), undefined, 'delegated credentials never grant Owner disclosure');
+    await f.peer.deleteCredential(credential.hash);
+    assert.equal(await f.store.resolveManagement(credential.hash, a.agent.handle), 'invalid_token');
+    assert.equal(await f.store.readManagementKeys(a.agent.handle, authorization), undefined);
+    assert.equal(await f.store.readManagementAccounts(a.agent.handle, authorization), undefined);
+    assert.equal(await f.store.patchKey(a.key.kid, a.key.enrollment, { name: 'stale' }, authorization), undefined);
+    assert.equal(await f.store.revokeKey(a.key.kid, a.key.enrollment, f.now(), authorization), undefined);
+    assert.deepEqual(await f.peer.getKey(a.key.kid, a.agent.handle), a.key);
+
+    await f.peer.putCredential({ ...a.authorization, sessionAuth: 'email_only' });
+    assert.equal(await f.store.patchKey(a.key.kid, a.key.enrollment, { shareOwner: true }, a.authorization), undefined);
+    assert.equal(await f.store.readManagementKeys(a.agent.handle, a.authorization), undefined, 'changed session authorization invalidates the old snapshot');
+    const weaker = await f.store.resolveManagement(a.authorization.hash, a.agent.handle);
+    assert.ok(typeof weaker !== 'string');
+    assert.equal(await f.store.patchKey(a.key.kid, a.key.enrollment, { shareOwner: true }, weaker), undefined);
+    assert.equal((await f.store.patchKey(a.key.kid, a.key.enrollment, { name: 'fresh' }, weaker))?.name, 'fresh');
+    assert.equal((await f.store.revokeKey(a.key.kid, a.key.enrollment, f.now(), weaker))?.status, 'revoked');
+    assert.equal((await f.store.revokeKey(a.key.kid, a.key.enrollment, f.now(), weaker))?.status, 'revoked', 'an authorized repeat remains idempotent');
+  });
+
+  check('management authorization cannot be rebound across Agent replacement even under the same Owner', async (f) => {
+    const a = await subject(f);
+    const authorization = await f.store.resolveManagement(a.authorization.hash, a.agent.handle);
+    assert.ok(typeof authorization !== 'string');
+    assert.equal(await f.peer.deleteAgent(a.agent.handle, a.agent.sub, f.now()), true);
+    const replacement = { ...a.agent, sub: 'replacement-identity' };
+    assert.equal(await f.peer.putAgent(replacement), true);
+    const fresh = await f.peer.resolveManagement(a.authorization.hash, a.agent.handle);
+    assert.ok(typeof fresh !== 'string');
+    assert.equal(fresh.agentSub, replacement.sub);
+    const key: AgentKey = { ...a.key, kid: hash('replacement-management-key'), agentSub: replacement.sub,
+      enrollment: 'replacement-management-enrollment', status: 'pending', challenge: { value: 'proof', expiresAt: f.now() + 60 } };
+    assert.equal(await f.peer.insertKey(key, f.now(), fresh), 'ok');
+    assert.equal(await f.store.readManagementKeys(a.agent.handle, authorization), undefined);
+    assert.equal(await f.store.readManagementAccounts(a.agent.handle, authorization), undefined);
+    assert.equal(await f.store.patchKey(key.kid, key.enrollment, { name: 'stale' }, authorization), undefined);
+    assert.equal(await f.store.revokeKey(key.kid, key.enrollment, f.now(), authorization), undefined);
+    assert.deepEqual(await f.peer.getKey(key.kid, a.agent.handle), key);
+    assert.equal((await f.store.readManagementKeys(a.agent.handle, fresh))?.[0]?.enrollment, key.enrollment);
+  });
+
+  check('pending public keys do not reserve exclusivity and concurrent proofs activate only one Agent', async (f) => {
+    const a = await subject(f); const b = await subject(f, 'second');
+    const kid = hash('shared-unproved-key');
+    const attempts = [a, b].map((s): AgentKey => ({ ...s.key, kid, enrollment: `shared-${s.agent.sub}`, status: 'pending',
+      challenge: { value: `proof-${s.agent.sub}`, expiresAt: f.now() + 60 } }));
+    for (const [index, s] of [a, b].entries()) assert.equal(await f.store.insertKey(attempts[index]!, f.now(), s.authorization), 'ok');
+    assert.equal(await f.store.getKey(kid), undefined, 'an unscoped lookup must not pick an arbitrary pending enrollment');
+    assert.equal((await f.store.getKey(kid, a.agent.handle))?.enrollment, attempts[0]!.enrollment);
+    assert.equal((await f.peer.getKey(kid, b.agent.handle))?.enrollment, attempts[1]!.enrollment);
+    const results = await Promise.allSettled(attempts.map((key, i) => [f.store, f.peer][i]!.activateKey(kid, key.enrollment, key.challenge!.value, f.now())));
+    assert.equal(results.filter((result) => result.status === 'fulfilled' && result.value).length, 1);
+    const conflict = results.find((result) => result.status === 'rejected');
+    assert.ok(conflict?.status === 'rejected' && isKeyActivationConflictError(conflict.reason));
+    const records = await Promise.all([a, b].map((s) => f.store.getKey(kid, s.agent.handle)));
+    assert.equal(records.filter((key) => key?.status === 'active').length, 1);
+    assert.equal(records.filter((key) => key?.status === 'pending').length, 1, 'a losing proof does not consume its challenge');
+    assert.equal((await f.store.getKey(kid))?.enrollment, records.find((key) => key?.status === 'active')?.enrollment);
+  });
+
+  check('active key conflicts are decided at proof, while stale cleanup and revocation stay scoped', async (f) => {
+    const a = await subject(f); const b = await subject(f, 'second');
+    const replacement: AgentKey = { ...a.key, handle: b.agent.handle, agentSub: b.agent.sub, enrollment: 'new-enrollment',
+      status: 'pending', challenge: { value: 'proof', expiresAt: f.now() + 60 }, expiresAt: f.now() + 7200 };
+    assert.equal(await f.peer.insertKey(replacement, f.now(), b.authorization), 'ok', 'insertion does not claim the active slot');
+    await assert.rejects(f.peer.activateKey(replacement.kid, replacement.enrollment, 'proof', f.now()), isKeyActivationConflictError);
+    assert.equal((await f.store.getKey(a.key.kid, a.agent.handle))?.status, 'active');
+    assert.equal((await f.store.getKey(a.key.kid, b.agent.handle))?.challenge?.value, 'proof');
+    await f.advance(3601);
+    const refreshed = { ...replacement, enrollment: 'refreshed-enrollment', challenge: { value: 'fresh-proof', expiresAt: f.now() + 60 } };
+    assert.equal(await f.peer.insertKey(refreshed, f.now(), b.authorization), 'ok');
+    assert.equal(await f.peer.activateKey(refreshed.kid, refreshed.enrollment, 'fresh-proof', f.now()), true);
+    assert.equal(await f.store.activateKey(replacement.kid, replacement.enrollment, 'proof', f.now()), false);
+    assert.equal((await f.store.revokeKey(a.key.kid, a.key.enrollment, f.now()))?.status, 'revoked');
+    assert.equal(await f.peer.wasRevoked(a.agent.handle, a.key.kid), true);
+    await f.store.deleteKey(a.key.kid, replacement.enrollment);
+    await f.store.deleteKey(a.key.kid, a.key.enrollment);
+    assert.equal((await f.store.getKey(a.key.kid, b.agent.handle))?.enrollment, refreshed.enrollment);
+    assert.equal((await f.store.getKey(a.key.kid))?.status, 'active');
+  });
+
+  check('individual revocation of a retired expired enrollment prevents reuse without changing other enrollments or retention', async (f) => {
+    const a = await subject(f); const b = await subject(f, 'second'); const c = await client(f);
+    const tx = await pending(f, c, 'retired-enrollment', 7200);
+    assert.equal((await f.store.updateTransaction(asserted(f, tx, a), tx.version, { now: f.now(), maxSignups: 1 }))?.status, 'ready');
+    await f.advance(3601);
+    const replacement: AgentKey = { ...a.key, handle: b.agent.handle, agentSub: b.agent.sub, enrollment: 'other-agent-enrollment',
+      status: 'pending', challenge: { value: 'proof', expiresAt: f.now() + 60 }, expiresAt: f.now() + 3600 };
+    assert.equal(await f.peer.insertKey(replacement, f.now(), b.authorization), 'ok');
+    assert.equal(await f.peer.activateKey(replacement.kid, replacement.enrollment, 'proof', f.now()), true);
+    assert.equal((await f.store.getKey(a.key.kid, a.agent.handle))?.status, 'expired');
+    const terminal = await f.store.getTransaction(tx.id);
+    assert.equal(terminal?.status, 'denied');
+    assert.equal(terminal?.reason, 'key_revoked');
+    assert.equal(terminal?.terminalAt, a.key.expiresAt);
+
+    // Bulk revocation names pending/active keys; an explicit individual revocation also covers this expired record.
+    assert.equal(await f.store.revokeAllKeys(a.agent.handle, a.authorization, f.now()), true);
+    assert.equal(await f.peer.wasRevoked(a.agent.handle, a.key.kid), false);
+    await f.advance(300);
+    assert.equal(await f.peer.readTransaction(tx.id, { now: f.now(), retainFor: 300 }), undefined);
+    const revoked = await f.store.revokeKey(a.key.kid, a.key.enrollment, f.now());
+    assert.equal(revoked?.status, 'revoked');
+    assert.equal(revoked?.enrollment, a.key.enrollment);
+    assert.equal(await f.peer.wasRevoked(a.agent.handle, a.key.kid), true);
+    assert.equal(await f.peer.wasRevoked(b.agent.handle, a.key.kid), false);
+    const { transactionTokenHash: _revoked, ...retained } = terminal!;
+    assert.deepEqual(await f.peer.getTransaction(tx.id), { ...retained, version: terminal!.version + 1 }, 'revocation removes bearer authority without changing the terminal outcome');
+    assert.equal(await f.peer.readTransaction(tx.id, { now: f.now(), retainFor: 300 }), undefined);
+    assert.equal((await f.peer.getKey(a.key.kid, b.agent.handle))?.status, 'active');
+    assert.equal((await f.peer.getKey(a.key.kid, b.agent.handle))?.enrollment, replacement.enrollment);
+    assert.equal(await f.store.insertKey({ ...replacement, handle: a.agent.handle, agentSub: a.agent.sub,
+      enrollment: 'revoked-reuse', challenge: { value: 'reuse', expiresAt: f.now() + 60 } }, f.now(), a.authorization), 'revoked');
+  });
+
+  check('revoking or deleting an unproved enrollment cannot affect another Agent using the same key', async (f) => {
+    const a = await subject(f); const b = await subject(f, 'second');
+    const unproved: AgentKey = { ...a.key, handle: b.agent.handle, agentSub: b.agent.sub, enrollment: 'unproved-other-agent',
+      status: 'pending', challenge: { value: 'unproved', expiresAt: f.now() + 60 } };
+    assert.equal(await f.peer.insertKey(unproved, f.now(), b.authorization), 'ok');
+    await f.peer.patchKey(unproved.kid, unproved.enrollment, { shareOwner: true, name: 'other label' });
+    assert.equal((await f.store.getKey(a.key.kid, a.agent.handle))?.permissions.share_owner, false);
+    assert.equal((await f.store.getKey(a.key.kid, a.agent.handle))?.name, undefined);
+    assert.equal((await f.peer.revokeKey(unproved.kid, unproved.enrollment, f.now()))?.status, 'revoked');
+    assert.equal(await f.peer.wasRevoked(b.agent.handle, a.key.kid), true);
+    assert.equal(await f.store.wasRevoked(a.agent.handle, a.key.kid), false);
+    await f.peer.deleteKey(unproved.kid, unproved.enrollment);
+    assert.equal((await f.store.getKey(a.key.kid, a.agent.handle))?.status, 'active');
+    const c = await client(f); const tx = await ready(f, c, a, 'still-active');
+    assert.equal(tx.status, 'ready');
+    await complete(f, tx);
+  });
+
+  check('delayed pending cleanup cannot delete a successfully activated enrollment', async (f) => {
+    const a = await subject(f);
+    const key: AgentKey = { ...a.key, kid: hash('pending-cleanup-race'), enrollment: 'pending-cleanup-race', status: 'pending',
+      challenge: { value: 'proof', expiresAt: f.now() + 10 } };
+    const unproved: AgentKey = { ...key, kid: hash('unproved-cleanup-control'), enrollment: 'unproved-cleanup-control' };
+    for (const candidate of [key, unproved]) assert.equal(await f.store.insertKey(candidate, f.now(), a.authorization), 'ok');
+    const stale = (await f.store.getKey(key.kid, a.agent.handle))!;
+    assert.equal(stale.status, 'pending');
+    await f.store.deleteKey(unproved.kid, unproved.enrollment, f.now());
+    assert.equal((await f.store.getKey(unproved.kid, a.agent.handle))?.status, 'pending', 'a live challenge is not cleaned up');
+    assert.equal(await f.peer.activateKey(key.kid, key.enrollment, 'proof', f.now()), true);
+    await f.advance(10);
+    await f.store.deleteKey(stale.kid, stale.enrollment, f.now());
+    assert.equal((await f.store.getKey(key.kid, a.agent.handle))?.status, 'active', 'stale cleanup cannot delete the same enrollment after activation');
+    await f.store.deleteKey(unproved.kid, unproved.enrollment, f.now());
+    assert.equal(await f.store.getKey(unproved.kid, a.agent.handle), undefined, 'an unproved challenge is deleted at its deadline');
+  });
+
+  check('proof at the enrollment deadline fails without affecting another pending enrollment', async (f) => {
+    const a = await subject(f); const b = await subject(f, 'second');
+    const kid = hash('deadline-key');
+    const first: AgentKey = { ...a.key, kid, enrollment: 'deadline-first', status: 'pending', challenge: { value: 'first', expiresAt: f.now() + 10 } };
+    const second: AgentKey = { ...first, handle: b.agent.handle, agentSub: b.agent.sub, enrollment: 'deadline-second', challenge: { value: 'second', expiresAt: f.now() + 60 } };
+    assert.equal(await f.store.insertKey(first, f.now(), a.authorization), 'ok');
+    assert.equal(await f.peer.insertKey(second, f.now(), b.authorization), 'ok');
+    await f.advance(10);
+    assert.equal(await f.store.activateKey(kid, first.enrollment, 'first', f.now()), false);
+    await f.store.deleteKey(kid, first.enrollment);
+    assert.equal(await f.peer.activateKey(kid, second.enrollment, 'second', f.now()), true);
+  });
+
+  check('duplicate assertions own no cleanup and concurrent transactions for one agent consume one quota place', async (f) => {
+    const a = await subject(f); const b = await subject(f, 'second'); const c = await client(f);
+    const initial = await pending(f, c, 'one');
+    const attempt = asserted(f, initial, a);
+    const results = await Promise.all([f.store, f.peer].map((store) => store.updateTransaction(attempt, 0, { now: f.now(), maxSignups: 1 })));
+    assert.equal(results.filter(Boolean).length, 1);
+    const accepted = results.find(Boolean)!;
+    const sibling = await ready(f, c, a, 'two');
+    assert.equal(sibling.status, 'ready');
+    const refused = await ready(f, c, b, 'three');
+    assert.equal(refused.reason, 'signup_limit_reached');
+    const code = await complete(f, accepted);
+    const duplicateCode = codeFor(f, accepted, '-duplicate');
+    assert.equal(await f.peer.completeTransaction(accepted, accepted.version, duplicateCode, f.now()), undefined);
+    assert.equal(await f.store.getCode(duplicateCode.hash), undefined);
+    assert.equal((await f.peer.getCode(code.hash))?.txnId, accepted.id);
+    await complete(f, sibling);
+    assert.equal(await f.store.signupsEver(a.owner.id, c.clientId), 1);
+    assert.equal((await f.store.getAccount(a.agent.handle, c.clientId))?.signInCount, 2);
+    assert.equal(await f.store.getAccount(b.agent.handle, c.clientId), undefined);
+  });
+
+  check('terminal decisions and expired reservations release quota without requiring a polling write', async (f) => {
+    const a = await subject(f); const b = await subject(f, 'second'); const c = await client(f);
+    const first = await ready(f, c, a, 'first');
+    assert.equal((await f.store.updateTransaction({ ...first, status: 'denied', reason: 'cancelled', terminalAt: f.now() }, first.version, { now: f.now() }))?.status, 'denied');
+    const second = await ready(f, c, b, 'second');
+    assert.equal(second.status, 'ready');
+    await f.advance(301);
+    const third = await ready(f, c, a, 'third');
+    assert.equal(third.status, 'ready');
+    assert.equal((await f.store.getTransaction(second.id))?.status, 'ready', 'admission does not need polling to persist expiry');
+    await complete(f, third);
+    assert.equal(await f.store.signupsEver(a.owner.id, c.clientId), 1);
+  });
+
+  check('code bindings come from the accepted transaction and a code-hash collision rolls completion back', async (f) => {
+    const a = await subject(f); const c = await client(f);
+    const first = await ready(f, c, a, 'first-code');
+    const firstCode = codeFor(f, first);
+    assert.equal((await f.store.completeTransaction(first, first.version,
+      { ...firstCode, agentVersion: 999, scopes: ['openid', 'owner_email'] }, f.now()))?.status, 'completed');
+    assert.equal((await f.peer.getCode(firstCode.hash))?.agentVersion, first.agentVersion);
+    assert.deepEqual((await f.peer.getCode(firstCode.hash))?.scopes, first.scopes);
+    const second = await ready(f, c, a, 'second-code');
+    const beforeCollision = await f.store.getTransaction(second.id);
+    await assert.rejects(f.peer.completeTransaction(second, second.version, { ...codeFor(f, second), hash: firstCode.hash }, f.now()));
+    assert.deepEqual(await f.store.getTransaction(second.id), beforeCollision);
+    assert.equal((await f.store.getCode(firstCode.hash))?.txnId, first.id);
+    assert.equal((await f.store.getAccount(a.agent.handle, c.clientId))?.signInCount, 1);
+    assert.equal(await f.store.signupsEver(a.owner.id, c.clientId), 1);
+    await complete(f, second);
+    assert.equal((await f.store.getAccount(a.agent.handle, c.clientId))?.signInCount, 2);
+  });
+
+  check('disable and re-enable fences stale assertions and codes, retaining permanent signup accounting', async (f) => {
+    const a = await subject(f); const c = await client(f);
+    const tx = await ready(f, c, a, 'completed'); const code = await complete(f, tx);
+    const stale = await pending(f, c, 'stale');
+    await f.peer.setAgentEnabled(a.agent.handle, false, a.agent.sub, f.now());
+    await f.peer.setAgentEnabled(a.agent.handle, true, a.agent.sub, f.now());
+    await assert.rejects(f.store.updateTransaction(asserted(f, stale, a), stale.version, { now: f.now(), maxSignups: 1 }),
+      (error) => isAssertionSubjectError(error) && error.error === 'unknown_key');
+    assert.deepEqual(await f.store.getTransaction(stale.id), stale, 'invalid Agent authority cannot consume the challenge');
+    assert.equal(await f.store.redeemCode(code.hash, f.now()), 'void');
+    assert.equal((await f.store.getAgent(a.agent.handle))?.authorizationVersion, 1);
+    await f.store.deleteAgent(a.agent.handle, a.agent.sub, f.now());
+    assert.equal(await f.store.signupsEver(a.owner.id, c.clientId), 1);
+  });
+
+  check('account disable versions survive re-enable and invalidate previously issued credentials', async (f) => {
+    const a = await subject(f); const c = await client(f);
+    const tx = await ready(f, c, a, 'account'); const code = await complete(f, tx);
+    assert.equal(await f.store.redeemCode(code.hash, f.now()), 'ok');
+    const token = tokenFor(f, code);
+    assert.equal(await f.store.insertAccessToken(token, f.now()), true);
+    await f.peer.setAccountStatus(a.agent.handle, c.clientId, 'disabled', a.authorization, f.now());
+    await f.peer.setAccountStatus(a.agent.handle, c.clientId, 'enabled', a.authorization, f.now());
+    assert.equal((await f.store.getAccount(a.agent.handle, c.clientId))?.authorizationVersion, 1);
+    assert.equal((await f.store.getAccessToken(token.hash))?.revoked, true);
+    assert.equal(await f.store.insertAccessToken(tokenFor(f, code, 'late-token'), f.now()), false);
+    assert.equal(await f.store.signupsEver(a.owner.id, c.clientId), 1);
+  });
+
+  check('a token must retain the redeemed code scopes and lifecycle bindings', async (f) => {
+    const a = await subject(f); const c = await client(f);
+    const code = await complete(f, await ready(f, c, a, 'token-binding'));
+    assert.equal(await f.store.redeemCode(code.hash, f.now()), 'ok');
+    const elevated = { ...tokenFor(f, code, 'elevated-scopes'), scopes: ['openid', 'owner_email'] as AccessToken['scopes'] };
+    assert.equal(await f.peer.insertAccessToken(elevated, f.now()), false, 'candidate scopes cannot expand the authorization code');
+    await f.store.setAgentEnabled(a.agent.handle, false, a.agent.sub, f.now());
+    const updated = await f.store.setAgentEnabled(a.agent.handle, true, a.agent.sub, f.now());
+    const rebound = { ...tokenFor(f, code, 'rebound-token'), agentVersion: updated!.authorizationVersion };
+    assert.equal(await f.peer.insertAccessToken(rebound, f.now()), false, 'a fresh candidate version cannot revive an old code');
+    assert.equal(await f.store.getAccessToken(rebound.hash), undefined);
+  });
+
+  check('scope unions require identical material consent terms', async (f) => {
+    const a = await subject(f); const c = await client(f);
+    const consent = { handle: a.agent.handle, clientId: c.clientId, scopes: ['openid', 'owner_email'] as const,
+      redirectHost: 'rp.example', clientName: 'RP', policyUri: 'https://rp.example/policy-a' };
+    await ready(f, c, a, 'consent-a', { consent: { ...consent, scopes: [...consent.scopes] } });
+    await ready(f, c, a, 'consent-same', { consent: { ...consent, scopes: ['openid'] } });
+    assert.deepEqual((await f.peer.getConsent(a.agent.handle, c.clientId))?.scopes, ['openid', 'owner_email']);
+    await f.advance(1);
+    await ready(f, c, a, 'consent-b', { consent: { ...consent, scopes: ['openid'], policyUri: 'https://rp.example/policy-b' } });
+    assert.deepEqual((await f.peer.getConsent(a.agent.handle, c.clientId))?.scopes, ['openid']);
+    assert.equal((await f.store.getConsent(a.agent.handle, c.clientId))?.createdAt, f.now());
+  });
+
+  for (const change of ['missing', 'expired', 'material change', 'expired prompt none'] as const) {
+    check(`consent reliance is revalidated at acceptance after ${change}`, async (f) => {
+      const a = await subject(f); const c = await client(f);
+      const consentContext = { handle: a.agent.handle, clientId: c.clientId, scopes: ['openid'] as Transaction['scopes'],
+        redirectHost: 'rp.example', policyUri: 'https://rp.example/policy-a' };
+      await ready(f, c, a, 'original-consent', { consent: consentContext });
+      const tx = await pending(f, c, 'relying-assertion');
+      if (change === 'missing') await f.peer.deleteConsent(a.agent.handle, c.clientId, a.authorization);
+      else if (change === 'material change') await ready(f, c, a, 'changed-consent', {
+        consent: { ...consentContext, policyUri: 'https://rp.example/policy-b' },
+      });
+      else await f.advance(11);
+      const previous = await f.store.getConsent(a.agent.handle, c.clientId);
+      await f.advance(1);
+      const next = { ...asserted(f, tx, a), consentRelied: true, ...(change === 'expired prompt none' ? { prompt: 'none' as const } : {}) };
+      const accepted = await f.store.updateTransaction(next, tx.version, { now: f.now(), maxSignups: 1,
+        touchConsent: true, consentContext, expireConsentBefore: f.now() - 10 });
+      if (change === 'expired prompt none') {
+        assert.equal(accepted?.status, 'denied');
+        assert.equal(accepted?.reason, 'consent_required');
+      } else {
+        assert.equal(accepted?.status, 'awaiting_consent');
+        assert.equal(accepted?.consentReason, change === 'missing' ? 'first_visit' : change === 'material change' ? 'material_change' : 'expired');
+      }
+      assert.equal(accepted?.consentRelied, false);
+      const after = await f.store.getConsent(a.agent.handle, c.clientId);
+      if (after) assert.equal(after.lastUsedAt, previous?.lastUsedAt, 'stale reliance cannot renew the consent record');
+    });
+  }
+
+  check('signed assertion expiry is checked at acceptance without consuming its challenge or quota', async (f) => {
+    const a = await subject(f); const b = await subject(f, 'second'); const c = await client(f);
+    const tx = await pending(f, c, 'assertion-window'); const next = asserted(f, tx, a);
+    const expiresAt = f.now() + 5;
+    await f.advance(5);
+    await assert.rejects(f.store.updateTransaction(next, tx.version, { now: f.now(), maxSignups: 1,
+      assertionWindow: { notBefore: expiresAt - 60, expiresAt } }), isAssertionWindowError);
+    assert.deepEqual(await f.peer.getTransaction(tx.id), tx);
+    assert.equal((await ready(f, c, b, 'fresh-assertion')).status, 'ready');
+  });
+
+  for (const outcome of ['ready', 'awaiting_owner', 'denied'] as const) {
+    check(`transaction expiry rejects a first assertion planned as ${outcome} without identity, token or consent`, async (f) => {
+      const a = await subject(f); const b = await subject(f, 'second'); const c = await client(f);
+      const tx = await pending(f, c, `deadline-${outcome}`, 5);
+      const next = { ...asserted(f, tx, a), status: outcome, expiresAt: outcome === 'awaiting_owner' ? tx.expiresAt + 600 : tx.expiresAt,
+        ...(outcome === 'denied' ? { reason: 'consent_required' as const, terminalAt: f.now() } : {}) };
+      const consent = { handle: a.agent.handle, clientId: c.clientId, scopes: tx.scopes, redirectHost: 'rp.example' };
+      await f.advance(5);
+      await assert.rejects(f.store.updateTransaction(next, tx.version, { now: f.now(), maxSignups: 1, consent,
+        assertionWindow: { notBefore: tx.createdAt - 1, expiresAt: tx.expiresAt } }), isTransactionExpiredError);
+      assert.deepEqual(await f.peer.getTransaction(tx.id), tx, 'a rejected assertion cannot bind identity, change expiry, or consume the challenge');
+      assert.equal(await f.store.getConsent(a.agent.handle, c.clientId), undefined);
+      const expired = await f.peer.readTransaction(tx.id, { now: f.now(), retainFor: 30 });
+      assert.equal(expired?.status, 'expired');
+      assert.equal(expired?.terminalAt, tx.expiresAt);
+      assert.equal((await ready(f, c, b, 'after-deadline')).status, 'ready', 'the rejected assertion reserves no quota');
+    });
+  }
+
+  for (const outcome of ['ready', 'denied', 'completed', 'expired'] as const) {
+    check(`explicit key revocation removes ${outcome} bearer authority and fences stale mutations`, async (f) => {
+      const a = await subject(f); const c = await client(f);
+      let tx = await ready(f, c, a, `bearer-${outcome}`);
+      if (outcome === 'denied') tx = (await f.store.updateTransaction({ ...tx, status: 'denied', reason: 'cancelled' }, tx.version, { now: f.now() }))!;
+      if (outcome === 'completed') { await complete(f, tx); tx = (await f.store.getTransaction(tx.id))!; }
+      if (outcome === 'expired') await f.advance(300);
+      const effective = (await f.store.readTransaction(tx.id, { now: f.now(), retainFor: 30 }))!;
+      await f.peer.revokeKey(a.key.kid, a.key.enrollment, f.now());
+      const revoked = (await f.store.getTransaction(tx.id))!;
+      assert.equal(revoked.transactionTokenHash, undefined);
+      assert.ok(revoked.version > tx.version);
+      assert.equal(revoked.sessionSecretHash, tx.sessionSecretHash);
+      if (outcome !== 'ready') {
+        assert.equal(revoked.status, effective.status);
+        assert.equal(revoked.reason, effective.reason);
+        assert.equal(revoked.terminalAt, effective.terminalAt);
+      }
+      await assert.rejects(f.store.updateTransaction({ ...tx, status: 'ready' }, tx.version,
+        { now: f.now(), transactionTokenHash: tx.transactionTokenHash }), isTransactionTokenError);
+      await assert.rejects(f.store.completeTransaction({ ...tx, status: 'completed' }, tx.version,
+        codeFor(f, tx, 'stale'), f.now(), tx.transactionTokenHash), isTransactionTokenError);
+      assert.equal(await f.store.getCode(codeFor(f, tx, 'stale').hash), undefined);
+      assert.ok(await f.store.readTransaction(tx.id, { now: f.now(), retainFor: 30 }), 'revocation does not remove anonymous terminal readability');
+    });
+  }
+
+  check('legacy retained hashes on explicitly revoked enrollments confer no authority and idempotent revocation repairs them', async (f) => {
+    const a = await subject(f); const c = await client(f);
+    const tx = await ready(f, c, a, 'before-revocation');
+    await f.store.revokeKey(a.key.kid, a.key.enrollment, f.now());
+    // Trusted insertion represents a pre-fix persisted terminal row whose original revocation retained the hash.
+    const legacy = { ...tx, id: 'legacy-terminal', sessionSecretHash: hash('legacy-terminal-session'), status: 'denied' as const, reason: 'cancelled' as const, terminalAt: f.now() - 1 };
+    await f.store.insertTransaction(legacy);
+    const persisted = (await f.store.getTransaction(legacy.id))!;
+    const read = await f.peer.readTransaction(legacy.id, { now: f.now(), retainFor: 30 });
+    assert.equal(read?.transactionTokenHash, undefined);
+    assert.equal(read?.status, legacy.status);
+    assert.equal(read?.terminalAt, legacy.terminalAt);
+    assert.deepEqual(await f.store.getTransaction(legacy.id), persisted, 'legacy suppression is a read-only projection');
+    await assert.rejects(f.peer.updateTransaction({ ...legacy, status: 'ready' }, legacy.version,
+      { now: f.now(), transactionTokenHash: legacy.transactionTokenHash }), isTransactionTokenError);
+    await assert.rejects(f.peer.completeTransaction({ ...legacy, status: 'completed' }, legacy.version,
+      codeFor(f, legacy), f.now(), legacy.transactionTokenHash), isTransactionTokenError);
+    assert.equal((await f.peer.revokeKey(a.key.kid, a.key.enrollment, f.now(), a.authorization))?.status, 'revoked');
+    const { transactionTokenHash: _revoked, ...retained } = persisted;
+    assert.deepEqual(await f.store.getTransaction(legacy.id), { ...retained, version: legacy.version + 1 });
+  });
+
+  for (const removal of ['Agent', 'key'] as const) {
+    check(`removing a revoked ${removal} persists legacy bearer revocation before forgetting its key record`, async (f) => {
+      const a = await subject(f); const c = await client(f);
+      const tx = await ready(f, c, a, 'before-legacy-removal');
+      await f.store.revokeKey(a.key.kid, a.key.enrollment, f.now());
+      const legacy = { ...tx, id: 'legacy-removal', sessionSecretHash: hash('legacy-removal-session'), status: 'denied' as const, reason: 'cancelled' as const, terminalAt: f.now() - 1 };
+      await f.store.insertTransaction(legacy);
+      const persisted = (await f.store.getTransaction(legacy.id))!;
+      const read = () => f.peer.readTransaction(legacy.id, { now: f.now(), retainFor: 30 });
+      assert.equal((await read())?.transactionTokenHash, undefined);
+      assert.equal((await f.store.getTransaction(legacy.id))?.transactionTokenHash, legacy.transactionTokenHash);
+      if (removal === 'Agent') assert.equal(await f.peer.deleteAgent(a.agent.handle, a.agent.sub, f.now()), true);
+      else await f.peer.deleteKey(a.key.kid, a.key.enrollment);
+      assert.equal(await f.store.getKey(a.key.kid, a.agent.handle), undefined);
+      const { transactionTokenHash: _revoked, ...retained } = persisted;
+      assert.deepEqual(await f.store.getTransaction(legacy.id), { ...retained, version: legacy.version + 1 });
+      assert.equal((await read())?.transactionTokenHash, undefined, 'removing the legacy key cannot restore bearer authority');
+      if (removal === 'Agent') {
+        assert.equal(await f.store.putAgent({ ...a.agent, sub: 'replacement-Agent' }), true);
+        assert.equal((await read())?.transactionTokenHash, undefined, 'recreating the handle cannot restore bearer authority');
+      }
+      await assert.rejects(f.peer.updateTransaction({ ...legacy, status: 'ready' }, legacy.version,
+        { now: f.now(), transactionTokenHash: legacy.transactionTokenHash }), isTransactionTokenError);
+      assert.equal((await read())?.terminalAt, legacy.terminalAt);
+    });
+  }
+
+  for (const removal of ['Agent', 'key'] as const) {
+    check(`removing a naturally expired ${removal} does not revoke its retained transaction bearer`, async (f) => {
+      const a = await subject(f); const c = await client(f);
+      const pendingTx = await pending(f, c, 'natural-expiry-removal', 7200);
+      const tx = (await f.store.updateTransaction(asserted(f, pendingTx, a), pendingTx.version, { now: f.now() }))!;
+      await f.advance(3600);
+      const terminal = (await f.store.updateTransaction(tx, tx.version, { now: f.now() }))!;
+      assert.equal(terminal.reason, 'key_revoked');
+      assert.equal(terminal.terminalAt, a.key.expiresAt);
+      assert.equal(terminal.transactionTokenHash, tx.transactionTokenHash);
+      if (removal === 'Agent') assert.equal(await f.peer.deleteAgent(a.agent.handle, a.agent.sub, f.now()), true);
+      else await f.peer.deleteKey(a.key.kid, a.key.enrollment);
+      const retained = await f.store.readTransaction(tx.id, { now: f.now(), retainFor: 30 });
+      assert.equal(retained?.transactionTokenHash, tx.transactionTokenHash);
+      assert.equal(retained?.terminalAt, a.key.expiresAt);
+    });
+  }
+
+  for (const change of ['revoked key', 'expired key', 'replaced key', 'deleted Agent', 'disabled Agent', 're-enabled Agent'] as const) {
+    check(`first assertion rejects a ${change} before identity, token, quota or consent take effect`, async (f) => {
+      const a = await subject(f); const c = await client(f);
+      const tx = await pending(f, c, 'invalid-assertion-authority', 7200);
+      const next = asserted(f, tx, a);
+      if (change === 'revoked key') await f.peer.revokeKey(a.key.kid, a.key.enrollment, f.now());
+      if (change === 'expired key' || change === 'replaced key') await f.advance(3600);
+      if (change === 'replaced key') {
+        const replacement = { ...a.key, enrollment: 'replacement', status: 'pending' as const, createdAt: f.now(), expiresAt: f.now() + 3600,
+          challenge: { value: 'replacement-challenge', expiresAt: f.now() + 60 } };
+        assert.equal(await f.peer.insertKey(replacement, f.now(), a.authorization), 'ok');
+        assert.equal(await f.peer.activateKey(replacement.kid, replacement.enrollment, replacement.challenge.value, f.now()), true);
+      }
+      if (change === 'deleted Agent') await f.peer.deleteAgent(a.agent.handle, a.agent.sub, f.now());
+      if (change === 'disabled Agent' || change === 're-enabled Agent') await f.peer.setAgentEnabled(a.agent.handle, false, a.agent.sub, f.now());
+      if (change === 're-enabled Agent') await f.peer.setAgentEnabled(a.agent.handle, true, a.agent.sub, f.now());
+      const expected = change === 'revoked key' || change === 'expired key' ? 'key_revoked' : 'unknown_key';
+      await assert.rejects(f.store.updateTransaction(next, tx.version, { now: f.now(), maxSignups: 1,
+        consent: { handle: a.agent.handle, clientId: c.clientId, scopes: tx.scopes, redirectHost: 'rp.example' } }),
+        (error) => isAssertionSubjectError(error) && error.error === expected);
+      assert.deepEqual(await f.peer.getTransaction(tx.id), tx);
+      assert.equal(await f.store.getConsent(a.agent.handle, c.clientId), undefined);
+      const b = await subject(f, 'new-authority');
+      assert.equal((await ready(f, c, b, 'after-authority-rejection')).status, 'ready', 'no rejected assertion holds quota');
+    });
+  }
+
+  for (const initial of [true, false]) {
+    check(`first assertion conflicts without effects when share_owner changes from ${initial} before acceptance`, async (f) => {
+      const a = await subject(f); const b = await subject(f, 'second'); const c = await client(f);
+      assert.ok(await f.store.patchKey(a.key.kid, a.key.enrollment, { shareOwner: initial }, a.authorization));
+      const tx = await pending(f, c, 'permission-race');
+      const planned = { ...asserted(f, tx, a), ownerApprovalOutstanding: !initial,
+        status: initial ? 'ready' as const : 'awaiting_owner' as const, expiresAt: initial ? tx.expiresAt : tx.expiresAt + 600 };
+      const consent = { handle: a.agent.handle, clientId: c.clientId, scopes: tx.scopes, redirectHost: 'rp.example' };
+      assert.ok(await f.peer.patchKey(a.key.kid, a.key.enrollment, { shareOwner: !initial }, a.authorization));
+      assert.equal(await f.store.updateTransaction(planned, tx.version, { now: f.now(), expectedShareOwner: initial, maxSignups: 1, consent }), undefined);
+      assert.deepEqual(await f.peer.getTransaction(tx.id), tx);
+      assert.equal(await f.store.getConsent(a.agent.handle, c.clientId), undefined);
+      const other = await ready(f, c, b, 'permission-race-other');
+      assert.equal(other.status, 'ready', 'the failed permission snapshot did not reserve quota');
+      assert.equal((await f.store.updateTransaction({ ...other, status: 'denied', reason: 'cancelled' }, other.version, { now: f.now() }))?.status, 'denied');
+      const recomputed = { ...asserted(f, tx, a), ownerApprovalOutstanding: initial,
+        status: initial ? 'awaiting_owner' as const : 'ready' as const, expiresAt: initial ? tx.expiresAt + 600 : tx.expiresAt };
+      const accepted = await f.store.updateTransaction(recomputed, tx.version, { now: f.now(), expectedShareOwner: !initial, maxSignups: 1, consent });
+      assert.equal(accepted?.status, recomputed.status);
+      assert.equal(accepted?.expiresAt, recomputed.expiresAt, 'only the accepted gate can extend transaction expiry');
+      assert.equal(accepted?.keyEnrollment, a.key.enrollment);
+    });
+  }
+
+  check('signed proof expiry is checked atomically without consuming a still-live enrollment challenge', async (f) => {
+    const a = await subject(f);
+    const pending: AgentKey = { ...a.key, kid: hash('pending-proof'), enrollment: 'pending-proof', status: 'pending',
+      challenge: { value: 'proof-challenge', expiresAt: f.now() + 60 } };
+    assert.equal(await f.store.insertKey(pending, f.now(), a.authorization), 'ok');
+    const expiresAt = f.now() + 5;
+    await f.advance(5);
+    await assert.rejects(f.peer.activateKey(pending.kid, pending.enrollment, pending.challenge!.value, f.now(),
+      { notBefore: expiresAt - 60, expiresAt }), isAssertionWindowError);
+    assert.equal((await f.store.getKey(pending.kid))?.status, 'pending');
+    assert.equal((await f.store.getKey(pending.kid))?.challenge?.value, pending.challenge!.value);
+    assert.equal(await f.store.activateKey(pending.kid, pending.enrollment, pending.challenge!.value, f.now(),
+      { notBefore: f.now() - 1, expiresAt: f.now() + 5 }), true);
+  });
+
+  check('key expiry frees its reservation during admission even without polling or cleanup', async (f) => {
+    const a = await subject(f); const c = await client(f);
+    const tx = await pending(f, c, 'expired-reservation-key', 7200);
+    await f.store.updateTransaction(asserted(f, tx, a), tx.version, { now: f.now(), maxSignups: 1 });
+    await f.advance(3601);
+    const b = await subject(f, 'second');
+    assert.equal((await ready(f, c, b, 'key-expiry-admission')).status, 'ready');
+    assert.equal((await f.store.getTransaction(tx.id))?.status, 'ready', 'admission uses lifecycle state without requiring a materialized denial');
+  });
+
+  check('polling computes expiry without writes and later revocation cannot restart retention', async (f) => {
+    const a = await subject(f); const c = await client(f); const tx = await ready(f, c, a, 'expiry');
+    const beforeRead = await f.store.getTransaction(tx.id);
+    await f.advance(305);
+    const read = () => f.peer.readTransaction(tx.id, { now: f.now(), retainFor: 30 });
+    const effective = await read();
+    assert.equal(effective?.status, 'expired');
+    assert.equal(effective?.terminalAt, tx.expiresAt);
+    assert.deepEqual(await f.store.getTransaction(tx.id), beforeRead, 'polling must not update transaction state');
+    await f.store.revokeKey(a.key.kid, a.key.enrollment, f.now());
+    assert.equal((await f.store.getTransaction(tx.id))?.terminalAt, tx.expiresAt);
+    await f.advance(25);
+    assert.ok(await read(), 'the retention boundary remains readable');
+    await f.advance(1);
+    assert.equal(await read(), undefined);
+  });
+
+  check('key expiry polling is read-only and replacing that enrollment preserves its original terminal time', async (f) => {
+    const a = await subject(f); const c = await client(f);
+    const tx = await pending(f, c, 'key-expiry', 7200);
+    await f.store.updateTransaction(asserted(f, tx, a), tx.version, { now: f.now(), maxSignups: 1 });
+    const beforeRead = await f.store.getTransaction(tx.id);
+    await f.advance(3601);
+    const effective = await f.peer.readTransaction(tx.id, { now: f.now(), retainFor: 30 });
+    assert.equal(effective?.status, 'denied');
+    assert.equal(effective?.reason, 'key_revoked');
+    assert.equal(effective?.terminalAt, a.key.expiresAt);
+    assert.deepEqual(await f.store.getTransaction(tx.id), beforeRead);
+    const replacement: AgentKey = { ...a.key, enrollment: 'after-expiry', status: 'pending', createdAt: f.now(), expiresAt: f.now() + 3600,
+      challenge: { value: 'new-proof', expiresAt: f.now() + 60 } };
+    assert.equal(await f.peer.insertKey(replacement, f.now(), a.authorization), 'ok');
+    assert.equal((await f.store.getTransaction(tx.id))?.terminalAt, a.key.expiresAt);
+    await f.advance(30);
+    assert.equal(await f.store.readTransaction(tx.id, { now: f.now(), retainFor: 30 }), undefined);
+  });
+
+  check('activation by another Agent preserves the expired enrollment terminal time and retention', async (f) => {
+    const a = await subject(f); const b = await subject(f, 'second'); const c = await client(f);
+    const tx = await pending(f, c, 'key-claimed-after-expiry', 7200);
+    await f.store.updateTransaction(asserted(f, tx, a), tx.version, { now: f.now(), maxSignups: 1 });
+    await f.advance(3600);
+    const replacement: AgentKey = { ...a.key, handle: b.agent.handle, agentSub: b.agent.sub, enrollment: 'different-agent-after-expiry',
+      status: 'pending', createdAt: f.now(), expiresAt: f.now() + 3600, challenge: { value: 'new-proof', expiresAt: f.now() + 60 } };
+    assert.equal(await f.peer.insertKey(replacement, f.now(), b.authorization), 'ok');
+    assert.equal(await f.peer.activateKey(replacement.kid, replacement.enrollment, 'new-proof', f.now()), true);
+    assert.equal((await f.store.getKey(a.key.kid, a.agent.handle))?.status, 'expired');
+    const original = await f.store.getTransaction(tx.id);
+    assert.equal(original?.status, 'denied');
+    assert.equal(original?.reason, 'key_revoked');
+    assert.equal(original?.terminalAt, a.key.expiresAt);
+    await f.advance(31);
+    assert.equal(await f.store.readTransaction(tx.id, { now: f.now(), retainFor: 30 }), undefined);
+    assert.equal((await f.store.getKey(a.key.kid, b.agent.handle))?.status, 'active');
+  });
+
+  for (const change of ['revocation', 'agent disable'] as const) {
+    check(`${change} cannot restore visibility after a key expiry ended transaction retention`, async (f) => {
+      const a = await subject(f); const c = await client(f);
+      const tx = await pending(f, c, 'expired-key-retention', 7200);
+      await f.store.updateTransaction(asserted(f, tx, a), tx.version, { now: f.now(), maxSignups: 1 });
+      await f.advance(3631);
+      assert.equal(await f.peer.readTransaction(tx.id, { now: f.now(), retainFor: 30 }), undefined);
+      if (change === 'revocation') await f.store.revokeKey(a.key.kid, a.key.enrollment, f.now());
+      else await f.store.setAgentEnabled(a.agent.handle, false, a.agent.sub, f.now());
+      assert.equal((await f.store.getTransaction(tx.id))?.terminalAt, a.key.expiresAt);
+      assert.equal((await f.store.getTransaction(tx.id))?.reason, 'key_revoked');
+      assert.equal(await f.peer.readTransaction(tx.id, { now: f.now(), retainFor: 30 }), undefined);
+    });
+  }
+
+  check('used-code replay atomically revokes tokens and forbids delayed issuance', async (f) => {
+    const a = await subject(f); const c = await client(f);
+    const code = await complete(f, await ready(f, c, a, 'replay'));
+    assert.equal(await f.store.redeemCode(code.hash, f.now()), 'ok');
+    const token = tokenFor(f, code);
+    assert.equal(await f.store.insertAccessToken(token, f.now()), true);
+    assert.equal((await f.peer.getAccessToken(token.hash))?.issuedAt, f.now());
+    assert.equal((await f.peer.getAccessToken(token.hash))?.expiresAt, f.now() + 600);
+    await f.advance(61); // replay evidence outlives the code's redemption expiry
+    assert.equal(await f.peer.redeemCode(code.hash, f.now()), 'used');
+    assert.equal((await f.store.getCode(code.hash))?.replayed, true);
+    assert.equal((await f.store.getAccessToken(token.hash))?.revoked, true);
+    assert.equal(await f.store.insertAccessToken(tokenFor(f, code, 'after-replay'), f.now()), false);
+  });
+}

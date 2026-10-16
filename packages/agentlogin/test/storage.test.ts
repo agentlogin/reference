@@ -1,9 +1,11 @@
 // Regression tests for the client's local storage and discovery (reported against commit 9b6dd09).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
+import fs from 'node:fs';
 import { existsSync, mkdtempSync, readFileSync, utimesSync, writeFileSync } from 'node:fs';
 import http from 'node:http';
+import { syncBuiltinESMExports } from 'node:module';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
@@ -96,6 +98,68 @@ test('#8 the WebFinger query carries the acct URI with its userpart percent-enco
 
 const key = (kid: string) => ({ kid, handle: 'scout@example.com', issuer: 'https://issuer.example', privateJwk: { kty: 'EC' }, publicJwk: { kty: 'EC' }, createdAt: 0, status: 'active' as const });
 
+test('lock: publication closes its descriptor only once, including when linking fails', async (t) => {
+  for (const failLink of [false, true]) await t.test(failLink ? 'failed link' : 'successful link', async (t) => {
+    const home = mkdtempSync(join(tmpdir(), 'al-lock-fd-'));
+    const file = join(home, 'keys.json');
+    const originalOpen = fs.openSync;
+    const originalLink = fs.linkSync;
+    let ownerFd: number | undefined;
+    let unrelatedFd: number | undefined;
+    const failure = new Error('link failed');
+    t.mock.method(fs, 'openSync', (...args: Parameters<typeof fs.openSync>) => {
+      const fd = originalOpen(...args);
+      if (String(args[0]).endsWith('.owner')) ownerFd = fd;
+      return fd;
+    });
+    t.mock.method(fs, 'linkSync', (...args: Parameters<typeof fs.linkSync>) => {
+      // Reuse the just-closed owner's fd in the gap before publication's cleanup.
+      unrelatedFd = originalOpen(join(home, 'unrelated'), 'wx', 0o600);
+      assert.equal(unrelatedFd, ownerFd, 'the unrelated file reuses the closed descriptor');
+      if (failLink) throw failure;
+      return originalLink(...args);
+    });
+    syncBuiltinESMExports();
+    try {
+      const write = new FileKeystore(file).put(key('kept'));
+      if (failLink) await assert.rejects(write, (error) => error === failure);
+      else await write;
+      assert.notEqual(unrelatedFd, undefined, 'the publication hook ran');
+      fs.writeSync(unrelatedFd!, 'still open');
+      assert.equal(readFileSync(join(home, 'unrelated'), 'utf8'), 'still open');
+      assert.equal(fs.readdirSync(home).some((name) => name.endsWith('.owner')), false, 'the candidate is removed');
+      assert.equal(existsSync(`${file}.lock`), false, 'the lock is released');
+    } finally {
+      t.mock.restoreAll();
+      syncBuiltinESMExports();
+      if (unrelatedFd !== undefined) try { fs.closeSync(unrelatedFd); } catch { /* regression may have closed it */ }
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+});
+
+test('private write: a rejecting guard cannot close a reused descriptor', () => {
+  const home = mkdtempSync(join(tmpdir(), 'al-guard-fd-'));
+  const file = join(home, 'keys.json');
+  let unrelatedFd: number | undefined;
+  const failure = new Error('guard rejected the write');
+  try {
+    writePrivateJson(file, [key('kept')]);
+    assert.throws(() => writePrivateJson(file, [key('discarded')], () => {
+      // The temporary file is closed before the guard; the next open reuses its fd.
+      unrelatedFd = fs.openSync(join(home, 'unrelated'), 'wx', 0o600);
+      throw failure;
+    }), (error) => error === failure);
+    fs.writeSync(unrelatedFd!, 'still open');
+    assert.equal(readFileSync(join(home, 'unrelated'), 'utf8'), 'still open');
+    assert.deepEqual(JSON.parse(readFileSync(file, 'utf8')), [key('kept')]);
+    assert.equal(fs.readdirSync(home).some((name) => name.endsWith('.tmp')), false, 'the temporary write is removed');
+  } finally {
+    if (unrelatedFd !== undefined) try { fs.closeSync(unrelatedFd); } catch { /* regression may have closed it */ }
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test('lock: a dead holder is taken over at once, and concurrent waiters lose nothing', async () => {
   const home = mkdtempSync(join(tmpdir(), 'al-dead-'));
   const file = join(home, 'keys.json');
@@ -113,13 +177,13 @@ test('lock: a dead holder is taken over at once, and concurrent waiters lose not
   assert.equal(existsSync(`${file}.lock.takeover`), false);
 });
 
-test('lock: a holder that was taken over neither writes nor removes the new holder\'s lock', async () => {
+test('lock: externally changed ownership fails closed before writing', async () => {
   const home = mkdtempSync(join(tmpdir(), 'al-lost-'));
   const file = join(home, 'keys.json');
   writePrivateJson(file, [key('kept')]);
   await assert.rejects(
     withFileLock(file, (guard) => {
-      // While this holder is inside its critical section, it is taken for dead and another process takes the lock.
+      // Defense in depth: detect unsupported external replacement before writing.
       writeFileSync(`${file}.lock`, `${process.pid}:someone-else`);
       writePrivateJson(file, [key('stale-write')], guard);
     }),
@@ -129,15 +193,34 @@ test('lock: a holder that was taken over neither writes nor removes the new hold
   assert.equal(readFileSync(`${file}.lock`, 'utf8'), `${process.pid}:someone-else`, 'the new holder\'s lock is still there');
 });
 
-test('lock: a live holder that stopped refreshing its lock is taken over after the staleness threshold', async () => {
-  const home = mkdtempSync(join(tmpdir(), 'al-stale-'));
+test('lock: a writer suspended after its ownership check cannot be evicted before rename', { skip: process.platform === 'win32', timeout: 10_000 }, async () => {
+  const home = mkdtempSync(join(tmpdir(), 'al-suspended-'));
   const file = join(home, 'keys.json');
-  writeFileSync(`${file}.lock`, `${process.pid}:suspended`, { mode: 0o600 }); // this process is alive, so only age counts
-  await assert.rejects(Promise.race([new FileKeystore(file).put(key('early')), new Promise((_, reject) => setTimeout(() => reject(new Error('still waiting')), 600))]), /still waiting/, 'a fresh lock of a live holder is respected');
-  const old = new Date(Date.now() - 60_000);
-  utimesSync(`${file}.lock`, old, old);
-  await new FileKeystore(file).put(key('late'));
-  assert.ok((await new FileKeystore(file).list()).some((k) => k.kid === 'late'));
+  const marker = join(home, 'checked');
+  writePrivateJson(file, [key('initial')]);
+  const worker = fileURLToPath(new URL('./suspended-writer.ts', import.meta.url));
+  const child = spawn(process.execPath, ['--import', 'tsx', worker, file, marker], { stdio: ['ignore', 'pipe', 'pipe'] });
+  let stderr = '';
+  child.stderr.on('data', (chunk) => { stderr += chunk; });
+  const exited = new Promise<number | null>((resolve) => child.once('exit', resolve));
+  try {
+    const until = Date.now() + 5000;
+    while (!existsSync(marker) && child.exitCode === null && Date.now() < until) await new Promise((r) => setTimeout(r, 10));
+    assert.ok(existsSync(marker), `writer reached the check/rename gap: ${stderr}`);
+    const old = new Date(Date.now() - 60_000);
+    utimesSync(`${file}.lock`, old, old); // the old lease algorithm would evict this still-live writer
+    let finished = false;
+    const second = new FileKeystore(file).put(key('second')).then(() => { finished = true; });
+    await new Promise((r) => setTimeout(r, 200));
+    assert.equal(finished, false, 'no writer may pass a suspended live owner, even after the old stale threshold');
+    child.kill('SIGCONT');
+    assert.equal(await exited, 0, stderr);
+    await second;
+    assert.deepEqual((await new FileKeystore(file).list()).map((k) => k.kid).sort(), ['first', 'initial', 'second']);
+  } finally {
+    child.kill('SIGKILL');
+    await exited;
+  }
 });
 
 test('freshness follows the whole response: Age, Expires and malformed max-age', () => {

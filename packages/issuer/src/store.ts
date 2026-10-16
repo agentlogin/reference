@@ -1,11 +1,10 @@
-// Storage model and an in-memory implementation.
-//
-// The protocol's security invariants are single store operations with explicit preconditions: activating a pending
-// key, revoking a key, accepting a change to a transaction, reserving a place under a per-owner cap, redeeming a
-// code, recording a completed sign-in. Each must be atomic in the store, a single conditional write or one database
-// transaction, because the issuer holds no locks of its own: any number of issuer processes may share one store.
-// Everything else is plain reads and inserts. The in-memory store keeps and returns copies, as a database does.
+// Atomic protocol state transitions. MemoryStore and SQLiteStore share the synchronous state machine below.
+// Authorization plus enrollment; assertion plus cap reservation and consent; completion plus code, Account and
+// count; and lifecycle changes plus invalidation each commit together. No network or cryptographic work runs
+// inside a store operation. Immutable Agent identities and persistent disable versions fence delayed work.
 import type { Scope } from './constants.js';
+import { LEGACY_SIGNING_CACHE_SECONDS, LEGACY_SIGNING_OVERLAP_SECONDS, samePublicSigningKey, validateSigningPublication, type PublishedSigningKey, type SigningKeyPublication } from './signing-state.js';
+import { ownerAddressKey } from './owner-address.js';
 
 export type OwnerVerifiedVia = 'email' | 'oidc' | 'domain' | 'passkey';
 export interface Owner {
@@ -26,6 +25,8 @@ export interface Agent {
   name?: string;
   preferredUsername: string;
   enabled: boolean;
+  /** Monotonic invalidation fence: disabling and re-enabling never revives old authorizations. */
+  authorizationVersion: number;
   createdAt: number;
 }
 /**
@@ -54,6 +55,8 @@ export interface P256Jwk { kty: 'EC'; crv: 'P-256'; x: string; y: string }
 export interface AgentKey {
   kid: string;
   handle: string;
+  /** Immutable Agent identity that authorized this enrollment. */
+  agentSub: string;
   /**
    * Identifies this enrollment of the key. A transaction, code or Access Token is bound to the enrollment that
    * asserted it: enrolling the same public key again after it expired starts a new enrollment and revives nothing.
@@ -89,11 +92,13 @@ export interface Client {
   fetchedAt?: number;
   cacheUntil?: number;
 }
+/** Public presentation accepted for one transaction; never includes authentication credentials or live policy. */
+export type ClientPresentation = Pick<Client, 'type' | 'clientName' | 'logoUri' | 'tosUri' | 'policyUri' | 'relayIssuer' | 'relayPolicyUri'>;
 export type TxStatus = 'awaiting_agent' | 'awaiting_owner' | 'awaiting_consent' | 'ready' | 'completed' | 'denied' | 'expired';
 export const TERMINAL: ReadonlySet<TxStatus> = new Set(['completed', 'denied', 'expired']);
 export type DenyReason =
   | 'cancelled' | 'access_denied' | 'key_revoked' | 'owner_declined'
-  | 'consent_required' | 'interaction_required' | 'signup_limit_reached';
+  | 'consent_required' | 'interaction_required' | 'signup_limit_reached' | 'login_required';
 export type ConsentReason = 'first_visit' | 'material_change' | 'expired' | 'prompt_consent' | 'policy';
 export interface Disclosure { scope: Scope; title: string; description: string }
 export interface Transaction {
@@ -101,12 +106,16 @@ export interface Transaction {
   /** Incremented by every accepted change; a change is accepted only against the version it was computed from. */
   version: number;
   clientId: string;
+  /** Immutable displayed metadata. Missing only on legacy records, which issuer startup cancels without backfilling. */
+  clientPresentation?: ClientPresentation;
   redirectUri: string;
   scopes: Scope[];
   state: string;
   nonce: string;
   codeChallenge: string;
   prompt?: 'consent' | 'none';
+  /** Immutable requested authentication age in seconds; zero requires this transaction's fresh assertion. */
+  maxAge?: number;
   loginHint?: string;
   disclosure: Disclosure[];
   requester?: { user_agent?: string; network?: string };
@@ -122,6 +131,9 @@ export interface Transaction {
   kid?: string;
   /** The enrollment of `kid` that asserted (see AgentKey.enrollment). */
   keyEnrollment?: string;
+  agentSub?: string;
+  agentVersion?: number;
+  accountVersion?: number;
   ownerId?: string;
   assertedAt?: number;
   acceptDisclosure: boolean;
@@ -149,7 +161,12 @@ export interface Code {
   handle: string;
   kid: string;
   keyEnrollment: string;
+  agentSub: string;
+  agentVersion: number;
+  accountVersion: number;
   authTime: number;
+  /** Bound to the original Authentication Request, never supplied by the redeeming caller. */
+  maxAge?: number;
   expiresAt: number;
   used: boolean;
   voided: boolean;
@@ -163,7 +180,12 @@ export interface AccessToken {
   handle: string;
   kid: string;
   keyEnrollment: string;
+  agentSub: string;
+  agentVersion: number;
+  accountVersion: number;
   scopes: Scope[];
+  /** The store's clock when issuance was accepted. Older persisted snapshots may omit this field. */
+  issuedAt?: number;
   expiresAt: number;
   revoked: boolean;
 }
@@ -178,10 +200,24 @@ export interface Consent {
   createdAt: number;
   lastUsedAt: number;
 }
+type ConsentMetadata = Pick<Consent, 'redirectHost' | 'clientName' | 'tosUri' | 'policyUri'>;
+/** Section 6.4: scopes may accumulate only under the same material disclosure terms. */
+export function sameConsentMetadata(a: ConsentMetadata, b: ConsentMetadata): boolean {
+  return a.redirectHost === b.redirectHost && a.clientName === b.clientName && a.tosUri === b.tosUri && a.policyUri === b.policyUri;
+}
+/** The material consent preconditions, shared by gate planning and atomic acceptance. */
+export function consentRecordReason(record: Consent | undefined,
+  expected: ConsentMetadata & Pick<Consent, 'scopes'>, expireBefore?: number): 'first_visit' | 'material_change' | 'expired' | undefined {
+  if (!record) return 'first_visit';
+  if (!expected.scopes.every((scope) => record.scopes.includes(scope)) || !sameConsentMetadata(record, expected)) return 'material_change';
+  if (expireBefore !== undefined && record.lastUsedAt < expireBefore) return 'expired';
+  return undefined;
+}
 export interface Account {
   handle: string;
   clientId: string;
   status: 'enabled' | 'disabled';
+  authorizationVersion: number;
   firstSignedInAt: number;
   lastSignedInAt: number;
   signInCount: number;
@@ -189,52 +225,145 @@ export interface Account {
 
 /** Selects transactions, codes or Access Tokens by what they are bound to. Absent members match everything. */
 export interface SubjectFilter { kid?: string; keyEnrollment?: string; handle?: string; clientId?: string; ownerId?: string; txnId?: string }
-export type InsertKeyResult = 'ok' | 'enrolled' | 'other_handle' | 'revoked';
+export type InsertKeyResult = 'unauthorized' | 'ok' | 'enrolled' | 'other_handle' | 'revoked';
 export type RedeemResult = 'ok' | 'used' | 'void' | 'expired' | 'unknown';
 
+/** Section 5.1: equality is allowed; zero requests fresh authentication, not instantaneous delivery. */
+export function isAuthenticationTooOld(maxAge: number | undefined, authTime: number | undefined, now: number): boolean {
+  if (maxAge === undefined) return false; // Existing records predate this optional request constraint.
+  if (!Number.isSafeInteger(maxAge) || maxAge < 0 || !Number.isSafeInteger(authTime) || authTime! < 0) return true;
+  return maxAge > 0 && now - authTime! > maxAge;
+}
+
+export interface ManagementAuthorization extends Credential { agentSub: string }
+export interface TransitionEffects {
+  now: number;
+  /** Already verified signed assertion window, rechecked by the store at its atomic acceptance point. */
+  assertionWindow?: { notBefore: number; expiresAt: number };
+  /** Review bearer, checked against current authority before version or terminal checks. */
+  transactionTokenHash?: string;
+  /** Key permission used to plan first-assertion Owner approval; mismatch returns a conflict without effects. */
+  expectedShareOwner?: boolean;
+  maxSignups?: number;
+  consent?: Omit<Consent, 'createdAt' | 'lastUsedAt'>;
+  /** The disclosure whose existing consent a transition relies on; revalidated atomically before acceptance. */
+  consentContext?: Omit<Consent, 'createdAt' | 'lastUsedAt'>;
+  touchConsent?: boolean;
+  expireConsentBefore?: number;
+}
+export class AssertionWindowError extends Error {
+  readonly code = 'ASSERTION_WINDOW';
+  constructor() { super('The signed assertion is outside its validity window'); this.name = 'AssertionWindowError'; }
+}
+/** Stable across separate copies of this package loaded by an external adapter. */
+export function isAssertionWindowError(error: unknown): error is AssertionWindowError {
+  return error instanceof Error && 'code' in error && error.code === 'ASSERTION_WINDOW';
+}
+/** Step 2 authority is rechecked atomically before consuming a first assertion. */
+export class AssertionSubjectError extends Error {
+  readonly code = 'ASSERTION_SUBJECT';
+  constructor(readonly error: 'unknown_key' | 'key_revoked') { super('The asserting key or Agent is no longer authorized'); this.name = 'AssertionSubjectError'; }
+}
+export function isAssertionSubjectError(error: unknown): error is AssertionSubjectError {
+  return error instanceof Error && 'code' in error && error.code === 'ASSERTION_SUBJECT' &&
+    'error' in error && (error.error === 'unknown_key' || error.error === 'key_revoked');
+}
+/** First assertions cannot take effect at or after the transaction deadline. */
+export class TransactionExpiredError extends Error {
+  readonly code = 'TRANSACTION_EXPIRED';
+  constructor() { super('The transaction expired before assertion acceptance'); this.name = 'TransactionExpiredError'; }
+}
+export function isTransactionExpiredError(error: unknown): error is TransactionExpiredError {
+  return error instanceof Error && 'code' in error && error.code === 'TRANSACTION_EXPIRED';
+}
+/** A previously identified transaction bearer no longer has authority. */
+export class TransactionTokenError extends Error {
+  readonly code = 'TRANSACTION_TOKEN';
+  constructor() { super('The transaction bearer is no longer valid'); this.name = 'TransactionTokenError'; }
+}
+export function isTransactionTokenError(error: unknown): error is TransactionTokenError {
+  return error instanceof Error && 'code' in error && error.code === 'TRANSACTION_TOKEN';
+}
+/** The public key is already active for another Agent; pending enrollments confer no exclusivity. */
+export class KeyActivationConflictError extends Error {
+  readonly code = 'KEY_ACTIVATION_CONFLICT';
+  constructor() { super('The public key is active for another Agent'); this.name = 'KeyActivationConflictError'; }
+}
+/** Stable across separate copies of this package loaded by an external adapter. */
+export function isKeyActivationConflictError(error: unknown): error is KeyActivationConflictError {
+  return error instanceof Error && 'code' in error && error.code === 'KEY_ACTIVATION_CONFLICT';
+}
 export interface Store {
+  /** Authoritative clock for protocol timestamps; local adapters use the supplied application/test clock. */
+  currentTime(fallbackNow: number): Promise<number>;
+  /** Shared issuer-key lifecycle. Private keys never enter Store. First initialization may select bootstrapKid. */
+  publishSigningKeys(keys: SigningKeyPublication[], bootstrapKid: string, now: number, cacheLifetime: number): Promise<void>;
+  listSigningKeys(): Promise<PublishedSigningKey[]>;
+  activateSigningKey(kid: string, now: number): Promise<boolean>;
+  removeSigningKey(kid: string, compromised: boolean, now: number): Promise<boolean>;
+  /** Reserves maximum expiration before signing; callers recheck compromise before delivery. */
+  reserveSigningKey(expiresAt: number, now: number): Promise<PublishedSigningKey | undefined>;
   // ---- owners, agents, credentials ----
-  putOwner(o: Owner): Promise<void>;
+  putOwner(o: Owner, now?: number): Promise<void>;
+  /** ATOMIC identity deletion; retained address linkage expires at this fixed deadline. */
+  deleteOwner(id: string, ownerSub: string, now: number, retentionSeconds: number): Promise<boolean>;
   getOwner(id: string): Promise<Owner | undefined>;
-  /** The Owner with this address (compared without regard to case); the most recently created when several share it. */
+  /** The Owner with this address (parsed local-part exact, domain case-insensitive); the most recently created when several share it. */
   getOwnerByEmail(email: string): Promise<Owner | undefined>;
   putOwnerCode(c: OwnerCode): Promise<void>;
   /** ATOMIC. Returns and deletes the Owner's outstanding code. */
   takeOwnerCode(ownerId: string): Promise<OwnerCode | undefined>;
-  putAgent(a: Agent): Promise<void>;
+  /** ATOMIC insert-if-absent; an existing handle is never overwritten. */
+  putAgent(a: Agent): Promise<boolean>;
   getAgent(handle: string): Promise<Agent | undefined>;
-  /** ATOMIC. Sets `enabled` on an existing Agent and returns it. */
-  setAgentEnabled(handle: string, enabled: boolean): Promise<Agent | undefined>;
-  deleteAgent(handle: string): Promise<void>;
+  /** ATOMIC. Requires this immutable Agent identity; disabling increments its fence and invalidates all dependent state. */
+  setAgentEnabled(handle: string, enabled: boolean, agentSub: string, now: number): Promise<Agent | undefined>;
+  /** ATOMIC. Delete only this identity, with all keys, accounts, consents and delegated credentials; retain signup counts. */
+  deleteAgent(handle: string, agentSub: string, now: number): Promise<boolean>;
   listAgentsByOwner(ownerId: string): Promise<Agent[]>;
   putCredential(c: Credential): Promise<void>;
   getCredential(hash: string): Promise<Credential | undefined>;
   listCredentials(filter: { ownerId?: string; handle?: string; kind?: 'owner' | 'delegated' }): Promise<Credential[]>;
   deleteCredential(hash: string): Promise<void>;
+  /** Read the credential and current Agent in one snapshot; never derive a new identity from a stale credential. */
+  resolveManagement(hash: string, handle: string): Promise<ManagementAuthorization | 'invalid_token' | 'not_found'>;
+  /** Protected reads validate the supplied authorization and return resources from the same snapshot. */
+  readManagementKeys(handle: string, authorization: ManagementAuthorization, kid?: string): Promise<AgentKey[] | undefined>;
+  readManagementAccounts(handle: string, authorization: ManagementAuthorization): Promise<Account[] | undefined>;
 
   // ---- keys (Section 7) ----
-  getKey(kid: string): Promise<AgentKey | undefined>;
+  /** Lookup is scoped to the current Agent at handle. Legacy unscoped lookup returns the active or sole record; ambiguous pending records return undefined. */
+  getKey(kid: string, handle?: string): Promise<AgentKey | undefined>;
   listKeys(handle: string): Promise<AgentKey[]>;
   /**
    * ATOMIC. Stores a `pending` key unless the public key was revoked for this handle (`revoked`) or is enrolled
-   * now, pending with an unexpired challenge or active and unexpired, for this handle (`enrolled`) or another
-   * (`other_handle`). A dead record of the same key is replaced.
+   * now, pending with an unexpired challenge or active and unexpired, for this Agent (`enrolled`). Other Agents'
+   * pending or active records do not prevent insertion. A dead record of this Agent's same key is replaced.
+   * The Agent sub, Owner and credential must still match the authorization snapshot, otherwise `unauthorized`;
+   * check and insert are one transaction.
    */
-  insertKey(k: AgentKey, now: number): Promise<InsertKeyResult>;
+  insertKey(k: AgentKey, now: number, authorization: ManagementAuthorization): Promise<InsertKeyResult>;
   /**
    * ATOMIC. `pending` becomes `active`, only if this enrollment is still pending and `challenge` is its unconsumed,
-   * unexpired challenge. False otherwise: in particular when the key was revoked while the proof was verified.
+   * unexpired challenge and the verified proof window still holds. False otherwise, or AssertionWindowError when
+   * the signed proof expired: in particular a revocation while the proof was verified cannot be overwritten.
+   * Exclusivity is claimed here: throws KeyActivationConflictError if another Agent has this key active and unexpired.
    */
-  activateKey(kid: string, enrollment: string, challenge: string, now: number): Promise<boolean>;
+  activateKey(kid: string, enrollment: string, challenge: string, now: number, assertionWindow?: { notBefore: number; expiresAt: number }): Promise<boolean>;
   /**
-   * ATOMIC. A `pending` or `active` key becomes `revoked` and is remembered as revoked for its handle. Returns the
-   * key when this call revoked it, nothing when there was nothing to revoke.
+   * ATOMIC. A `pending`, `active` or `expired` key becomes `revoked` and is remembered as revoked for its handle. Returns the
+   * key when this call revoked it (or an authorized repeat finds it already revoked), otherwise nothing. Requires the same enrollment and
+   * invalidates its transactions, codes and tokens in the same atomic operation. Protocol callers supply authorization,
+   * which is revalidated with the enrollment; omission is reserved for trusted internal lifecycle operations.
    */
-  revokeKey(kid: string, now: number): Promise<AgentKey | undefined>;
-  /** ATOMIC. Changes the label or permissions of this enrollment without touching its status. */
-  patchKey(kid: string, enrollment: string, patch: { name?: string; shareOwner?: boolean }): Promise<AgentKey | undefined>;
-  /** Deletes the record; with `enrollment`, only if it still is that enrollment. */
-  deleteKey(kid: string, enrollment?: string): Promise<void>;
+  revokeKey(kid: string, enrollment: string, now: number, authorization?: ManagementAuthorization): Promise<AgentKey | undefined>;
+  /** ATOMIC. Revoke pending/active keys and, for an Owner request, delegated credentials of the authorized Agent identity. */
+  revokeAllKeys(handle: string, authorization: ManagementAuthorization, now: number): Promise<boolean>;
+  /** ATOMIC. Changes this enrollment, validating authorization and permission when supplied by a protocol caller. */
+  patchKey(kid: string, enrollment: string, patch: { name?: string; shareOwner?: boolean }, authorization?: ManagementAuthorization): Promise<AgentKey | undefined>;
+  /** Deletes the selected record, requiring enrollment when supplied. With pendingExpiredAt, deletes only a
+   * still-pending challenge expired by that time; database adapters recheck their authoritative clock. */
+  deleteKey(kid: string, enrollment?: string, pendingExpiredAt?: number): Promise<void>;
   wasRevoked(handle: string, kid: string): Promise<boolean>;
 
   // ---- clients ----
@@ -244,25 +373,42 @@ export interface Store {
   // ---- transactions (Section 6) ----
   insertTransaction(t: Transaction): Promise<void>;
   getTransaction(id: string): Promise<Transaction | undefined>;
+  /** Read-only effective state, including lifecycle expiry and terminal retention. Never persists a transition. */
+  readTransaction(id: string, options: { now: number; retainFor: number }): Promise<Transaction | undefined>;
   /**
-   * ATOMIC. Replaces the transaction only if its stored version is `expectedVersion`, and stores it with the next
-   * version. False when another request changed it first: the caller re-reads and decides again.
+   * ATOMIC. Compare-and-swap against the open transaction version; return undefined on conflict. Validate subject
+   * identity/lifecycle and expiry, admit the signup cap on the FIRST assertion, and commit the transaction,
+   * reservation, and consent effects together. Existing consent relied on must still cover the supplied context;
+   * otherwise return a review state (or denial for prompt=none). Return the actual state (which may be denied/expired). Completion
+   * must use completeTransaction. A losing caller never creates or releases a reservation. A first assertion whose
+   * original transaction expired throws TransactionExpiredError without any write, before assertion-window checks.
+   * First assertions with invalid key/Agent authority throw AssertionSubjectError without consuming the challenge;
+   * Account denial remains an accepted gate. A changed expectedShareOwner returns a conflict with no effects,
+   * so the caller can recompute gates using the same enrollment's current permission. A supplied transactionTokenHash is checked before version/terminal checks and throws TransactionTokenError
+   * if explicit revocation removed its authority. The original maxAge is immutable; only first assertion acceptance
+   * sets assertedAt, using the store's fresh clock. Subsequent transitions cannot refresh that time.
    */
-  updateTransaction(t: Transaction, expectedVersion: number): Promise<boolean>;
+  updateTransaction(t: Transaction, expectedVersion: number, effects: TransitionEffects): Promise<Transaction | undefined>;
   /** Transactions whose stored status is not terminal (an expired one may still be listed; callers look at `expiresAt`). */
   listOpenTransactions(filter: SubjectFilter): Promise<Transaction[]>;
+  /** Upgrade only: at most limit (1..256) nonterminal records lacking a pinned presentation, from a filtered index. */
+  listLegacyTransactions(limit: number): Promise<Transaction[]>;
+
+  /** ATOMIC. Validate subject, reservation, expiry and maxAge; complete, insert code, count Account and release
+   * reservation together. Stale authentication ends denied/login_required without code, Account or count changes. */
+  completeTransaction(t: Transaction, expectedVersion: number, code: Code, now: number, transactionTokenHash?: string): Promise<Transaction | undefined>;
 
   // ---- codes and Access Tokens (Section 5) ----
-  insertCode(c: Code): Promise<void>;
   getCode(hash: string): Promise<Code | undefined>;
   /**
-   * ATOMIC. Marks the code used if it is neither used, void nor expired; otherwise says which. One redemption wins.
-   * A code that was used already is also marked `replayed`.
+   * ATOMIC. Marks the code used if it is neither used, void nor expired (including maxAge); otherwise says which. One redemption wins.
+   * A code that was used already is also marked `replayed`, and its Access Tokens are revoked in the same operation.
    */
   redeemCode(hash: string, now: number): Promise<RedeemResult>;
   /** ATOMIC per code. Voids every matching code that has not been used. */
   voidCodes(filter: SubjectFilter): Promise<void>;
-  insertAccessToken(t: AccessToken): Promise<void>;
+  /** ATOMIC. Issue only for a redeemed, unreplayed code, a current subject lifecycle and its stored maxAge. */
+  insertAccessToken(t: AccessToken, now: number): Promise<boolean>;
   getAccessToken(hash: string): Promise<AccessToken | undefined>;
   /** ATOMIC per token. Revokes every matching Access Token. */
   revokeAccessTokens(filter: SubjectFilter): Promise<void>;
@@ -270,38 +416,88 @@ export interface Store {
   // ---- consent (Section 6.4) ----
   getConsent(handle: string, clientId: string): Promise<Consent | undefined>;
   listConsents(handle: string): Promise<Consent[]>;
-  /** ATOMIC. Creates the record or adds the scopes to it, takes the client's current values, and sets its last use. */
-  grantConsent(c: Omit<Consent, 'createdAt' | 'lastUsedAt'>, now: number): Promise<void>;
-  /** ATOMIC. Sets the last use of an existing record. */
-  touchConsent(handle: string, clientId: string, now: number): Promise<void>;
-  deleteConsent(handle: string, clientId: string): Promise<void>;
+  deleteConsent(handle: string, clientId: string, authorization: ManagementAuthorization): Promise<boolean>;
 
   // ---- accounts and the per-owner cap (Sections 7.4, 7.6) ----
   getAccount(handle: string, clientId: string): Promise<Account | undefined>;
   listAccounts(handle: string): Promise<Account[]>;
-  /** ATOMIC. Sets the status of an existing Account and returns it. */
-  setAccountStatus(handle: string, clientId: string, status: 'enabled' | 'disabled'): Promise<Account | undefined>;
+  /** ATOMIC. Authorize against the same Agent identity; disabling increments the Account fence and invalidates dependents. */
+  setAccountStatus(handle: string, clientId: string, status: 'enabled' | 'disabled', authorization: ManagementAuthorization, now: number): Promise<Account | undefined>;
   deleteAccount(handle: string, clientId: string): Promise<void>;
   /** Number of Accounts ever created for (Owner, client), including disabled and deleted ones. */
   signupsEver(ownerId: string, clientId: string): Promise<number>;
-  /**
-   * ATOMIC. Reserves a place under the cap for an Agent that has no Account at the client, on behalf of one
-   * transaction, until `expiresAt`. Granted when the Accounts ever created plus the other Agents that hold an
-   * unexpired reservation and still have no Account number fewer than `max`. An Agent's own reservations and Agents
-   * that have an Account by now take no further place.
-   */
-  reserveSignup(p: { ownerId: string; clientId: string; handle: string; txnId: string; expiresAt: number; max: number; now: number }): Promise<boolean>;
-  /** Moves the expiry of a transaction's reservation, if it holds one (a transaction waiting for the Owner lives longer). */
-  extendSignup(p: { ownerId: string; clientId: string; txnId: string; expiresAt: number }): Promise<void>;
-  /** Gives up a transaction's reservation, if it holds one. */
-  releaseSignup(p: { ownerId: string; clientId: string; txnId: string }): Promise<void>;
-  /**
-   * ATOMIC. Records a completed sign-in: creates the Account and counts one sign-up for the Owner when the Account
-   * does not exist, otherwise updates its counters; either way the transaction's reservation ends. However many
-   * transactions complete for one Account at the same time, it is created and counted once.
-   */
-  recordSignIn(p: { handle: string; clientId: string; ownerId: string; txnId: string; now: number }): Promise<{ created: boolean }>;
+
 }
+
+/** Public operations only: internal reservation/count helpers cannot be called outside their atomic transition. */
+export const STORE_METHODS: readonly (keyof Store)[] = Object.freeze(Object.keys({
+  currentTime: true,
+  publishSigningKeys: true,
+  listSigningKeys: true,
+  activateSigningKey: true,
+  removeSigningKey: true,
+  reserveSigningKey: true,
+  putOwner: true,
+  deleteOwner: true,
+  getOwner: true,
+  getOwnerByEmail: true,
+  putOwnerCode: true,
+  takeOwnerCode: true,
+  putAgent: true,
+  getAgent: true,
+  setAgentEnabled: true,
+  deleteAgent: true,
+  listAgentsByOwner: true,
+  putCredential: true,
+  getCredential: true,
+  listCredentials: true,
+  deleteCredential: true,
+  resolveManagement: true,
+  readManagementKeys: true,
+  readManagementAccounts: true,
+  getKey: true,
+  listKeys: true,
+  insertKey: true,
+  activateKey: true,
+  revokeKey: true,
+  revokeAllKeys: true,
+  patchKey: true,
+  deleteKey: true,
+  wasRevoked: true,
+  putClient: true,
+  getClient: true,
+  insertTransaction: true,
+  getTransaction: true,
+  readTransaction: true,
+  updateTransaction: true,
+  listOpenTransactions: true,
+  listLegacyTransactions: true,
+  completeTransaction: true,
+  getCode: true,
+  redeemCode: true,
+  voidCodes: true,
+  insertAccessToken: true,
+  getAccessToken: true,
+  revokeAccessTokens: true,
+  getConsent: true,
+  listConsents: true,
+  deleteConsent: true,
+  getAccount: true,
+  listAccounts: true,
+  setAccountStatus: true,
+  deleteAccount: true,
+  signupsEver: true,
+} satisfies Record<keyof Store, true>) as (keyof Store)[]);
+
+/** Reads never rewrite state, including polling an effectively expired transaction. */
+export const READ_METHODS: ReadonlySet<keyof Store> = new Set<keyof Store>([
+  'currentTime', 'listSigningKeys', 'getOwner', 'getOwnerByEmail', 'getAgent', 'listAgentsByOwner', 'getCredential',
+  'listCredentials', 'getKey', 'listKeys', 'wasRevoked', 'getClient', 'getTransaction', 'readTransaction',
+  'resolveManagement', 'readManagementKeys', 'readManagementAccounts',
+  'listOpenTransactions', 'listLegacyTransactions', 'getCode', 'getAccessToken', 'getConsent', 'listConsents', 'getAccount',
+  'listAccounts', 'signupsEver',
+]);
+
 
 const copy = <T>(v: T): T => (v === undefined ? v : structuredClone(v));
 const matches = (x: { kid?: string; keyEnrollment?: string; handle?: string; clientId?: string; ownerId?: string; txnId?: string }, f: SubjectFilter): boolean =>
@@ -316,7 +512,13 @@ const matches = (x: { kid?: string; keyEnrollment?: string; handle?: string; cli
  * The in-memory store. Every method body runs without awaiting anything, so each is atomic within the process; it
  * stores and returns copies, so nothing a caller holds changes behind its back or changes the store by itself.
  */
-export class MemoryStore implements Store {
+export type SyncStore = { [K in keyof Store]: (...args: Parameters<Store[K]>) => Awaited<ReturnType<Store[K]>> };
+
+export class StoreState implements SyncStore {
+  private signingKeys = new Map<string, PublishedSigningKey>();
+  private activeSigningKid?: string;
+  private legacySigningHistory = false;
+  private deletedIdentities = new Map<string, string>();
   private owners = new Map<string, Owner>();
   private agents = new Map<string, Agent>();
   private ownerCodes = new Map<string, OwnerCode>();
@@ -325,155 +527,566 @@ export class MemoryStore implements Store {
   private revoked = new Set<string>();
   private clients = new Map<string, Client>();
   private transactions = new Map<string, Transaction>();
+  private legacyTransactions = new Set<string>();
   private codes = new Map<string, Code>();
   private tokens = new Map<string, AccessToken>();
   private consents = new Map<string, Consent>();
   private accounts = new Map<string, Account>();
-  private signups = new Map<string, number>();
+  private signups = new Map<string, number>(); // legacy snapshot migration only
+  private signupEvents = new Map<string, string[]>();
+  private deletedOwners = new Map<string, { address: string; expiresAt: number }>();
   private reservations = new Map<string, Map<string, { handle: string; expiresAt: number }>>();
 
-  async putOwner(o: Owner) { this.owners.set(o.id, copy(o)); }
-  async getOwner(id: string) { return copy(this.owners.get(id)); }
-  async getOwnerByEmail(email: string) {
-    const wanted = email.toLowerCase();
-    return copy([...this.owners.values()].filter((o) => o.email.toLowerCase() === wanted).sort((a, b) => b.createdAt - a.createdAt)[0]);
+  constructor(snapshot?: string) {
+    if (snapshot !== undefined) {
+      const parsed = JSON.parse(snapshot);
+      if ((parsed.version !== 1 && parsed.version !== 2 && parsed.version !== 3) || !parsed.maps || !Array.isArray(parsed.revoked)) throw new Error('Unsupported issuer store snapshot');
+      for (const name of ['owners', 'agents', 'ownerCodes', 'credentials', 'keys', 'clients', 'transactions', 'codes', 'tokens', 'consents', 'accounts', 'signups'] as const) {
+        if (!Array.isArray(parsed.maps[name])) throw new Error(`Invalid store map: ${name}`);
+        (this[name] as Map<string, unknown>) = new Map(parsed.maps[name]);
+      }
+      // Version 1 originally indexed all keys by kid. Derive the scoped index from each value so existing SQLite
+      // snapshots and the newer scoped form both load without losing identity, revocation or transaction history.
+      this.keys = new Map([...this.keys.values()].map((key) => [this.keyIndex(key.agentSub, key.kid), key]));
+      this.signingKeys = new Map(parsed.maps.signingKeys ?? []);
+      this.activeSigningKid = parsed.activeSigningKid;
+      this.legacySigningHistory = parsed.legacySigningHistory ?? parsed.maps.signingKeys === undefined;
+      this.deletedIdentities = new Map(parsed.maps.deletedIdentities ?? []);
+      this.signupEvents = new Map(parsed.maps.signupEvents ?? []);
+      if (!parsed.maps.signupEvents) {
+        for (const tx of this.transactions.values()) if (tx.status === 'completed' && tx.ownerId && tx.agentSub) {
+          const key=`${tx.ownerId}\u0000${tx.clientId}`;
+          this.signupEvents.set(key,[...new Set([...(this.signupEvents.get(key)??[]),`${tx.agentSub}\u0000${tx.clientId}`])]);
+        }
+        for (const [key,count] of this.signups) {
+          const known=this.signupEvents.get(key)??[];
+          this.signupEvents.set(key,[...known,...Array.from({length:Math.max(0,count-known.length)},(_,i)=>`legacy:${key}:${i}`)]);
+        }
+      }
+      this.deletedOwners = new Map(parsed.maps.deletedOwners ?? []);
+      this.revoked = new Set(parsed.revoked);
+      this.reservations = new Map(parsed.reservations.map(([key, entries]: [string, [string, { handle: string; expiresAt: number }][]]) => [key, new Map(entries)]));
+      for (const tx of this.transactions.values()) if (!tx.clientPresentation && !TERMINAL.has(tx.status)) this.legacyTransactions.add(tx.id);
+    }
   }
-  async putOwnerCode(c: OwnerCode) { this.ownerCodes.set(c.ownerId, copy(c)); }
-  async takeOwnerCode(ownerId: string) {
+  exportSnapshot(): string {
+    const maps = Object.fromEntries(['owners', 'agents', 'ownerCodes', 'credentials', 'keys', 'clients', 'transactions', 'codes', 'tokens', 'consents', 'accounts', 'signups', 'signupEvents', 'deletedOwners', 'signingKeys', 'deletedIdentities'].map((name) => [name, [...(this as unknown as Record<string, Map<string, unknown>>)[name]!.entries()]]));
+    return JSON.stringify({ version: 3, maps, activeSigningKid: this.activeSigningKid, legacySigningHistory: this.legacySigningHistory, revoked: [...this.revoked], reservations: [...this.reservations].map(([key, entries]) => [key, [...entries]]) });
+  }
+
+  currentTime(fallbackNow: number) { return fallbackNow; }
+
+  publishSigningKeys(keys: SigningKeyPublication[], bootstrapKid: string, now: number, cacheLifetime: number) {
+    if (!Number.isSafeInteger(cacheLifetime) || cacheLifetime < 0 || !keys.some((k) => k.kid === bootstrapKid)) throw new TypeError('Invalid signing publication');
+    for (const key of keys) {
+      validateSigningPublication(key);
+      const previous = this.signingKeys.get(key.kid);
+      if (previous && !samePublicSigningKey(previous.publicJwk,key.publicJwk)) throw new Error('Signing key identifier cannot be reused');
+      if (previous && previous.status !== 'published') throw new Error('Removed signing key cannot be republished');
+    }
+    const bootstrap = this.signingKeys.size === 0;
+    const retireNotBefore = this.legacySigningHistory ? now + LEGACY_SIGNING_OVERLAP_SECONDS : undefined;
+    // Every replica serves the shared key ring. A replica with a longer cache policy
+    // may serve keys another replica stages later, without reloading its own ring.
+    const sharedCacheLifetime = Math.max(cacheLifetime, ...[...this.signingKeys.values()].map((key) => key.cacheLifetime));
+    for (const existing of this.signingKeys.values()) if (existing.status === 'published') existing.cacheLifetime=sharedCacheLifetime;
+    for (const key of keys) {
+      const previous = this.signingKeys.get(key.kid);
+      this.signingKeys.set(key.kid,previous ? {...previous,cacheLifetime:sharedCacheLifetime} : {...copy(key),status:'published',publishedAt:now,cacheLifetime:sharedCacheLifetime,retireNotBefore});
+    }
+    if (bootstrap) this.activeSigningKid = bootstrapKid;
+    this.legacySigningHistory = false;
+  }
+  listSigningKeys() { return copy([...this.signingKeys.values()].filter((k) => k.status === 'published')); }
+  activateSigningKey(kid: string, now: number) {
+    const key=this.signingKeys.get(kid);
+    if (!key || key.status !== 'published' || now <= key.publishedAt) return false;
+    this.activeSigningKid=kid;
+    return true;
+  }
+  removeSigningKey(kid: string, compromised: boolean, now: number) {
+    const key=this.signingKeys.get(kid);
+    if (!key) return false;
+    if (key.status !== 'published') return true;
+    if (!compromised && (this.activeSigningKid === kid || now < Math.max((key.lastIssuedExpiresAt ?? key.publishedAt) + key.cacheLifetime,key.retireNotBefore ?? 0))) return false;
+    key.status=compromised?'compromised':'retired';
+    if (this.activeSigningKid === kid) this.activeSigningKid=undefined;
+    return true;
+  }
+  reserveSigningKey(expiresAt: number, now: number) {
+    const key=this.activeSigningKid ? this.signingKeys.get(this.activeSigningKid) : undefined;
+    if (!key || key.status !== 'published' || !Number.isSafeInteger(expiresAt) || expiresAt <= now) return undefined;
+    key.lastIssuedExpiresAt=Math.max(key.lastIssuedExpiresAt ?? 0,expiresAt);
+    if (key.retireNotBefore !== undefined) key.retireNotBefore=Math.max(key.retireNotBefore,expiresAt+LEGACY_SIGNING_CACHE_SECONDS);
+    return copy(key);
+  }
+  private quotaOwners(ownerId: string): string[] {
+    const owner = this.owners.get(ownerId);
+    if (!owner?.emailVerified) return [ownerId];
+    const address = ownerAddressKey(owner.email);
+    return [...this.owners.values()].filter((o) => o.emailVerified && ownerAddressKey(o.email) === address).map((o) => o.id);
+  }
+  private expireOwnerLinks(now: number) {
+    for (const [id, link] of this.deletedOwners) if (now >= link.expiresAt) {
+      this.deletedOwners.delete(id);
+      for (const key of this.signupEvents.keys()) if (key.startsWith(`${id}\u0000`)) this.signupEvents.delete(key);
+    }
+  }
+  putOwner(o: Owner, now = o.createdAt) {
+    const address = ownerAddressKey(o.email);
+    const previous = this.owners.get(o.id);
+    if (previous && previous.ownerSub !== o.ownerSub) throw new Error('Owner subject is immutable');
+    if (this.deletedIdentities.has(o.id) || [...this.deletedIdentities.values()].includes(o.ownerSub)) throw new Error('Deleted Owner identity cannot be reused');
+    if ([...this.owners.values()].some((owner) => owner.id !== o.id && owner.ownerSub === o.ownerSub)) throw new Error('Owner subject already exists');
+    this.expireOwnerLinks(now);
+    this.owners.set(o.id, copy(o));
+    if (o.emailVerified) {
+      const peers = this.quotaOwners(o.id);
+      const sources = new Set([...peers, ...[...this.deletedOwners].filter(([, link]) => link.address === address).map(([id]) => id)]);
+      const totals = new Map<string, Set<string>>();
+      for (const [key, events] of this.signupEvents) {
+        const [id, client] = key.split('\u0000');
+        if (!sources.has(id!)) continue;
+        const all = totals.get(client!) ?? new Set<string>();
+        for (const event of events) all.add(event);
+        totals.set(client!, all);
+      }
+      for (const peer of peers) for (const [client, events] of totals) this.signupEvents.set(`${peer}\u0000${client}`, [...events]);
+    }
+  }
+  deleteOwner(id: string, ownerSub: string, now: number, retentionSeconds: number) {
+    if (!Number.isSafeInteger(retentionSeconds) || retentionSeconds < 0 || !Number.isSafeInteger(now + retentionSeconds)) throw new TypeError('Invalid Owner retention period');
+    const owner = this.owners.get(id);
+    if (!owner || owner.ownerSub !== ownerSub) return false;
+    this.expireOwnerLinks(now);
+    for (const agent of [...this.agents.values()]) if (agent.ownerId === id) this.deleteAgent(agent.handle, agent.sub, now);
+    for (const [hash, credential] of this.credentials) if (credential.ownerId === id) this.credentials.delete(hash);
+    this.ownerCodes.delete(id);
+    this.owners.delete(id);
+    this.deletedIdentities.set(id,ownerSub);
+    if (owner.emailVerified && retentionSeconds > 0) this.deletedOwners.set(id, { address: ownerAddressKey(owner.email), expiresAt: now + retentionSeconds });
+    else for (const key of this.signupEvents.keys()) if (key.startsWith(`${id}\u0000`)) this.signupEvents.delete(key);
+    return true;
+  }
+  getOwner(id: string) { return copy(this.owners.get(id)); }
+  getOwnerByEmail(email: string) {
+    const wanted = ownerAddressKey(email);
+    return copy([...this.owners.values()].filter((o) => ownerAddressKey(o.email) === wanted).sort((a, b) => b.createdAt - a.createdAt)[0]);
+  }
+  putOwnerCode(c: OwnerCode) { this.ownerCodes.set(c.ownerId, copy(c)); }
+  takeOwnerCode(ownerId: string) {
     const c = this.ownerCodes.get(ownerId);
     this.ownerCodes.delete(ownerId);
     return c;
   }
-  async putAgent(a: Agent) { this.agents.set(a.handle, copy(a)); }
-  async getAgent(handle: string) { return copy(this.agents.get(handle)); }
-  async setAgentEnabled(handle: string, enabled: boolean) {
+  putAgent(a: Agent) {
+    if (this.agents.has(a.handle) || [...this.agents.values()].some((agent) => agent.sub === a.sub)) return false;
+    this.agents.set(a.handle, copy(a));
+    return true;
+  }
+  getAgent(handle: string) { return copy(this.agents.get(handle)); }
+  setAgentEnabled(handle: string, enabled: boolean, agentSub: string, now: number) {
     const a = this.agents.get(handle);
-    if (a) a.enabled = enabled;
+    if (!a || a.sub !== agentSub) return undefined;
+    a.enabled = enabled;
+    if (!enabled) {
+      a.authorizationVersion += 1;
+      this.invalidate({ handle }, 'access_denied', now);
+    }
     return copy(a);
   }
-  async deleteAgent(handle: string) { this.agents.delete(handle); }
-  async listAgentsByOwner(ownerId: string) { return copy([...this.agents.values()].filter((a) => a.ownerId === ownerId)); }
-  async putCredential(c: Credential) { this.credentials.set(c.hash, copy(c)); }
-  async getCredential(hash: string) { return copy(this.credentials.get(hash)); }
-  async listCredentials(f: { ownerId?: string; handle?: string; kind?: 'owner' | 'delegated' }) {
+  deleteAgent(handle: string, agentSub: string, now: number) {
+    const a = this.agents.get(handle);
+    if (!a || a.sub !== agentSub) return false;
+    this.invalidate({ handle }, 'access_denied', now);
+    for (const [index, k] of this.keys) if (k.handle === handle && k.agentSub === agentSub) {
+      if (k.status === 'revoked') this.revokeTransactionTokens(k.kid, k.enrollment);
+      this.revoked.add(`${handle}\u0000${k.kid}`);
+      this.keys.delete(index);
+    }
+    for (const [id, c] of this.consents) if (c.handle === handle) this.consents.delete(id);
+    for (const [id, a] of this.accounts) if (a.handle === handle) this.accounts.delete(id);
+    for (const [hash, c] of this.credentials) if (c.handle === handle && c.kind === 'delegated') this.credentials.delete(hash);
+    this.agents.delete(handle);
+    return true;
+  }
+  private managementCurrent(handle: string, auth: ManagementAuthorization) {
+    const agent = this.agents.get(handle);
+    const credential = this.credentials.get(auth.hash);
+    return agent?.sub === auth.agentSub && agent.ownerId === auth.ownerId && credential?.ownerId === auth.ownerId &&
+      credential.kind === auth.kind && credential.sessionAuth === auth.sessionAuth && credential.createdAt === auth.createdAt &&
+      credential.handle === auth.handle && (credential.kind === 'owner' || credential.handle === handle);
+  }
+  resolveManagement(hash: string, handle: string): ManagementAuthorization | 'invalid_token' | 'not_found' {
+    const credential = this.credentials.get(hash);
+    if (!credential) return 'invalid_token';
+    const agent = this.agents.get(handle);
+    if (!agent || agent.ownerId !== credential.ownerId || (credential.kind === 'delegated' && credential.handle !== handle)) return 'not_found';
+    return copy({ ...credential, agentSub: agent.sub });
+  }
+  readManagementKeys(handle: string, authorization: ManagementAuthorization, kid?: string) {
+    if (!this.managementCurrent(handle, authorization)) return undefined;
+    return copy([...this.keys.values()].filter((key) => key.agentSub === authorization.agentSub && key.handle === handle && (kid === undefined || key.kid === kid)));
+  }
+  readManagementAccounts(handle: string, authorization: ManagementAuthorization) {
+    if (!this.managementCurrent(handle, authorization)) return undefined;
+    return this.listAccounts(handle);
+  }
+  private invalidate(filter: SubjectFilter, reason: DenyReason, now: number) {
+    for (const t of this.transactions.values()) if (!TERMINAL.has(t.status) && matches({ ...t, txnId: t.id }, filter)) {
+      // Expiry may not have been materialized yet. A later lifecycle event must not restart its retention window,
+      // including when the asserting key expired before the transaction's own deadline.
+      const expired = this.expiredTransaction(t, now);
+      t.status = expired?.status ?? 'denied';
+      t.reason = expired ? expired.reason : reason;
+      t.terminalAt = expired?.terminalAt ?? now;
+      t.challenge = undefined;
+      t.version += 1;
+      if (t.ownerId) this.releaseSignup({ ownerId: t.ownerId, clientId: t.clientId, txnId: t.id });
+    }
+    this.voidCodes(filter);
+    this.revokeAccessTokens(filter);
+  }
+  private expiredTransaction(t: Transaction, now: number): Transaction | undefined {
+    const key = t.kid && t.keyEnrollment ? this.enrollmentKey(t.kid, t.keyEnrollment) : undefined;
+    const keyExpiry = key && key.enrollment === t.keyEnrollment && key.agentSub === t.agentSub && key.status !== 'pending'
+      ? key.expiresAt : Infinity;
+    if (now >= t.expiresAt && t.expiresAt <= keyExpiry) {
+      return { ...t, status: 'expired', terminalAt: t.expiresAt, reason: undefined, challenge: undefined };
+    }
+    if (now >= keyExpiry) return { ...t, status: 'denied', reason: 'key_revoked', terminalAt: keyExpiry, challenge: undefined };
+    return undefined;
+  }
+  private assertionSubjectReason(tx: Transaction, now: number): 'unknown_key' | 'key_revoked' | undefined {
+    const agent = tx.handle && this.agents.get(tx.handle);
+    if (!agent || agent.sub !== tx.agentSub || !agent.enabled || agent.authorizationVersion !== tx.agentVersion) return 'unknown_key';
+    const key = tx.kid && tx.keyEnrollment ? this.enrollmentKey(tx.kid, tx.keyEnrollment) : undefined;
+    if (!key || key.handle !== tx.handle || key.agentSub !== tx.agentSub) return 'unknown_key';
+    if (key.status !== 'active' || now >= key.expiresAt) return 'key_revoked';
+    return undefined;
+  }
+  private subjectReason(s: { handle?: string; kid?: string; keyEnrollment?: string; agentSub?: string; agentVersion?: number; accountVersion?: number; clientId: string }, now: number): 'key_revoked' | 'access_denied' | undefined {
+    const key = s.kid && s.keyEnrollment && this.enrollmentKey(s.kid, s.keyEnrollment);
+    if (!key || key.handle !== s.handle || key.enrollment !== s.keyEnrollment || key.agentSub !== s.agentSub || key.status !== 'active' || now >= key.expiresAt) return 'key_revoked';
+    const agent = s.handle && this.agents.get(s.handle);
+    if (!agent || agent.sub !== s.agentSub || !agent.enabled || agent.authorizationVersion !== s.agentVersion) return 'access_denied';
+    const account = this.accounts.get(`${s.handle}\u0000${s.clientId}`);
+    if (account?.status === 'disabled' || (account?.authorizationVersion ?? 0) !== s.accountVersion) return 'access_denied';
+    return undefined;
+  }
+  listAgentsByOwner(ownerId: string) { return copy([...this.agents.values()].filter((a) => a.ownerId === ownerId)); }
+  putCredential(c: Credential) { this.credentials.set(c.hash, copy(c)); }
+  getCredential(hash: string) { return copy(this.credentials.get(hash)); }
+  listCredentials(f: { ownerId?: string; handle?: string; kind?: 'owner' | 'delegated' }) {
     return copy([...this.credentials.values()].filter((c) => (f.ownerId === undefined || c.ownerId === f.ownerId) && (f.handle === undefined || c.handle === f.handle) && (f.kind === undefined || c.kind === f.kind)));
   }
-  async deleteCredential(hash: string) { this.credentials.delete(hash); }
+  deleteCredential(hash: string) { this.credentials.delete(hash); }
 
-  async getKey(kid: string) { return copy(this.keys.get(kid)); }
-  async listKeys(handle: string) { return copy([...this.keys.values()].filter((k) => k.handle === handle)); }
-  async insertKey(k: AgentKey, now: number): Promise<InsertKeyResult> {
+  private keyIndex(agentSub: string, kid: string): string { return `${agentSub}\u0000${kid}`; }
+  private enrollmentKey(kid: string, enrollment: string): AgentKey | undefined {
+    return [...this.keys.values()].find((key) => key.kid === kid && key.enrollment === enrollment);
+  }
+  getKey(kid: string, handle?: string) {
+    if (handle !== undefined) {
+      const agent = this.agents.get(handle);
+      return copy(agent ? this.keys.get(this.keyIndex(agent.sub, kid)) : undefined);
+    }
+    const keys = [...this.keys.values()].filter((key) => key.kid === kid);
+    const active = keys.filter((key) => key.status === 'active');
+    return copy(active.length === 1 ? active[0] : keys.length === 1 ? keys[0] : undefined);
+  }
+  listKeys(handle: string) { return copy([...this.keys.values()].filter((k) => k.handle === handle)); }
+  insertKey(k: AgentKey, now: number, authorization: ManagementAuthorization): InsertKeyResult {
+    if (k.agentSub !== authorization.agentSub || !this.managementCurrent(k.handle, authorization)) return 'unauthorized';
     if (this.revoked.has(`${k.handle}\u0000${k.kid}`)) return 'revoked';
-    const cur = this.keys.get(k.kid);
-    const enrolled = cur !== undefined && ((cur.status === 'pending' && cur.challenge !== undefined && now <= cur.challenge.expiresAt) || (cur.status === 'active' && now < cur.expiresAt));
-    if (enrolled) return cur.handle === k.handle ? 'enrolled' : 'other_handle';
-    this.keys.set(k.kid, copy(k));
+    const index = this.keyIndex(k.agentSub, k.kid);
+    const cur = this.keys.get(index);
+    const enrolled = cur !== undefined && ((cur.status === 'pending' && cur.challenge !== undefined && now < cur.challenge.expiresAt && now < cur.expiresAt) || (cur.status === 'active' && now < cur.expiresAt));
+    if (enrolled) return 'enrolled';
+    if (k.status !== 'pending' || k.expiresAt <= now || !k.challenge || k.challenge.expiresAt <= now) return 'unauthorized';
+    if ([...this.keys.values()].some((key) => key.enrollment === k.enrollment)) throw new Error('Key enrollment already exists');
+    // Preserve the original expiry outcome before this Agent's current-key index points at a new enrollment.
+    if (cur?.status === 'active' && now >= cur.expiresAt) this.invalidate({ kid: cur.kid, keyEnrollment: cur.enrollment }, 'key_revoked', cur.expiresAt);
+    this.keys.set(index, copy(k));
     return 'ok';
   }
-  async activateKey(kid: string, enrollment: string, challenge: string, now: number) {
-    const k = this.keys.get(kid);
-    if (!k || k.enrollment !== enrollment || k.status !== 'pending' || !k.challenge || k.challenge.value !== challenge || now > k.challenge.expiresAt) return false;
+  activateKey(kid: string, enrollment: string, challenge: string, now: number, assertionWindow?: { notBefore: number; expiresAt: number }) {
+    const k = this.enrollmentKey(kid, enrollment);
+    if (!k || this.agents.get(k.handle)?.sub !== k.agentSub || k.status !== 'pending' || !k.challenge || k.challenge.value !== challenge || now >= k.challenge.expiresAt || now >= k.expiresAt) return false;
+    if (assertionWindow && (now < assertionWindow.notBefore || now >= assertionWindow.expiresAt)) throw new AssertionWindowError();
+    const active = [...this.keys.values()].filter((key) => key.kid === kid && key.status === 'active');
+    if (active.some((key) => now < key.expiresAt)) throw new KeyActivationConflictError();
+    for (const expired of active) {
+      this.invalidate({ kid, keyEnrollment: expired.enrollment }, 'key_revoked', expired.expiresAt);
+      expired.status = 'expired';
+    }
     k.status = 'active';
     k.challenge = undefined;
     return true;
   }
-  async revokeKey(kid: string, now: number) {
-    const k = this.keys.get(kid);
-    if (!k || (k.status !== 'pending' && k.status !== 'active')) return undefined;
+  revokeKey(kid: string, enrollment: string, now: number, authorization?: ManagementAuthorization) {
+    const k = this.enrollmentKey(kid, enrollment);
+    if (authorization && (!k || k.agentSub !== authorization.agentSub || !this.managementCurrent(k.handle, authorization))) return undefined;
+    // Individual revocation also forbids reuse after expiry, including an enrollment retired by another Agent.
+    if (!k) return undefined;
+    if (k.status === 'revoked') {
+      this.revokeTransactionTokens(kid, enrollment);
+      return authorization ? copy(k) : undefined;
+    }
     k.status = 'revoked';
     k.revokedAt = now;
     k.challenge = undefined;
     this.revoked.add(`${k.handle}\u0000${k.kid}`);
+    this.invalidate({ kid, keyEnrollment: enrollment }, 'key_revoked', now);
+    this.revokeTransactionTokens(kid, enrollment);
     return copy(k);
   }
-  async patchKey(kid: string, enrollment: string, patch: { name?: string; shareOwner?: boolean }) {
-    const k = this.keys.get(kid);
-    if (!k || k.enrollment !== enrollment) return undefined;
+  private revokeTransactionTokens(kid: string, enrollment: string) {
+    // Explicit revocation ends bearer authority even for retained terminal transactions. Natural expiry does not.
+    for (const tx of this.transactions.values()) if (tx.kid === kid && tx.keyEnrollment === enrollment && tx.transactionTokenHash !== undefined) {
+      delete tx.transactionTokenHash;
+      tx.version += 1;
+    }
+  }
+  private transactionTokenRevoked(tx: Transaction): boolean {
+    const key = tx.kid && tx.keyEnrollment ? this.enrollmentKey(tx.kid, tx.keyEnrollment) : undefined;
+    return key?.status === 'revoked' && key.handle === tx.handle && key.agentSub === tx.agentSub;
+  }
+  revokeAllKeys(handle: string, authorization: ManagementAuthorization, now: number) {
+    if (!this.managementCurrent(handle, authorization)) return false;
+    for (const k of this.keys.values()) if (k.handle === handle && k.agentSub === authorization.agentSub && (k.status === 'pending' || k.status === 'active')) this.revokeKey(k.kid, k.enrollment, now);
+    if (authorization.kind === 'owner') for (const [hash, c] of this.credentials) if (c.handle === handle && c.kind === 'delegated') this.credentials.delete(hash);
+    return true;
+  }
+  patchKey(kid: string, enrollment: string, patch: { name?: string; shareOwner?: boolean }, authorization?: ManagementAuthorization) {
+    const k = this.enrollmentKey(kid, enrollment);
+    if (!k) return undefined;
+    if (authorization && (k.agentSub !== authorization.agentSub || !this.managementCurrent(k.handle, authorization) ||
+      (patch.shareOwner !== undefined && (authorization.kind !== 'owner' || !['passkey', 'oidc', 'domain', 'email_factor'].includes(authorization.sessionAuth ?? ''))))) return undefined;
     if (patch.name !== undefined) k.name = patch.name;
     if (patch.shareOwner !== undefined) k.permissions.share_owner = patch.shareOwner;
     return copy(k);
   }
-  async deleteKey(kid: string, enrollment?: string) {
-    const k = this.keys.get(kid);
-    if (k && (enrollment === undefined || k.enrollment === enrollment)) this.keys.delete(kid);
+  deleteKey(kid: string, enrollment?: string, pendingExpiredAt?: number) {
+    const k = enrollment === undefined ? this.getKey(kid) : this.enrollmentKey(kid, enrollment);
+    if (!k || (pendingExpiredAt !== undefined && (k.status !== 'pending' || (k.challenge && pendingExpiredAt < k.challenge.expiresAt)))) return;
+    // Persist legacy revocation before its key record disappears; missing/expired enrollments alone revoke no bearer.
+    if (k.status === 'revoked') this.revokeTransactionTokens(k.kid, k.enrollment);
+    this.keys.delete(this.keyIndex(k.agentSub, kid));
   }
-  async wasRevoked(handle: string, kid: string) { return this.revoked.has(`${handle}\u0000${kid}`); }
+  wasRevoked(handle: string, kid: string) { return this.revoked.has(`${handle}\u0000${kid}`); }
 
-  async putClient(c: Client) { this.clients.set(c.clientId, copy(c)); }
-  async getClient(clientId: string) { return copy(this.clients.get(clientId)); }
+  putClient(c: Client) { this.clients.set(c.clientId, copy(c)); }
+  getClient(clientId: string) { return copy(this.clients.get(clientId)); }
 
-  async insertTransaction(t: Transaction) { this.transactions.set(t.id, copy(t)); }
-  async getTransaction(id: string) { return copy(this.transactions.get(id)); }
-  async updateTransaction(t: Transaction, expectedVersion: number) {
+  insertTransaction(t: Transaction) {
+    if (this.transactions.has(t.id)) throw new Error('Transaction already exists');
+    this.transactions.set(t.id, copy(t));
+    if (!t.clientPresentation && !TERMINAL.has(t.status)) this.legacyTransactions.add(t.id);
+  }
+  getTransaction(id: string) { return copy(this.transactions.get(id)); }
+  readTransaction(id: string, { now, retainFor }: { now: number; retainFor: number }) {
+    const stored = this.transactions.get(id);
+    if (!stored) return undefined;
+    let tx = copy(stored);
+    // Older snapshots may retain hashes after revocation; deny that exact enrollment without a polling write.
+    if (this.transactionTokenRevoked(tx)) delete tx.transactionTokenHash;
+    if (!TERMINAL.has(tx.status)) {
+      const expired = this.expiredTransaction(tx, now);
+      if (expired) tx = expired;
+      else if (tx.kid) {
+        const reason = this.subjectReason(tx, now);
+        if (reason) tx = { ...tx, status: 'denied', reason, terminalAt: now, challenge: undefined };
+      }
+    }
+    return TERMINAL.has(tx.status) && tx.terminalAt !== undefined && now > tx.terminalAt + retainFor ? undefined : tx;
+  }
+  updateTransaction(t: Transaction, expectedVersion: number, effects: TransitionEffects) {
     const cur = this.transactions.get(t.id);
-    if (!cur || cur.version !== expectedVersion) return false;
-    this.transactions.set(t.id, { ...copy(t), version: expectedVersion + 1 });
-    return true;
+    if (cur && effects.transactionTokenHash !== undefined && (effects.transactionTokenHash !== cur.transactionTokenHash || this.transactionTokenRevoked(cur))) throw new TransactionTokenError();
+    if (!cur || cur.version !== expectedVersion || TERMINAL.has(cur.status) || t.status === 'completed') return undefined;
+    if (!cur.clientPresentation && t.status !== 'denied') throw new TransactionExpiredError();
+    const expired = this.expiredTransaction(cur, effects.now);
+    if (cur.status === 'awaiting_agent' && t.kid) {
+      if (expired) throw new TransactionExpiredError();
+      const reason = this.assertionSubjectReason(t, effects.now);
+      if (reason) throw new AssertionSubjectError(reason);
+    }
+    if (effects.assertionWindow && (effects.now < effects.assertionWindow.notBefore || effects.now >= effects.assertionWindow.expiresAt)) throw new AssertionWindowError();
+    if (cur.status === 'awaiting_agent' && t.kid && effects.expectedShareOwner !== undefined &&
+      this.enrollmentKey(t.kid, t.keyEnrollment!)?.permissions.share_owner !== effects.expectedShareOwner) return undefined;
+    const next = { ...copy(expired ?? t), clientPresentation: copy(cur.clientPresentation), maxAge: cur.maxAge, assertedAt: cur.assertedAt };
+    const deny = (reason: DenyReason) => { next.status = 'denied'; next.reason = reason; next.terminalAt = effects.now; next.challenge = undefined; };
+    if (!expired && next.kid) {
+      const reason = this.subjectReason(next, effects.now);
+      if (reason) deny(reason);
+      else if (cur.status === 'awaiting_agent' && !this.accounts.has(`${next.handle}\u0000${next.clientId}`) && effects.maxSignups !== undefined) {
+        // Assertion acceptance owns the reservation: a losing CAS never creates or releases it.
+        const reserved = this.reserveSignup({ ownerId: next.ownerId!, clientId: next.clientId, handle: next.handle!, txnId: next.id, expiresAt: next.expiresAt, max: effects.maxSignups, now: effects.now });
+        if (!reserved) deny('signup_limit_reached');
+        else next.passedCap = true;
+      }
+      if (cur.status === 'awaiting_agent' && !reason) next.assertedAt = effects.now;
+    }
+    const consentKey = `${next.handle}\u0000${next.clientId}`;
+    const previousConsent = this.consents.get(consentKey);
+    if (!TERMINAL.has(next.status) && effects.touchConsent && !effects.consent) {
+      const reason = consentRecordReason(previousConsent,
+        effects.consentContext ?? { scopes: next.scopes, redirectHost: new URL(next.redirectUri).host }, effects.expireConsentBefore);
+      if (reason) {
+        next.consentRelied = false;
+        next.reviewOutstanding = true;
+        next.consentReason = reason;
+        if (next.prompt === 'none') deny('consent_required');
+        else next.status = next.ownerApprovalOutstanding ? 'awaiting_owner' : 'awaiting_consent';
+      }
+    }
+    if (TERMINAL.has(next.status) && !expired) next.terminalAt = effects.now;
+    next.version = expectedVersion + 1;
+    this.transactions.set(next.id, next);
+    if (TERMINAL.has(next.status) && next.ownerId) this.releaseSignup({ ownerId: next.ownerId, clientId: next.clientId, txnId: next.id });
+    else {
+      if (next.passedCap && next.ownerId) this.extendSignup({ ownerId: next.ownerId, clientId: next.clientId, txnId: next.id, expiresAt: next.expiresAt });
+      if (previousConsent && effects.expireConsentBefore !== undefined && previousConsent.lastUsedAt < effects.expireConsentBefore) this.consents.delete(consentKey);
+      if (effects.consent) this.grantConsent(effects.consent, effects.now);
+      else if (effects.touchConsent && next.consentRelied && next.status === 'ready' && next.handle) this.touchConsent(next.handle, next.clientId, effects.now);
+    }
+    return copy(next);
   }
-  async listOpenTransactions(f: SubjectFilter) {
+  completeTransaction(t: Transaction, expectedVersion: number, code: Code, now: number, transactionTokenHash?: string) {
+    const cur = this.transactions.get(t.id);
+    if (cur && transactionTokenHash !== undefined && (transactionTokenHash !== cur.transactionTokenHash || this.transactionTokenRevoked(cur))) throw new TransactionTokenError();
+    if (!cur || cur.version !== expectedVersion || cur.status !== 'ready') return undefined;
+    const dead = !cur.clientPresentation ? 'access_denied' : this.subjectReason(cur, now);
+    const reservation = cur.ownerId && this.reservations.get(`${cur.ownerId}\u0000${cur.clientId}`)?.get(cur.id);
+    const hasAccount = this.accounts.has(`${cur.handle}\u0000${cur.clientId}`);
+    const needsReservation = cur.passedCap && !hasAccount;
+    const cap = this.clients.get(cur.clientId)?.maxSignupsPerOwner;
+    const capExceeded = !hasAccount && cap !== undefined && this.signupsEver(cur.ownerId!,cur.clientId) >= cap;
+    const staleAuthentication = isAuthenticationTooOld(cur.maxAge, cur.assertedAt, now);
+    if (now >= cur.expiresAt || dead || staleAuthentication || capExceeded || (needsReservation && (!reservation || reservation.expiresAt <= now))) {
+      return this.updateTransaction({ ...cur, status: 'denied', reason: dead ?? (staleAuthentication ? 'login_required' : 'signup_limit_reached'), terminalAt: now, challenge: undefined }, expectedVersion, { now });
+    }
+    if (this.codes.has(code.hash)) throw new Error('Authorization code already exists');
+    // Every Account creation needs current capacity, even with an owned reservation:
+    // sibling completion/deletion or an address merge may have changed other claims.
+    if (!hasAccount && cap !== undefined && !this.reserveSignup({
+      ownerId: cur.ownerId!, clientId: cur.clientId, handle: cur.handle!, txnId: cur.id,
+      expiresAt: cur.expiresAt, max: cap, now,
+    })) return this.updateTransaction({ ...cur, status: 'denied', reason: 'signup_limit_reached', terminalAt: now, challenge: undefined }, expectedVersion, { now });
+    const next = { ...copy(cur), version: expectedVersion + 1, status: 'completed' as const, terminalAt: now, challenge: undefined, codeIssued: true };
+    const issued: Code = { ...copy(code), txnId: cur.id, clientId: cur.clientId, redirectUri: cur.redirectUri,
+      codeChallenge: cur.codeChallenge, nonce: cur.nonce, scopes: copy(cur.scopes), handle: cur.handle!, kid: cur.kid!,
+      keyEnrollment: cur.keyEnrollment!, agentSub: cur.agentSub!, agentVersion: cur.agentVersion!, accountVersion: cur.accountVersion!,
+      authTime: cur.assertedAt!, maxAge: cur.maxAge, used: false, voided: false, replayed: undefined };
+    this.transactions.set(next.id, next);
+    this.codes.set(code.hash, issued);
+    this.recordSignIn({ handle: next.handle!, clientId: next.clientId, ownerId: next.ownerId!, txnId: next.id, now });
+    return copy(next);
+  }
+  listOpenTransactions(f: SubjectFilter) {
     return copy([...this.transactions.values()].filter((t) => !TERMINAL.has(t.status) && matches({ ...t, txnId: t.id }, f)));
   }
+  listLegacyTransactions(limit: number) {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 256) throw new RangeError('Legacy transaction batch must be between 1 and 256');
+    const result: Transaction[] = [];
+    for (const id of this.legacyTransactions) {
+      const tx = this.transactions.get(id);
+      if (!tx || tx.clientPresentation || TERMINAL.has(tx.status)) { this.legacyTransactions.delete(id); continue; }
+      result.push(tx);
+      if (result.length === limit) break;
+    }
+    return copy(result);
+  }
 
-  async insertCode(c: Code) { this.codes.set(c.hash, copy(c)); }
-  async getCode(hash: string) { return copy(this.codes.get(hash)); }
-  async redeemCode(hash: string, now: number): Promise<RedeemResult> {
+  getCode(hash: string) { return copy(this.codes.get(hash)); }
+  redeemCode(hash: string, now: number): RedeemResult {
     const c = this.codes.get(hash);
     if (!c) return 'unknown';
     if (c.used) {
       c.replayed = true;
+      this.revokeAccessTokens({ txnId: c.txnId });
       return 'used';
     }
-    if (c.voided) return 'void';
-    if (now >= c.expiresAt) return 'expired';
+    if (c.voided || this.subjectReason(c, now)) return 'void';
+    if (now >= c.expiresAt || isAuthenticationTooOld(c.maxAge, c.authTime, now)) return 'expired';
     c.used = true;
     return 'ok';
   }
-  async voidCodes(f: SubjectFilter) { for (const c of this.codes.values()) if (!c.used && matches(c, f)) c.voided = true; }
-  async insertAccessToken(t: AccessToken) { this.tokens.set(t.hash, copy(t)); }
-  async getAccessToken(hash: string) { return copy(this.tokens.get(hash)); }
-  async revokeAccessTokens(f: SubjectFilter) { for (const t of this.tokens.values()) if (matches(t, f)) t.revoked = true; }
+  voidCodes(f: SubjectFilter) { for (const c of this.codes.values()) if (!c.used && matches(c, f)) c.voided = true; }
+  insertAccessToken(t: AccessToken, now: number) {
+    const code = [...this.codes.values()].find((c) => c.txnId === t.txnId);
+    if (!code || !code.used || code.replayed || isAuthenticationTooOld(code.maxAge, code.authTime, now) || this.subjectReason(code, now) || this.subjectReason(t, now)) return false;
+    for (const field of ['handle', 'kid', 'agentSub', 'keyEnrollment', 'agentVersion', 'accountVersion', 'clientId'] as const) {
+      if (t[field] !== code[field]) return false;
+    }
+    if (JSON.stringify(t.scopes) !== JSON.stringify(code.scopes)) return false;
+    if (this.tokens.has(t.hash) || [...this.tokens.values()].some((token) => token.txnId === t.txnId)) return false;
+    this.tokens.set(t.hash, { ...copy(t), issuedAt: now });
+    return true;
+  }
+  getAccessToken(hash: string) { return copy(this.tokens.get(hash)); }
+  revokeAccessTokens(f: SubjectFilter) { for (const t of this.tokens.values()) if (matches(t, f)) t.revoked = true; }
 
-  async getConsent(handle: string, clientId: string) { return copy(this.consents.get(`${handle}\u0000${clientId}`)); }
-  async listConsents(handle: string) { return copy([...this.consents.values()].filter((c) => c.handle === handle)); }
-  async grantConsent(c: Omit<Consent, 'createdAt' | 'lastUsedAt'>, now: number) {
+  getConsent(handle: string, clientId: string) { return copy(this.consents.get(`${handle}\u0000${clientId}`)); }
+  listConsents(handle: string) { return copy([...this.consents.values()].filter((c) => c.handle === handle)); }
+  private grantConsent(c: Omit<Consent, 'createdAt' | 'lastUsedAt'>, now: number) {
     const key = `${c.handle}\u0000${c.clientId}`;
     const cur = this.consents.get(key);
-    this.consents.set(key, { ...copy(c), scopes: [...new Set([...(cur?.scopes ?? []), ...c.scopes])], createdAt: cur?.createdAt ?? now, lastUsedAt: now });
+    // Accepting a subset under new terms does not authorize the old scopes under those terms.
+    const previous = cur && sameConsentMetadata(cur, c) ? cur : undefined;
+    this.consents.set(key, { ...copy(c), scopes: [...new Set([...(previous?.scopes ?? []), ...c.scopes])], createdAt: previous?.createdAt ?? now, lastUsedAt: now });
   }
-  async touchConsent(handle: string, clientId: string, now: number) {
+  private touchConsent(handle: string, clientId: string, now: number) {
     const cur = this.consents.get(`${handle}\u0000${clientId}`);
     if (cur) cur.lastUsedAt = now;
   }
-  async deleteConsent(handle: string, clientId: string) { this.consents.delete(`${handle}\u0000${clientId}`); }
+  deleteConsent(handle: string, clientId: string, authorization: ManagementAuthorization) {
+    if (!this.managementCurrent(handle, authorization)) return false;
+    this.consents.delete(`${handle}\u0000${clientId}`);
+    return true;
+  }
 
-  async getAccount(handle: string, clientId: string) { return copy(this.accounts.get(`${handle}\u0000${clientId}`)); }
-  async listAccounts(handle: string) { return copy([...this.accounts.values()].filter((a) => a.handle === handle)); }
-  async setAccountStatus(handle: string, clientId: string, status: 'enabled' | 'disabled') {
+  getAccount(handle: string, clientId: string) { return copy(this.accounts.get(`${handle}\u0000${clientId}`)); }
+  listAccounts(handle: string) { return copy([...this.accounts.values()].filter((a) => a.handle === handle)); }
+  setAccountStatus(handle: string, clientId: string, status: 'enabled' | 'disabled', authorization: ManagementAuthorization, now: number) {
+    if (!this.managementCurrent(handle, authorization)) return undefined;
     const a = this.accounts.get(`${handle}\u0000${clientId}`);
-    if (a) a.status = status;
+    if (a) {
+      a.status = status;
+      if (status === 'disabled') {
+        a.authorizationVersion += 1;
+        this.invalidate({ handle, clientId }, 'access_denied', now);
+      }
+    }
     return copy(a);
   }
-  async deleteAccount(handle: string, clientId: string) { this.accounts.delete(`${handle}\u0000${clientId}`); }
-  async signupsEver(ownerId: string, clientId: string) { return this.signups.get(`${ownerId}\u0000${clientId}`) ?? 0; }
-  async reserveSignup(p: { ownerId: string; clientId: string; handle: string; txnId: string; expiresAt: number; max: number; now: number }) {
+  deleteAccount(handle: string, clientId: string) { this.accounts.delete(`${handle}\u0000${clientId}`); }
+  signupsEver(ownerId: string, clientId: string) { return new Set(this.quotaOwners(ownerId).flatMap((id) => this.signupEvents.get(`${id}\u0000${clientId}`) ?? [])).size; }
+  private reserveSignup(p: { ownerId: string; clientId: string; handle: string; txnId: string; expiresAt: number; max: number; now: number }) {
     const key = `${p.ownerId}\u0000${p.clientId}`;
     const held = this.reservations.get(key) ?? new Map<string, { handle: string; expiresAt: number }>();
-    for (const [txn, r] of held) if (r.expiresAt <= p.now) held.delete(txn); // an expired transaction holds no place
+    const peers = this.quotaOwners(p.ownerId);
     const others = new Set<string>();
-    for (const r of held.values()) if (r.handle !== p.handle && !this.accounts.has(`${r.handle}\u0000${p.clientId}`)) others.add(r.handle);
-    const admitted = (this.signups.get(key) ?? 0) + others.size < p.max;
+    for (const owner of peers) for (const [txn, r] of this.reservations.get(`${owner}\u0000${p.clientId}`) ?? []) {
+      const t = this.transactions.get(txn);
+      if (r.expiresAt <= p.now || !t || TERMINAL.has(t.status) || (t.kid && this.subjectReason(t, p.now))) {
+        this.reservations.get(`${owner}\u0000${p.clientId}`)?.delete(txn);
+      } else if (r.handle !== p.handle && !this.accounts.has(`${r.handle}\u0000${p.clientId}`)) others.add(t.agentSub!);
+    }
+    const admitted = this.signupsEver(p.ownerId, p.clientId) + others.size < p.max;
     if (admitted) held.set(p.txnId, { handle: p.handle, expiresAt: p.expiresAt });
     this.reservations.set(key, held);
     return admitted;
   }
-  async extendSignup(p: { ownerId: string; clientId: string; txnId: string; expiresAt: number }) {
+  private extendSignup(p: { ownerId: string; clientId: string; txnId: string; expiresAt: number }) {
     const r = this.reservations.get(`${p.ownerId}\u0000${p.clientId}`)?.get(p.txnId);
     if (r) r.expiresAt = p.expiresAt;
   }
-  async releaseSignup(p: { ownerId: string; clientId: string; txnId: string }) {
+  private releaseSignup(p: { ownerId: string; clientId: string; txnId: string }) {
     this.reservations.get(`${p.ownerId}\u0000${p.clientId}`)?.delete(p.txnId);
   }
-  async recordSignIn(p: { handle: string; clientId: string; ownerId: string; txnId: string; now: number }) {
+  private recordSignIn(p: { handle: string; clientId: string; ownerId: string; txnId: string; now: number }) {
     const key = `${p.ownerId}\u0000${p.clientId}`;
     this.reservations.get(key)?.delete(p.txnId);
     const accountKey = `${p.handle}\u0000${p.clientId}`;
@@ -483,8 +1096,29 @@ export class MemoryStore implements Store {
       existing.signInCount += 1;
       return { created: false };
     }
-    this.accounts.set(accountKey, { handle: p.handle, clientId: p.clientId, status: 'enabled', firstSignedInAt: p.now, lastSignedInAt: p.now, signInCount: 1 });
-    this.signups.set(key, (this.signups.get(key) ?? 0) + 1);
+    this.accounts.set(accountKey, { handle: p.handle, clientId: p.clientId, status: 'enabled', authorizationVersion: 0, firstSignedInAt: p.now, lastSignedInAt: p.now, signInCount: 1 });
+    // A deleted Account can be created again for the same Agent/client pair.
+    // Identify this creation, while inherited memberships retain the same event.
+    const event = `created:${p.txnId}`;
+    for (const owner of this.quotaOwners(p.ownerId)) {
+      const membership = `${owner}\u0000${p.clientId}`;
+      this.signupEvents.set(membership, [...new Set([...(this.signupEvents.get(membership) ?? []), event])]);
+    }
     return { created: true };
+  }
+}
+
+/** Promise facade; every state transition finishes synchronously before it yields to its caller. */
+export interface MemoryStore extends Store {}
+export class MemoryStore {
+  constructor() {
+    const state = new StoreState();
+    return new Proxy(this, {
+      get(target, prop, receiver) {
+        const method = Reflect.get(state, prop) as unknown;
+        if (typeof prop !== 'string' || !STORE_METHODS.includes(prop as keyof Store) || typeof method !== 'function') return Reflect.get(target, prop, receiver);
+        return async (...args: unknown[]) => Reflect.apply(method, state, args);
+      },
+    });
   }
 }

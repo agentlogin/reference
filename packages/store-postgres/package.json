@@ -1,0 +1,37 @@
+{
+  "name": "@agentlogin/store-postgres",
+  "version": "0.1.0",
+  "description": "Normalized PostgreSQL storage for the Agent Login reference issuer",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "bin": {
+    "agentlogin-migrate": "dist/migrate.js"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/agentlogin/reference.git",
+    "directory": "packages/store-postgres"
+  },
+  "dependencies": {
+    "@agentlogin/issuer": "0.1.0",
+    "pg": "^8.16.3"
+  },
+  "devDependencies": {
+    "@types/pg": "^8.23.1"
+  },
+  "scripts": {
+    "prepack": "tsc -b"
+  },
+  "engines": {
+    "node": ">=22.13"
+  }
+}
