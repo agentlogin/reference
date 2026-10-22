@@ -19,10 +19,12 @@ WORKDIR /app
 COPY --from=build --chown=node:node /app/package.json /app/package-lock.json ./
 COPY --from=build --chown=node:node /app/node_modules ./node_modules
 COPY --from=build --chown=node:node /app/packages/agentlogin/package.json ./packages/agentlogin/package.json
+COPY --from=build --chown=node:node /app/packages/agentlogin/bin ./packages/agentlogin/bin
 COPY --from=build --chown=node:node /app/packages/agentlogin/dist ./packages/agentlogin/dist
 COPY --from=build --chown=node:node /app/packages/rp/package.json ./packages/rp/package.json
 COPY --from=build --chown=node:node /app/packages/rp/dist ./packages/rp/dist
 COPY --from=build --chown=node:node /app/packages/rp-store-postgres/package.json ./packages/rp-store-postgres/package.json
+COPY --from=build --chown=node:node /app/packages/rp-store-postgres/bin ./packages/rp-store-postgres/bin
 COPY --from=build --chown=node:node /app/packages/rp-store-postgres/dist ./packages/rp-store-postgres/dist
 COPY --from=build --chown=node:node /app/examples/rp-hono/package.json ./examples/rp-hono/package.json
 COPY --from=build --chown=node:node /app/examples/rp-hono/dist ./examples/rp-hono/dist

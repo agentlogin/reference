@@ -10,9 +10,10 @@
     ".": "./dist/index.js"
   },
   "bin": {
-    "agentlogin-migrate": "dist/migrate.js"
+    "agentlogin-migrate": "bin/agentlogin-migrate.js"
   },
   "files": [
+    "bin",
     "dist",
     "README.md"
   ],

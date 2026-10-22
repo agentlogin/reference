@@ -7,8 +7,8 @@
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "exports": { ".": "./dist/index.js" },
-  "bin": { "agentlogin-rp-migrate": "dist/migrate.js" },
-  "files": ["dist", "README.md"],
+  "bin": { "agentlogin-rp-migrate": "bin/agentlogin-rp-migrate.js" },
+  "files": ["bin", "dist", "README.md"],
   "repository": {
     "type": "git",
     "url": "git+https://github.com/agentlogin/reference.git",
