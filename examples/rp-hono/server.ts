@@ -6,14 +6,18 @@ import { Pool } from 'pg';
 import { createExample } from './app.js';
 import { MemorySessionStore, type SessionStore } from './session-store.js';
 import { PostgresSessionStore } from './postgres-session-store.js';
+import { listenPort, readinessCheck } from './server-config.js';
 
 const baseUrl = new URL(process.env.BASE_URL ?? 'http://localhost:4000');
 const issuer = process.env.ISSUER ?? 'http://localhost:3000'; // exactly as the Issuer publishes it
 const loopback = ['localhost', '127.0.0.1', '[::1]'].includes(baseUrl.hostname);
 const dev = baseUrl.protocol === 'http:' && loopback;
+if (process.env.NODE_ENV === 'production' && dev) throw new Error('Production requires an explicit HTTPS BASE_URL');
 if (baseUrl.protocol !== 'https:' && !dev) throw new Error('BASE_URL must use HTTPS outside loopback development');
 if (baseUrl.username || baseUrl.password || baseUrl.search || baseUrl.hash || baseUrl.pathname !== '/') throw new Error('BASE_URL must be an origin URL');
 const base = baseUrl.origin;
+const port = listenPort(baseUrl, process.env.PORT);
+if (!dev && !process.env.ISSUER) throw new Error('ISSUER is required outside loopback development');
 if (!dev && !process.env.RP_DATABASE_URL) throw new Error('RP_DATABASE_URL is required outside loopback development');
 if (!dev && (!process.env.STATE_SECRET || !process.env.SESSION_SECRET)) throw new Error('STATE_SECRET and SESSION_SECRET are required outside development');
 const stateSecret = process.env.STATE_SECRET ?? 'development-only-state-secret-development-only';
@@ -27,6 +31,21 @@ const pool = process.env.RP_DATABASE_URL ? new Pool({
 pool?.on('error', () => console.error('Application database connection failed'));
 let callbackStore: PostgresCallbackStateStore | SqliteCallbackStateStore | undefined;
 let sessionStore: SessionStore | undefined;
+let stopping = false;
+const ready = readinessCheck(async () => {
+  if (!pool) return;
+  const client = await pool.connect(); // Pool acquisition is bounded to five seconds.
+  let failed = false;
+  const onError = () => { failed = true; };
+  client.on('error', onError);
+  const query = { text: 'SELECT 1', query_timeout: 2_000 };
+  try {
+    await client.query(query);
+    if (failed) throw new Error('Readiness connection failed');
+  }
+  catch (error) { failed = true; throw error; }
+  finally { client.removeListener('error', onError); client.release(failed); }
+});
 async function closeStorage(): Promise<void> {
   try {
     const results = await Promise.allSettled([callbackStore?.close(), sessionStore?.close()]);
@@ -47,6 +66,7 @@ try {
   example = createExample({
     base, issuer, stateSecret, callbackStore, sessionStore,
     handleDomains: (process.env.HANDLE_DOMAINS ?? (dev ? 'example.com' : '')).split(',').map((d) => d.trim()).filter(Boolean),
+    ready: async () => !stopping && await ready() && !stopping,
   });
 } catch (error) {
   await closeStorage();
@@ -71,7 +91,7 @@ let server: ReturnType<typeof serve>;
 try {
   server = serve({
     fetch: app.fetch,
-    port: Number(baseUrl.port || 4000),
+    port,
     hostname: dev ? (baseUrl.hostname === '[::1]' ? '::1' : '127.0.0.1') : '0.0.0.0',
   }, () => console.log(`Example application at ${base}, accepting agents from ${issuer}`));
 } catch (error) {
@@ -81,11 +101,13 @@ try {
   throw error;
 }
 
-let stopping = false;
 async function shutdown(): Promise<void> {
   if (stopping) return;
   stopping = true;
   clearInterval(cleanupTimer);
+  // Give ordinary requests time to finish, then close held-open connections before the platform kills us.
+  const deadline = setTimeout(() => { if ('closeAllConnections' in server) server.closeAllConnections(); }, 15_000);
+  deadline.unref();
   try {
     try {
       if (server.listening) await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
@@ -96,7 +118,7 @@ async function shutdown(): Promise<void> {
   } catch {
     console.error('Example application shutdown failed');
     process.exitCode = 1;
-  }
+  } finally { clearTimeout(deadline); }
 }
 server.once('error', () => {
   console.error('Example application listener failed');

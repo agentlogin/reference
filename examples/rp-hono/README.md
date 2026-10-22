@@ -3,6 +3,10 @@
 A Hono server using `@agentlogin/rp`. It is an Open Client: no registration with the issuer, its client identifier is
 the URL of the metadata document it serves.
 
+For the invite-only SentFrom deployment, use the [pilot runbook](../../deploy/pilot/README.md). It includes a
+Railway container configuration and public/authenticated acceptance commands. These are deployment artifacts,
+not evidence that a particular remote deployment or real Owner account has passed acceptance.
+
 Once, from the repository root:
 
 ```bash
@@ -81,6 +85,18 @@ both stores and their pool on SIGINT or SIGTERM. Each minute it runs non-overlap
 or Access Token records and 1,000 callback records. Increase maintenance frequency if expired records accumulate.
 Expiry is enforced at reads and transitions regardless of cleanup; retained live-check credentials are encrypted
 and never returned after their expiry. Keep the application hosts and database clocks synchronized.
+
+`PORT` sets the internal listener independently of `BASE_URL` (default: the explicit base port, otherwise 4000).
+`GET /healthz` reports process liveness; `GET /readyz` reports startup-verified storage connectivity with a generic
+`503` on failure or shutdown. Readiness queries share one in-flight check and cache its result for two seconds;
+database acquisition and query timeouts bound each check to about seven seconds. No probe runs DDL, changes
+sessions, fetches the Issuer, or returns connection details. Shutdown closes lingering HTTP connections after
+15 seconds. A platform health check does not replace continuous availability monitoring.
+
+The built example supports `npm start --workspace=agentlogin-example-rp-hono` and
+`npm run migrate --workspace=agentlogin-example-rp-hono`; the latter installs the separate callback and application
+schemas in sequence. Migrations are idempotent, but are not one cross-schema transaction; rerun after a failed
+migration before admitting traffic. Both commands run compiled JavaScript without `tsx`.
 
 Use a migration role to create the schema, and a separate runtime role with `USAGE` on the application schema,
 `SELECT`, `INSERT`, `UPDATE`, and `DELETE` on `app_accounts`, `app_sessions` and `app_notes`, `SELECT` on

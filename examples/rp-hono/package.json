@@ -25,6 +25,8 @@
     "README.md"
   ],
   "scripts": {
+    "start": "node dist/server.js",
+    "migrate": "agentlogin-rp-migrate && node dist/migrate.js",
     "prepack": "tsc -p tsconfig.build.json"
   }
 }

@@ -11,7 +11,9 @@ import { connectionString, fixture, quote, secret, session, sid, skipPostgres } 
 test('documented migration commands and PostgreSQL server persist sessions and shut down cleanly', { skip: skipPostgres }, async (t) => {
   const reservation = createServer();
   reservation.listen(0, '127.0.0.1'); await once(reservation, 'listening');
-  const base = `http://127.0.0.1:${(reservation.address() as AddressInfo).port}`;
+  const port = (reservation.address() as AddressInfo).port;
+  const transport = `http://127.0.0.1:${port}`;
+  const base = 'https://workspace.example'; // The real process listens behind an HTTPS-terminating proxy.
   await new Promise<void>((resolve, reject) => reservation.close((e) => e ? reject(e) : resolve()));
   const f = await fixture(t, { realClock: true, namespace: base });
   const callbackSchema = `${f.schema}_cb`;
@@ -20,12 +22,11 @@ test('documented migration commands and PostgreSQL server persist sessions and s
   // Deployment-role migrations need neither application secret; they create no sessions.
   delete env.STATE_SECRET; delete env.SESSION_SECRET;
   await f.admin.query(`DROP SCHEMA ${quote(f.schema)} CASCADE`);
-  await promisify(execFile)(process.execPath, ['--import', 'tsx', 'examples/rp-hono/migrate.ts'], { cwd: root, env });
-  await promisify(execFile)(process.execPath, ['--import', 'tsx', 'packages/rp-store-postgres/src/migrate.ts'], { cwd: root, env });
+  await promisify(execFile)('npm', ['run', 'migrate', '--workspace=agentlogin-example-rp-hono'], { cwd: root, env });
   const cookie = sid();
   await f.store.create(cookie, session(f.now()));
-  const child = spawn(process.execPath, ['--import', 'tsx', 'examples/rp-hono/server.ts'], {
-    cwd: root, env: { ...env, BASE_URL: base, STATE_SECRET: 'state-secret-distinct-for-runtime-test'.repeat(2), SESSION_SECRET: secret },
+  const child = spawn(process.execPath, ['examples/rp-hono/dist/server.js'], {
+    cwd: root, env: { ...env, BASE_URL: base, PORT: String(port), ISSUER: 'https://issuer.example', NODE_ENV: 'production', STATE_SECRET: 'state-secret-distinct-for-runtime-test'.repeat(2), SESSION_SECRET: secret },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let stdout = '', stderr = '';
@@ -40,10 +41,13 @@ test('documented migration commands and PostgreSQL server persist sessions and s
       const onExit = () => done(new Error(`example failed to start: ${stderr}`));
       child.stdout.on('data', onData); child.once('exit', onExit); onData();
     });
-    assert.equal((await fetch(`${base}/client-metadata.json`)).status, 200);
-    const headers = { cookie: `sid=${cookie}` };
-    assert.equal((await fetch(`${base}/me`, { headers })).status, 200, 'a new server recognizes an existing shared session');
-    assert.equal((await fetch(`${base}/logout`, { method: 'POST', headers })).status, 200);
+    const metadata = await (await fetch(`${transport}/client-metadata.json`)).json();
+    assert.equal(metadata.client_id, base + '/client-metadata.json', 'metadata binds the public origin, not the internal port');
+    assert.deepEqual(await (await fetch(`${transport}/healthz`)).json(), { status: 'alive' });
+    assert.deepEqual(await (await fetch(`${transport}/readyz`)).json(), { status: 'ready' });
+    const headers = { cookie: `__Host-sid=${cookie}` };
+    assert.equal((await fetch(`${transport}/me`, { headers })).status, 200, 'a new server recognizes an existing shared session');
+    assert.equal((await fetch(`${transport}/logout`, { method: 'POST', headers })).status, 200);
     assert.equal(await f.peer.get(cookie), undefined, 'logout is durable outside the server process');
     child.kill('SIGTERM');
     const [code] = await closed;

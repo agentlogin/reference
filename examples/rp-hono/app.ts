@@ -17,6 +17,8 @@ export interface ExampleOptions {
   /** For local development: handle domains served by `issuer`, mapped without WebFinger. */
   handleDomains?: string[];
   now?: () => number;
+  /** Runtime readiness, including storage connectivity. Must not disclose connection details. */
+  ready?: () => Promise<boolean>;
 }
 
 export const SESSION_TTL = 3600; // seconds
@@ -73,6 +75,17 @@ export function createExample(o: ExampleOptions) {
     c.header('x-content-type-options', 'nosniff');
     c.header('referrer-policy', 'no-referrer');
     if (['/', '/workspace', '/me', '/notes', '/logout'].includes(c.req.path) || c.req.path.startsWith('/auth/agent/')) c.header('cache-control', 'no-store, private');
+  });
+  app.get('/healthz', (c) => {
+    c.header('cache-control', 'no-store');
+    return c.json({ status: 'alive' });
+  });
+  app.get('/readyz', async (c) => {
+    c.header('cache-control', 'no-store');
+    try {
+      if (o.ready && !await o.ready()) return c.json({ status: 'unavailable' }, 503);
+      return c.json({ status: 'ready' });
+    } catch { return c.json({ status: 'unavailable' }, 503); }
   });
   app.get('/client-metadata.json', (c) => auth.metadata(c.req.raw));
   app.all('/auth/agent/login', (c) => auth.login(c.req.raw));
