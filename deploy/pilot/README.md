@@ -66,6 +66,42 @@ Run both migrations once as a separate one-off job with DDL credentials, using t
 npm run migrate --workspace=agentlogin-example-rp-hono
 ```
 
+For the separate `agent_workspace` database on the existing PostgreSQL cluster, the operator tool provides four
+reviewable phases. From an installed compiled reference release, first print each plan without database access:
+
+```sh
+node deploy/pilot/provision-database.mjs --phase bootstrap
+node deploy/pilot/provision-database.mjs --phase migrate
+node deploy/pilot/provision-database.mjs --phase grants
+node deploy/pilot/provision-database.mjs --phase verify
+```
+
+After reviewing a plan, add `--apply` to that command. `DATABASE_URL` supplies the operator connection privately;
+do not put it in command arguments or logs. On Railway's isolated private network use
+`PILOT_DATABASE_TRANSPORT=railway-private` with the platform's project/environment context; otherwise the default
+is verified TLS, optionally with `PILOT_DATABASE_CA_FILE`. `loopback-test` is restricted to localhost tests.
+The standalone operator bundle places the same script at `operator/provision-database.mjs`.
+
+Bootstrap refuses existing database or role names. It creates an empty `template0` database, owned by
+`agent_workspace_migrator`, and `agent_workspace_runtime`; both roles start `NOLOGIN`, without administrative
+privileges or memberships. The database starts with connections disabled while its public grants are removed.
+`CREATE DATABASE` cannot be atomic with role creation: after any interruption, inspect the named objects before
+retrying. The tool never drops a database/role, repairs a partially completed bootstrap, sets passwords or enables login.
+
+Migration connects only to `agent_workspace` and assumes the migrator role before using the compiled callback
+and application migrations. Grants give the runtime only schema usage, required table DML, migration-version
+reads and clock-function execution. Verification checks ownership/ACLs, the primary and synchronous commits,
+then performs rollback-only negative DDL probes and schema checks. It reads no application/customer records and
+does not prove a production credential can log in. Migrate/grants/verify can be rerun deliberately after inspection.
+Provisioning uses one connection per operation, with five-second connection/lock waits and bounded SQL execution.
+
+Only after verification should the operator provision a random runtime password and enable that role's login
+through the protected operational channel, then store its target-database URL as the app's `RP_DATABASE_URL`.
+Keep the migrator `NOLOGIN` and the administrator URL out of every application replica. The operator needs database
+and role creation privileges plus permission to assume the migrator role. Database isolation does not remove
+pre-existing `PUBLIC` privileges in other databases on the same cluster; review those separately without granting
+the runtime access to mail or identity data.
+
 Switch to the restricted runtime database role before starting the service. The image intentionally does not
 run migrations on startup or put DDL credentials in the app. See the [application grants](../../examples/rp-hono/README.md)
 and [callback grants](../../packages/rp-store-postgres/README.md). The platform's readiness path is `/readyz`.
