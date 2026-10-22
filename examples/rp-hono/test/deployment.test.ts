@@ -64,6 +64,29 @@ test('health reveals no storage details, while readiness fails closed without ca
   }
 });
 
+test('the public HTTPS configuration applies host-only HSTS across response boundaries', async () => {
+  const { app } = createExample({ ...options, ready: async () => false });
+  for (const [path, status] of [
+    ['/', 200], ['/workspace', 200], ['/client-metadata.json', 200], ['/healthz', 200],
+    ['/me', 401], ['/auth/agent/callback', 400], ['/not-found', 404], ['/readyz', 503],
+  ] as const) {
+    // The application may receive HTTP after a proxy has terminated public TLS.
+    const response = await app.request('http://127.0.0.1:8080' + path);
+    assert.equal(response.status, status, path);
+    assert.equal(response.headers.get('strict-transport-security'), 'max-age=31536000', path);
+  }
+});
+
+test('loopback HTTP development does not advertise HSTS', async () => {
+  for (const host of ['localhost', '127.0.0.1', '[::1]']) {
+    const localBase = `http://${host}:4000`;
+    const { app } = createExample({ ...options, base: localBase });
+    const response = await app.request(localBase + '/', { headers: { 'x-forwarded-proto': 'https' } });
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get('strict-transport-security'), null);
+  }
+});
+
 test('public pilot smoke checks the actual application and rejects metadata tampering and oversized bodies', async () => {
   // JavaScript operator tooling deliberately runs without a TypeScript loader in the deployed source checkout.
   const { smoke, readJson, origin } = await import('../../../deploy/pilot/acceptance.mjs');

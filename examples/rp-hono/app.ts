@@ -74,6 +74,7 @@ export function createExample(o: ExampleOptions) {
     await next();
     c.header('x-content-type-options', 'nosniff');
     c.header('referrer-policy', 'no-referrer');
+    if (baseUrl.protocol === 'https:') c.header('strict-transport-security', 'max-age=31536000');
     if (['/', '/workspace', '/me', '/notes', '/logout'].includes(c.req.path) || c.req.path.startsWith('/auth/agent/')) c.header('cache-control', 'no-store, private');
   });
   app.get('/healthz', (c) => {
