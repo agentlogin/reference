@@ -33,15 +33,15 @@ export function createServer(runtime: LoginRuntime, enrollment = new EnrollmentR
     inputSchema: z.object({ identity: identifier }).strict(), annotations: write,
   }, ({ identity }) => invoke(() => enrollment.start(identity)));
   server.registerTool('agentlogin_enrollment_status', {
-    description: 'Check enrollment. Show an awaiting_owner approval URL only to the operator in the trusted conversation. Poll no faster than every five seconds; stop on active or failed.',
+    description: 'Read saved enrollment progress, including after restart. Show an awaiting_owner approval URL only to the operator in the trusted conversation. Poll no faster than every five seconds while polling is true. If polling is false and resumable is true, stop polling; explicitly call agentlogin_enroll when ready to resume the same request. Stop on active, denied or expired.',
     inputSchema: z.object({ identity: identifier }).strict(), annotations: read,
   }, ({ identity }) => invoke(() => enrollment.status(identity)));
   server.registerTool('agentlogin_sign_in', {
-    description: 'Start sign-in to an application the user requested. Returns an operation identifier. Existing pending work is reused. Poll its status and review the disclosure. Never claims to sign a browser in.',
+    description: 'Start or explicitly resume a saved sign-in task for an application the user requested. Tasks last seven days. Resume keeps the intent identifier but starts a new operation and fresh protocol transaction; review its current disclosure again. Existing running work is reused. Never claims to sign a browser in.',
     inputSchema: z.object(pair).strict(), annotations: write,
   }, ({ identity, application }) => invoke(() => runtime.start(identity, application)));
   server.registerTool('agentlogin_status', {
-    description: 'Check sign-in status; poll at the returned interval. Terminal operation summaries remain available for up to fifteen minutes (bounded to 128). A process restart loses pending operations, not saved keys or sessions.',
+    description: 'Read sign-in progress; poll only at the returned interval. Paused tasks survive restart until decisionExpiresAt (seven days) and resume only through agentlogin_sign_in. Old Owner links and disclosure approvals are not retained. Terminal summaries remain available for fifteen minutes (bounded to 128).',
     inputSchema: z.object({ operation: operationId }).strict(), annotations: read,
   }, ({ operation }) => invoke(() => runtime.status(operation)));
   server.registerTool('agentlogin_review', {

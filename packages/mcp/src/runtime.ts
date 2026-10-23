@@ -16,13 +16,23 @@ const SessionBindingSchema = z.object({ handle: z.string(), issuer: z.string(), 
 export type SessionBinding = z.infer<typeof SessionBindingSchema>;
 interface Context { client: LoginClient; jar: CookieJar; identity: Identity; app: Application; issuer: string; bindingKey: string }
 interface Job {
-  id: string; identity: string; application: string; state: 'starting' | 'awaiting_consent' | 'awaiting_owner' | 'completing' | 'authenticated' | 'failed';
-  expiresAt: number; finishedAt?: number; code?: string; scopes?: string[]; disclosure?: Array<{ scope: string; title: string; description: string }>;
+  id: string; intentId: string; identity: string; application: string; state: 'starting' | 'awaiting_consent' | 'awaiting_owner' | 'completing' | 'authenticated' | 'failed' | 'paused' | 'expired';
+  expiresAt: number; decisionExpiresAt: number; binding: string; issuer?: string; createdAt: number; finishedAt?: number; code?: string; scopes?: string[]; disclosure?: Array<{ scope: string; title: string; description: string }>;
   client?: TransactionView['client']; consentReason?: string;
   ownerTransactionId?: string;
   decide?: (decision: 'allow' | 'deny') => void;
 }
+const intentSchema = z.object({
+  operation: z.string().uuid(), intent: z.string().uuid(), identity: z.string(), application: z.string(), binding: z.string().regex(/^[a-f0-9]{64}$/),
+  createdAt: z.number().int().nonnegative(), expiresAt: z.number().int().positive(), issuer: z.string().max(2048).optional(),
+  state: z.enum(['pending', 'authenticated', 'failed']), finishedAt: z.number().int().nonnegative().optional(), code: z.string().max(128).optional(),
+}).strict();
+type SignInIntent = z.infer<typeof intentSchema>;
+const DECISION_WINDOW_MS = 7 * 24 * 60 * 60_000;
 export interface RuntimeOptions {
+  now?: () => number;
+  /** An embedding host may supply its own protected, durable store; records contain no login authority. */
+  intents?: { get(identity: string, application: string): unknown; set(identity: string, application: string, value: unknown): void };
   clientFactory?: (identity: Identity, app: Application, jar: CookieJar) => LoginClient;
   jarFactory?: (identityId: string, applicationId: string) => CookieJar;
   catalogs?: Catalog[];
@@ -85,9 +95,11 @@ export class LoginRuntime {
   private readonly catalogs: Catalog[];
   private lastCall = 0;
   private callTokens = 60;
+  private readonly now: () => number;
 
   constructor(config: unknown, private readonly options: RuntimeOptions = {}) {
     this.config = parseConfig(config);
+    this.now = options.now ?? Date.now;
     this.catalogs = options.catalogs ?? this.config.catalogFiles.map(readCatalog);
   }
 
@@ -146,8 +158,39 @@ export class LoginRuntime {
     writeState(join(this.config.stateDirectory, 'sessions', `${context.bindingKey}.binding.json`), value ?? null);
   }
 
+  private intentFile(identity: string, application: string) {
+    return join(this.config.stateDirectory, 'sign-in-intents', `${createHash('sha256').update(JSON.stringify([identity, application])).digest('hex')}.json`);
+  }
+  private intentBinding(identity: string, application: string) {
+    const pair = this.configuredPair(identity, application);
+    return createHash('sha256').update(JSON.stringify([pair.identity, pair.app])).digest('hex');
+  }
+  private readIntent(identity: string, application: string): SignInIntent | undefined {
+    const raw = this.options.intents ? this.options.intents.get(identity, application) : readState(this.intentFile(identity, application));
+    if (raw === undefined) return undefined;
+    const record = intentSchema.parse(raw);
+    if (record.identity !== identity || record.application !== application || record.binding !== this.intentBinding(identity, application))
+      throw new ToolError('intent_mismatch', 'The saved sign-in request no longer matches this identity and application configuration. Resolve it before starting another request.');
+    if (record.expiresAt <= record.createdAt || record.expiresAt - record.createdAt > DECISION_WINDOW_MS)
+      throw new ToolError('intent_invalid', 'The saved sign-in request has an invalid decision window.');
+    return record;
+  }
+  private saveIntent(job: Job) {
+    const record: SignInIntent = { operation: job.id, intent: job.intentId, identity: job.identity, application: job.application, binding: job.binding,
+      createdAt: job.createdAt, expiresAt: job.decisionExpiresAt, ...(job.issuer ? { issuer: job.issuer } : {}),
+      state: job.state === 'authenticated' ? 'authenticated' : job.state === 'failed' || job.state === 'expired' ? 'failed' : 'pending',
+      ...(job.finishedAt && job.state !== 'paused' ? { finishedAt: job.finishedAt } : {}), ...(job.code ? { code: job.code } : {}) };
+    if (this.options.intents) this.options.intents.set(job.identity, job.application, record);
+    else writeState(this.intentFile(job.identity, job.application), record);
+  }
+  private restored(record: SignInIntent): Job {
+    const expired = this.now() >= record.expiresAt;
+    return { id: record.operation, intentId: record.intent, identity: record.identity, application: record.application, binding: record.binding, issuer: record.issuer,
+      createdAt: record.createdAt, decisionExpiresAt: record.expiresAt, expiresAt: this.now(), finishedAt: record.finishedAt ?? this.now(),
+      state: record.state === 'pending' ? expired ? 'expired' : 'paused' : record.state, ...(record.code ? { code: record.code } : {}) };
+  }
   private prune() {
-    const now = Date.now();
+    const now = this.now();
     for (const [id, job] of this.jobs) if (job.finishedAt && now - job.finishedAt > 15 * 60_000) this.jobs.delete(id);
     while (this.jobs.size >= 128) {
       const terminal = [...this.jobs.values()].find((j) => j.finishedAt);
@@ -163,9 +206,18 @@ export class LoginRuntime {
     const existing = [...this.jobs.values()].find((job) => this.key(job.identity, job.application) === key && !job.finishedAt);
     if (existing) return this.status(existing.id);
     if (this.busy.has(key) || this.busy.size >= 4) throw new ToolError('busy', 'Another operation is in progress. Wait for its result.');
-    if (Date.now() - (this.lastStarted.get(key) ?? 0) < 5000) throw new ToolError('rate_limited', 'Wait five seconds before starting another sign-in.');
-    this.lastStarted.set(key, Date.now());
-    const job: Job = { id: randomUUID(), identity, application, state: 'starting', expiresAt: Date.now() + this.config.signInTimeoutSeconds * 1000 };
+    if (this.now() - (this.lastStarted.get(key) ?? 0) < 5000) throw new ToolError('rate_limited', 'Wait five seconds before starting another sign-in.');
+    const saved = this.readIntent(identity, application);
+    const resume = saved?.state === 'pending' && this.now() < saved.expiresAt ? saved : undefined;
+    const createdAt = resume?.createdAt ?? this.now();
+    const decisionExpiresAt = resume?.expiresAt ?? createdAt + DECISION_WINDOW_MS;
+    const job: Job = { id: randomUUID(), intentId: resume?.intent ?? randomUUID(), identity, application, state: 'starting',
+      createdAt, decisionExpiresAt, binding: resume?.binding ?? this.intentBinding(identity, application), issuer: resume?.issuer,
+      expiresAt: Math.min(decisionExpiresAt, this.now() + this.config.signInTimeoutSeconds * 1000) };
+    // Saving the task never saves consent, assertions, redirects or Owner authority. Every attempt
+    // creates a fresh protocol transaction and rechecks its current disclosure and lifecycle state.
+    this.saveIntent(job);
+    this.lastStarted.set(key, this.now());
     this.jobs.set(job.id, job); this.busy.add(key);
     void this.complete(job).finally(() => this.busy.delete(key));
     return this.status(job.id);
@@ -173,17 +225,34 @@ export class LoginRuntime {
 
   status(operation: string) {
     this.prune();
-    const job = this.jobs.get(operation);
+    let job = this.jobs.get(operation);
+    if (!job) {
+      // There is at most one saved intent per explicitly configured pair. Read only those exact
+      // paths; operation identifiers never become paths or authorize new identities/applications.
+      for (const identity of Object.keys(this.config.identities)) {
+        for (const application of Object.keys(this.config.applications)) {
+          const raw = this.options.intents ? this.options.intents.get(identity, application) : readState(this.intentFile(identity, application));
+          if (raw === undefined || typeof raw !== 'object' || raw === null || (raw as { operation?: unknown }).operation !== operation) continue;
+          const record = this.readIntent(identity, application)!;
+          if (record.state !== 'pending' && (!record.finishedAt || this.now() - record.finishedAt > 15 * 60_000)) continue;
+          job = this.restored(record); this.jobs.set(job.id, job); break;
+        }
+        if (job) break;
+      }
+    }
     if (!job) throw new ToolError('unknown_operation', 'The operation is unknown or its retained status has expired.');
+    if (job.state === 'paused' && this.now() >= job.decisionExpiresAt) job.state = 'expired';
     const identity = this.config.identities[job.identity]!;
     const ownerPortal = job.state === 'awaiting_owner' ? identity.ownerPortal : undefined;
     const ownerApprovalUrl = ownerPortal && identity.ownerApprovalPath && job.ownerTransactionId ? new URL(identity.ownerApprovalPath.replace('{transaction_id}', encodeURIComponent(job.ownerTransactionId)), ownerPortal).href : undefined;
-    return { operation: job.id, identity: job.identity, application: job.application, status: job.state, expiresAt: job.expiresAt, ...(job.code ? { error: job.code } : {}), ...(job.scopes ? { scopes: job.scopes } : {}), ...(job.disclosure ? { disclosure: job.disclosure, client: job.client, consentReason: job.consentReason, disclosureIsUntrustedText: true } : {}), ...(ownerPortal ? { ownerPortal } : {}), ...(job.state === 'awaiting_owner' && job.ownerTransactionId ? { transactionId: job.ownerTransactionId } : {}), ...(ownerApprovalUrl ? { ownerApprovalUrl } : {}), sessionLocation: 'local_helper', browserSession: false, ...(!job.finishedAt ? { pollAfterSeconds: 2 } : {}) };
+    return { operation: job.id, intent: job.intentId, identity: job.identity, application: job.application, status: job.state, expiresAt: job.expiresAt,
+      decisionExpiresAt: job.decisionExpiresAt, resumable: job.state === 'paused' && this.now() < job.decisionExpiresAt,
+      ...(job.code ? { error: job.code } : {}), ...(job.scopes ? { scopes: job.scopes } : {}), ...(job.disclosure ? { disclosure: job.disclosure, client: job.client, consentReason: job.consentReason, disclosureIsUntrustedText: true } : {}), ...(ownerPortal ? { ownerPortal } : {}), ...(job.state === 'awaiting_owner' && job.ownerTransactionId ? { transactionId: job.ownerTransactionId } : {}), ...(ownerApprovalUrl ? { ownerApprovalUrl } : {}), sessionLocation: 'local_helper', browserSession: false, ...(!job.finishedAt ? { pollAfterSeconds: 2 } : {}) };
   }
 
   review(operation: string, decision: 'allow' | 'deny') {
     const job = this.jobs.get(operation);
-    if (!job || job.state !== 'awaiting_consent' || !job.decide || Date.now() >= job.expiresAt) throw new ToolError('review_not_pending', 'This operation has no live disclosure review.');
+    if (!job || job.state !== 'awaiting_consent' || !job.decide || this.now() >= job.expiresAt) throw new ToolError('review_not_pending', 'This operation has no live disclosure review.');
     const resolve = job.decide;
     delete job.decide; job.state = 'starting';
     resolve(decision);
@@ -193,14 +262,17 @@ export class LoginRuntime {
   private async complete(job: Job) {
     try {
       const context = await this.context(job.identity, job.application);
-      if (Date.now() >= job.expiresAt) throw new ToolError('timeout', 'Sign-in exceeded its deadline.');
+      if (job.issuer && job.issuer !== context.issuer) throw new ToolError('intent_mismatch', 'The saved sign-in request belongs to a different issuer. Resolve it before starting another request.');
+      job.issuer = context.issuer;
+      this.saveIntent(job);
+      if (this.now() >= job.expiresAt) throw new ToolError('timeout', 'Sign-in exceeded its deadline.');
       // A failed fresh callback cannot be mistaken for the old account just because its handle matches.
       // Forgetting a local jar is not server-side revocation; use logout to invalidate its server session.
       await this.bind(context);
       await context.jar.clear();
       const result = await context.client.signInAt(new URL(context.app.loginPath, context.app.origin).href, {
         expectedHost: new URL(context.app.origin).host,
-        deadlineMs: Math.max(1, job.expiresAt - Date.now()), acceptDisclosure: false,
+        deadlineMs: Math.max(1, job.expiresAt - this.now()), acceptDisclosure: false,
         onReview: (transaction) => this.awaitReview(job, transaction),
         onOwnerApproval: (transaction) => {
           if (typeof transaction.transaction_id !== 'string' || !transaction.transaction_id || transaction.transaction_id.length > 512 || /[\x00-\x20\x7f]/.test(transaction.transaction_id)) throw new ToolError('invalid_transaction', 'The issuer returned an invalid transaction identifier.');
@@ -212,9 +284,9 @@ export class LoginRuntime {
       job.state = 'completing';
       let url = checkedUrl(result.redirectUrl, this.config.developmentLoopback);
       for (let hop = 0; hop <= 5; hop += 1) {
-        if (Date.now() >= job.expiresAt) throw new ToolError('timeout', 'Sign-in exceeded its deadline.');
+        if (this.now() >= job.expiresAt) throw new ToolError('timeout', 'Sign-in exceeded its deadline.');
         if (url.origin !== context.app.origin) throw new ToolError('callback_rejected', 'The callback left the configured application origin.');
-        const response = await context.client.fetch(url.href, { signal: AbortSignal.timeout(Math.max(1, job.expiresAt - Date.now())) });
+        const response = await context.client.fetch(url.href, { signal: AbortSignal.timeout(Math.max(1, job.expiresAt - this.now())) });
         const location = response.headers.get('location');
         await response.body?.cancel();
         if (response.status >= 300 && response.status < 400 && location) {
@@ -225,13 +297,23 @@ export class LoginRuntime {
         if (response.status < 200 || response.status >= 300) throw new ToolError('callback_failed', 'The application rejected the sign-in callback.');
         break;
       }
-      if (Date.now() >= job.expiresAt) throw new ToolError('timeout', 'Sign-in exceeded its deadline.');
+      if (this.now() >= job.expiresAt) throw new ToolError('timeout', 'Sign-in exceeded its deadline.');
       const binding = await this.checkSession(context, job.expiresAt, true);
-      if (Date.now() >= job.expiresAt) throw new ToolError('timeout', 'Sign-in exceeded its deadline.');
+      if (this.now() >= job.expiresAt) throw new ToolError('timeout', 'Sign-in exceeded its deadline.');
       await this.bind(context, binding);
       job.scopes = result.scopes; job.state = 'authenticated';
-    } catch (error) { job.state = 'failed'; job.code = safeError(error).code; }
-    finally { job.finishedAt = Date.now(); job.decide?.('deny'); delete job.decide; delete job.disclosure; delete job.client; delete job.consentReason; }
+    } catch (error) {
+      const code = safeError(error).code;
+      const expired = code === 'timeout' || (error instanceof AgentLoginError && ['expired', 'transaction_expired', 'login_required'].includes(error.code));
+      job.state = expired ? this.now() < job.decisionExpiresAt ? 'paused' : 'expired' : 'failed';
+      if (!expired) job.code = code;
+    } finally {
+      job.finishedAt = this.now(); job.decide?.('deny'); delete job.decide; delete job.disclosure; delete job.client; delete job.consentReason;
+      delete job.ownerTransactionId;
+      if (job.state === 'paused' || job.state === 'expired') delete job.scopes;
+      try { this.saveIntent(job); }
+      catch { job.state = 'failed'; job.code = 'state_unavailable'; }
+    }
   }
 
   private awaitReview(job: Job, transaction: TransactionView): Promise<'allow' | 'deny'> {
@@ -248,10 +330,10 @@ export class LoginRuntime {
     return new Promise((resolve) => { job.decide = resolve; });
   }
 
-  private async checkSession(context: Context, deadline = Date.now() + 10_000, freshSignIn = false): Promise<SessionBinding> {
+  private async checkSession(context: Context, deadline = this.now() + 10_000, freshSignIn = false): Promise<SessionBinding> {
     const expected = freshSignIn ? undefined : await this.binding(context);
     if (!freshSignIn && !expected) throw new ToolError('not_authenticated', 'This helper has no bound session for the current issuer. Sign in again.');
-    const response = await context.client.fetch(new URL(context.app.sessionCheck.path, context.app.origin).href, { signal: AbortSignal.timeout(Math.max(1, deadline - Date.now())) });
+    const response = await context.client.fetch(new URL(context.app.sessionCheck.path, context.app.origin).href, { signal: AbortSignal.timeout(Math.max(1, deadline - this.now())) });
     if (response.status !== 200) { await response.body?.cancel(); throw new ToolError('not_authenticated', 'The application has no matching active session.'); }
     const value = await readJson(response);
     const checked = SessionBindingSchema.safeParse({ handle: atPointer(value, context.app.sessionCheck.handlePointer), issuer: atPointer(value, context.app.sessionCheck.issuerPointer), sub: atPointer(value, context.app.sessionCheck.subjectPointer) });

@@ -113,8 +113,22 @@ Sign-in is bounded to 180 seconds by default (configurable from 10 to 600). Up t
 four sign-in/request operations run concurrently, with only one per identity and
 application. Duplicate sign-in starts reuse the live operation; new attempts have
 a five-second cooldown. Tool calls have a 60-call burst and refill at one per second.
-The issuer's poll intervals and 429 responses are respected by the SDK. Completed
-sign-in summaries expire after fifteen minutes and the history is capped at 128.
+The issuer's poll intervals and 429 responses are respected by the SDK. Each
+sign-in task has a fixed seven-day `decisionExpiresAt`. A local deadline pauses
+network work without deleting that task. Its protected record survives restart;
+`agentlogin_status` returns `paused` and `resumable: true` while time remains.
+Explicitly call `agentlogin_sign_in` for the same pair to resume. The `intent`
+identifier stays the same, but the `operation` identifier and Core transaction are
+fresh, so a delayed review of old terms cannot approve a new disclosure.
+
+This retains the task, not its old disclosure, consent, Owner approval, callback
+URL or transaction authority. Current terms and any required Owner approval are
+checked again. A paused task never displays an old Owner transaction link. Changing
+its configured identity/application or discovered issuer fails closed and requires
+the operator to resolve the saved task. After seven days, an explicit new sign-in
+creates a new intent rather than extending the expired one. One current task record
+is kept per configured pair. Completed in-memory summaries expire after fifteen
+minutes and the history is capped at 128.
 
 ## Enrollment broker integration
 
@@ -139,11 +153,31 @@ checks `proof_url` against discovered issuer metadata, and signs the Core enroll
 proof locally. This broker is a product integration, not an addition to Core.
 
 The pending request, polling credential and key survive process restarts in mode
-`0600` files. A lost proof response is reported as `enrollment_uncertain`; an
+`0600` files. SentFrom's provider decision window is seven days; the returned
+`expires_at` is authoritative and explicit resumes do not extend it. Local polling
+is bounded by `signInTimeoutSeconds`, not the human decision window. Reaching
+that local limit returns `awaiting_owner` with `polling: false` and
+`resumable: true`, without deleting or declining the request. Status after restart
+reads the saved record without network traffic. Stop polling when `polling` is
+false; explicitly call `agentlogin_enroll` to check and resume the same request.
+After Owner approval, the provider can issue a fresh short-lived proof challenge
+when the agent returns; no seven-day signing proof is created. A failed challenge
+is not signed twice in one run.
+
+An explicitly configured `issuer` supports initial enrollment through validated
+issuer metadata even before the broker creates the handle's issuer record. Its
+`handle_domains` must serve the configured handle. Without an explicit issuer,
+normal handle discovery is required. Broker endpoints and credentials still come
+only from trusted operator configuration. This does not change sign-in discovery.
+
+A lost proof response is reported as `enrollment_uncertain`; an
 explicit retry polls that same request and accepts only the same key's `active`
 status. It does not silently create a replacement identity. Expired/denied requests
 require the operator to resolve or reset the enrollment record before a new request.
-Enrollment runs are bounded and at most two run concurrently.
+Enrollment runs are bounded and at most two actively poll concurrently. Paused
+requests do not occupy those slots. `denied` and `expired` are terminal and keep
+the pending key for deliberate operator resolution; a changed configuration cannot
+silently replace the saved request.
 
 ## State and failure handling
 
@@ -158,9 +192,11 @@ all helpers before removing the abandoned `mcp-server.lock`.
 The local filesystem must provide the atomic file operations the SDK requires.
 This directory is not a multi-host storage adapter. Each local agent has its own
 keys/sessions; the hosted issuer and application use their separate shared databases.
-When the host closes stdio, the helper exits and stops pending network work. Pending
-sign-in identifiers do not survive restart, but keys, enrollment requests and
-application cookies do. A failed or uncertain operation is never labelled successful.
+When the host closes stdio, the helper exits and stops pending network work.
+Sign-in task records, keys, enrollment requests and application cookies survive
+restart. Resuming a sign-in task uses a new protocol transaction and operation
+identifier; credentials and decisions from the old attempt are never restored.
+A failed or uncertain operation is never labelled successful.
 
 Install [the skill](skills/agent-login/SKILL.md) if the host supports skills. The skill
 explains consent and output boundaries; endpoint access is enforced by the helper.

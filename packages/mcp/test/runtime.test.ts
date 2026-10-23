@@ -22,10 +22,12 @@ function fixture(overrides: { callback?: string; handle?: string; discoveryIssue
   const calls: Array<{ url: string; init?: RequestInit }> = [];
   const jars = new Map<string, MemoryCookieJar>();
   const bindings = new Map<string, SessionBinding>();
+  const intents = new Map<string, unknown>();
   let starts = 0;
   const ownConfig = structuredClone(config);
   if (overrides.ownerPortal) Object.assign(ownConfig.identities.alice, { ownerPortal: overrides.ownerPortal, ownerApprovalPath: overrides.ownerApprovalPath });
   const runtime = new LoginRuntime(ownConfig, {
+    intents: { get(identity, application) { return intents.get(`${identity}:${application}`); }, set(identity, application, value) { intents.set(`${identity}:${application}`, value); } },
     sessionBindings: { async get(key) { return bindings.get(key); }, async set(key, value) { if (value) bindings.set(key, value); else bindings.delete(key); } },
     jarFactory: (id) => { const jar = new MemoryCookieJar(); jars.set(id, jar); return jar; },
     clientFactory: (identity, _app, jar) => ({
