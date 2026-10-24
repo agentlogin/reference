@@ -5,6 +5,8 @@ This release work list targets specification commit
 Discovery's `1.0` value does not distinguish drafts. Pin this revision when assessing
 compatibility. This is not an exhaustive conformance report; unlisted requirements
 are not automatically passed. Separate AI reviewers are not independent implementers.
+The same normative text is now published as [working draft 0.2](https://github.com/agentlogin/spec/releases/tag/draft-0.2)
+at `6563b8430b9df1d9a653b44c68b273a5774cabe5`; publication changes only status, date and review documentation.
 
 The implemented product path is direct ES256 sign-in: the PostgreSQL issuer, a
 managed Owner integration, the TypeScript client/local MCP helper, and a relying
@@ -18,7 +20,7 @@ party with its own shared application sessions and durable notes.
 | Address-linked signup accounting (Core 7.6) | Exact local-part/domain-normalized address equality, shared pending capacity, unique Account-creation events, inherited counts, fixed deletion deadlines and published retention policy. [Shared contracts](../packages/issuer/test/store-contract.ts). | Operator chooses the published retention period; zero is permitted. Permanent identity/event records must remain available for their dependent checks. |
 | Lifecycle, consent and replay (Core 5-7) | Immutable identities, atomic transitions, preserved polling/retention outcomes, authenticated replay handling and shared callback consumption. SQL lifecycle mutations coordinate with application-originated changes. [PostgreSQL tests](../packages/store-postgres/test/lifecycle-functions.test.ts). | Restore/failover exercises remain operational evidence. |
 | Application authorization (Core 9) | Agent Workspace persists private notes, checks UserInfo before a lasting action, and commits session authorization with the write. Idempotency, logout, expiry and bounded pagination have tests. | Other applications implement their own business permissions and sessions. A prior check cannot make arbitrary external side effects atomic. |
-| Plugin and catalogs | Local MCP enrollment/sign-in, immutable application-session binding, full disclosure review, configured operations, and optional provider/application catalogs. Catalogs distinguish review evidence from trust, support Open and Registered Clients, and label AgentID separately from Agent Login Core. | SentFrom.ai is an unreviewed Core provider candidate with no deployment-verification evidence. AgentID by AgentMail is an unreviewed OIDC integration candidate, not a Core provider; it requires its own connection or adapter. The application catalog is empty. Inclusion does not grant trust. Browser sessions need their own integration. |
+| Plugin and catalogs | Local MCP enrollment/sign-in, immutable application-session binding, full disclosure review, configured operations, and optional provider/application catalogs. Catalogs distinguish review evidence from trust, support Open and Registered Clients, and label AgentID separately from Agent Login Core. SentFrom and Agent Workspace candidates now attach [scoped, affiliated live evidence](evidence/2026-10-24-sentfrom-workspace.md). | Both remain candidates pending a recorded catalog review. Historical local-tarball and existing-identity results do not establish new-customer onboarding or publication of the planned beta. AgentID by AgentMail remains an unreviewed OIDC integration candidate, not a Core provider. Inclusion does not grant trust. Browser sessions need their own integration. |
 | Algorithms and optional profiles | The release accepts ES256; legacy `EdDSA` configuration is rejected. The harness recognizes optional `Ed25519` naming. | Ed25519, recommended `private_key_jwt`, optional DNS fallback and the separate Relay profile are not implemented by this direct-sign-in release. |
 | Rate limits (Core 6.7) | Managed-service shared PostgreSQL limits cover authorization/assertion/Owner requests, with bounded bodies and `429` / `Retry-After`. | Tune edge and tenant limits using measured load and the actual proxy topology. The reference core does not itself impose a deployment policy. |
 | Packaging and verification | A clean consumer installs real tarballs without workspace dependency links and runs PostgreSQL sign-in, persistent actions, instance switching, logout and revocation. [Pilot test](../packages/conformance/test/clean-consumer.test.ts). Hosted-service release preparation vendors exact issuer packages into a standalone artifact. | Publishing, actual target deployment, external adopter testing and independent protocol interoperability are not established by local execution. |
@@ -35,7 +37,10 @@ production claim for that adapter.
 ## External pilot handoff
 
 The clean-consumer test completes the install-and-run part of the pilot locally.
-An outside adopter and a live deployment are still required. Give that adopter the
+The [dated live SentFrom/Workspace report](evidence/2026-10-24-sentfrom-workspace.md)
+adds bounded deployment evidence, using an existing approved identity. Public-beta
+installation, a new human participant, and an outside adopter remain required.
+Give that adopter the
 exact specification revision above, committed package tarballs and lockfiles, the
 [application integration guide](../examples/rp-hono/README.md), and the
 [helper configuration](../packages/mcp/README.md). Record the tested software

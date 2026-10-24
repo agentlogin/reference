@@ -7,11 +7,13 @@ central root of trust, certification program or protocol requirement. For Core,
 domain discovery identifies an issuer; each relying party decides which issuers it
 accepts. The open specification has no default provider, registry or relay.
 
-The [provider catalog](providers.json) lists SentFrom.ai as an unreviewed candidate
-with the intended issuer `https://identity.sentfrom.ai` and initial handle domain
-`mail.sentfrom.ai`. The listing has no review evidence and does not establish live
-deployment, domain delegation or protocol verification. The
-[application catalog](applications.json) has no entries.
+The [provider catalog](providers.json) lists SentFrom.ai as a candidate with issuer
+`https://identity.sentfrom.ai` and handle domain `mail.sentfrom.ai`. The
+[application catalog](applications.json) lists Agent Workspace as an Open Client
+candidate. Both link [dated, redacted deployment and scoped sign-in evidence](../docs/evidence/2026-10-24-sentfrom-workspace.md).
+The report is an affiliated, Codex-assisted self-report, with historical package
+versions and explicit exclusions. Both entries remain candidates pending a recorded
+review decision; evidence attachment alone does not promote them to `reviewed`.
 
 [AgentID by AgentMail](https://www.agentid.com) is also an unreviewed candidate,
 identified as `protocol: "agentid"`, with issuer `https://auth.agentid.com` and the

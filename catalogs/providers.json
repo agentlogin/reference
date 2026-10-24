@@ -1,7 +1,7 @@
 {
   "version": 1,
   "kind": "providers",
-  "updatedAt": "2026-10-16T00:00:00Z",
+  "updatedAt": "2026-10-24T16:48:20Z",
   "entries": [
     {
       "id": "sentfromai",
@@ -11,11 +11,32 @@
       "operator": "SentFrom.ai",
       "homepage": "https://sentfrom.ai",
       "issuer": "https://identity.sentfrom.ai",
-      "handleDomains": ["mail.sentfrom.ai"],
+      "handleDomains": [
+        "mail.sentfrom.ai"
+      ],
       "status": "candidate",
       "specRevision": "a000e29c7af91d3fd8a5a4ad6241e2b10aabcc78",
-      "evidence": [],
-      "updatedAt": "2026-10-16T00:00:00Z"
+      "evidence": [
+        {
+          "kind": "domain_control",
+          "protocol": "agent-login",
+          "url": "https://github.com/agentlogin/reference/blob/main/docs/evidence/2026-10-24-sentfrom-workspace.md",
+          "observedAt": "2026-10-24T16:48:20Z",
+          "expiresAt": "2026-11-23T00:00:00Z",
+          "reviewer": "SentFrom.ai; Codex-assisted self-report",
+          "revision": "a000e29c7af91d3fd8a5a4ad6241e2b10aabcc78"
+        },
+        {
+          "kind": "protocol_test",
+          "protocol": "agent-login",
+          "url": "https://github.com/agentlogin/reference/blob/main/docs/evidence/2026-10-24-sentfrom-workspace.md",
+          "observedAt": "2026-10-24T00:56:53Z",
+          "expiresAt": "2026-11-23T00:00:00Z",
+          "reviewer": "SentFrom.ai; Codex-assisted self-report",
+          "revision": "a000e29c7af91d3fd8a5a4ad6241e2b10aabcc78"
+        }
+      ],
+      "updatedAt": "2026-10-24T16:48:20Z"
     },
     {
       "id": "agentid",
@@ -25,7 +46,9 @@
       "operator": "AgentMail, Inc.",
       "homepage": "https://www.agentid.com",
       "issuer": "https://auth.agentid.com",
-      "handleDomains": ["agentmail.to"],
+      "handleDomains": [
+        "agentmail.to"
+      ],
       "status": "candidate",
       "protocolReference": "https://docs.agentmail.to/agentid-sign-in",
       "evidence": [],
