@@ -3,8 +3,7 @@ import { calculateJwkThumbprint, compactVerify, decodeProtectedHeader, importJWK
 import { ENROLLMENT_TYP } from './constants.js';
 import type { IssuerContext } from './context.js';
 import { OAuthError } from './errors.js';
-import type { Agent, AgentKey, Credential, P256Jwk } from './store.js';
-import { denyOpenTransactions } from './state.js';
+import { isAssertionWindowError, isKeyActivationConflictError, type Agent, type AgentKey, type Credential, type ManagementAuthorization, type P256Jwk } from './store.js';
 import { isPlainObject, parseBearer, randomId, randomSecret, sha256, typMatches } from './util.js';
 
 const B64U_32 = /^[A-Za-z0-9_-]{43}$/; // 32 octets
@@ -39,18 +38,30 @@ export async function validateP256Jwk(jwk: unknown): Promise<P256Jwk> {
 }
 
 /** Section 7.2: a `pending` key not proved within T_ASSERT is deleted. Applied wherever a key is read, so it is never seen again. */
-async function dropIfUnproved(ctx: IssuerContext, key: AgentKey | undefined): Promise<AgentKey | undefined> {
-  if (key && key.status === 'pending' && (!key.challenge || ctx.now() > key.challenge.expiresAt)) {
-    await ctx.store.deleteKey(key.kid, key.enrollment); // only this enrollment: a newer one of the same key stays
-    return undefined;
+async function dropIfUnproved(ctx: IssuerContext, key: AgentKey | undefined, authorization?: ManagementAuthorization): Promise<AgentKey | undefined> {
+  if (key?.status === 'pending') {
+    const now = await ctx.store.currentTime(ctx.now());
+    if (!key.challenge || now >= key.challenge.expiresAt) {
+      // The pending read may predate a successful proof. Cleanup must still find an expired pending challenge,
+      // and the reread may return this enrollment's activation, but must not retarget a management request
+      // to a replacement enrollment created while cleanup was delayed.
+      await ctx.store.deleteKey(key.kid, key.enrollment, now);
+      const current = authorization
+        ? (await ctx.store.readManagementKeys(key.handle, authorization, key.kid))?.[0]
+        : await ctx.store.getKey(key.kid, key.handle);
+      return current?.enrollment === key.enrollment && current.agentSub === key.agentSub ? current : undefined;
+    }
   }
   return key;
 }
-export const getLiveKey = async (ctx: IssuerContext, kid: string): Promise<AgentKey | undefined> => dropIfUnproved(ctx, await ctx.store.getKey(kid));
-export async function listLiveKeys(ctx: IssuerContext, handle: string): Promise<AgentKey[]> {
+export const getLiveKey = async (ctx: IssuerContext, kid: string, handle: string, authorization?: ManagementAuthorization): Promise<AgentKey | undefined> =>
+  dropIfUnproved(ctx, authorization ? (await ctx.store.readManagementKeys(handle, authorization, kid))?.[0] : await ctx.store.getKey(kid, handle), authorization);
+export async function listLiveKeys(ctx: IssuerContext, handle: string, authorization?: ManagementAuthorization): Promise<AgentKey[]> {
   const keys: AgentKey[] = [];
-  for (const k of await ctx.store.listKeys(handle)) {
-    const live = await dropIfUnproved(ctx, k);
+  const records = authorization ? await ctx.store.readManagementKeys(handle, authorization) : await ctx.store.listKeys(handle);
+  if (!records) throw new OAuthError(404, 'not_found');
+  for (const k of records) {
+    const live = await dropIfUnproved(ctx, k, authorization);
     if (live) keys.push(live);
   }
   return keys;
@@ -59,17 +70,23 @@ export async function listLiveKeys(ctx: IssuerContext, handle: string): Promise<
 const isActive = (ctx: IssuerContext, k: AgentKey): boolean => k.status === 'active' && ctx.now() < k.expiresAt;
 
 export function keyRecord(ctx: IssuerContext, k: AgentKey): Record<string, unknown> {
-  const status = k.status === 'active' && ctx.now() >= k.expiresAt ? 'expired' : k.status;
+  const status = k.status !== 'revoked' && ctx.now() >= k.expiresAt ? 'expired' : k.status;
   return { kid: k.kid, status, jwk: k.jwk, permissions: k.permissions, name: k.name, created_at: k.createdAt, expires_at: k.expiresAt };
 }
 
 /** Section 7.2: create a pending key. */
-export async function enrollKey(ctx: IssuerContext, handle: string, body: unknown): Promise<{ record: Record<string, unknown>; challenge: string; proof_url: string }> {
+export async function enrollKey(ctx: IssuerContext, handle: string, body: unknown, authorization: ManagementAuthorization, enrollmentId = randomId(), challengeExpiresAt?: number): Promise<{ record: Record<string, unknown>; challenge: string; proof_url: string; enrollmentId: string }> {
   if (!isPlainObject(body)) throw new OAuthError(400, 'invalid_request', 'body must be an object');
+  if (!/^[A-Za-z0-9_-]{16,128}$/.test(enrollmentId)) throw new OAuthError(400, 'invalid_request', 'invalid internal enrollment identifier');
   const jwk = await validateP256Jwk(body.jwk);
   // The thumbprint is taken over canonical coordinates, so equal identifiers mean equal decoded points (Section 7.2).
   const kid = await calculateJwkThumbprint(jwk, 'sha256');
-  const now = ctx.now();
+  const now = await ctx.store.currentTime(ctx.now());
+  // Hosted approval retries may reuse an internal enrollment ID only within its original proof window.
+  // Carry that fixed deadline into the atomic store insertion; a retry must not renew it.
+  const challengeDeadline = challengeExpiresAt ?? now + ctx.constants.T_ASSERT;
+  if (!Number.isSafeInteger(challengeDeadline) || challengeDeadline <= now || challengeDeadline > now + ctx.constants.T_ASSERT)
+    throw new OAuthError(400, 'invalid_request', 'invalid enrollment challenge deadline');
   let expiresAt = now + ctx.constants.T_KEY;
   if (body.expires_at !== undefined) {
     if (typeof body.expires_at !== 'number' || !Number.isInteger(body.expires_at) || body.expires_at <= now) throw new OAuthError(400, 'invalid_request', 'expires_at');
@@ -79,31 +96,33 @@ export async function enrollKey(ctx: IssuerContext, handle: string, body: unknow
   const key: AgentKey = {
     kid,
     handle,
-    enrollment: randomId(), // credentials bind to this enrollment; an earlier, expired one of the same key stays dead
+    agentSub: authorization.agentSub,
+    enrollment: enrollmentId, // credentials bind to this enrollment; an earlier, expired one of the same key stays dead
     status: 'pending',
     jwk,
     permissions: { share_owner: false },
     name: typeof body.name === 'string' ? body.name.slice(0, 200) : undefined,
     createdAt: now,
     expiresAt,
-    challenge: { value: challenge, expiresAt: now + ctx.constants.T_ASSERT },
+    challenge: { value: challenge, expiresAt: challengeDeadline },
   };
   // One atomic operation with its preconditions: not revoked for this handle, not enrolled now (Section 7.2).
-  const inserted = await ctx.store.insertKey(key, now);
+  const inserted = await ctx.store.insertKey(key, now, authorization);
+  if (inserted === 'unauthorized') throw new OAuthError(404, 'not_found', 'the Agent or credential changed during enrollment');
   if (inserted === 'revoked') throw new OAuthError(400, 'invalid_request', 'this public key was revoked for this handle');
   if (inserted === 'other_handle') throw new OAuthError(400, 'invalid_request', 'public key is enrolled for another handle');
   if (inserted === 'enrolled') throw new OAuthError(400, 'invalid_request', 'key already enrolled');
-  return { record: keyRecord(ctx, key), challenge, proof_url: `${ctx.issuer}/agents/${encodeURIComponent(handle)}/keys/${encodeURIComponent(kid)}/proof` };
+  return { enrollmentId, record: keyRecord(ctx, key), challenge, proof_url: `${ctx.issuer}/agents/${encodeURIComponent(handle)}/keys/${encodeURIComponent(kid)}/proof` };
 }
 
 /** Section 7.2: verify the enrollment proof and activate the key. */
 export async function proveKey(ctx: IssuerContext, handle: string, kid: string, body: unknown): Promise<Record<string, unknown>> {
-  const key = await getLiveKey(ctx, kid);
-  const now = ctx.now();
+  const key = await getLiveKey(ctx, kid, handle);
+  const now = await ctx.store.currentTime(ctx.now());
   // Section 6.7: `unknown_key` (401) when `kid` names no enrolled key of the handle; a pending key that timed out is gone (Section 7.2).
   if (!key || key.handle !== handle) throw new OAuthError(401, 'unknown_key');
   // Section 7.4 table: proofs with a revoked or expired key are refused with `key_revoked`.
-  if (key.status === 'revoked' || key.status === 'expired' || (key.status === 'active' && now >= key.expiresAt)) throw new OAuthError(401, 'key_revoked');
+  if (key.status === 'revoked' || key.status === 'expired' || now >= key.expiresAt) throw new OAuthError(401, 'key_revoked');
   if (!isPlainObject(body) || typeof body.proof !== 'string') throw new OAuthError(400, 'invalid_request', 'proof required');
   // An active key has no unconsumed challenge left, so no proof can satisfy the `nonce` rule of Section 7.2.
   if (key.status !== 'pending' || !key.challenge) throw new OAuthError(400, 'invalid_assertion', 'the key has no unconsumed challenge');
@@ -132,76 +151,55 @@ export async function proveKey(ctx: IssuerContext, handle: string, kid: string, 
   if (payload.aud !== ctx.issuer) throw bad('aud');
   if (payload.nonce !== key.challenge.value) throw bad('nonce');
   const { iat, exp } = payload;
+  const verifiedAt = await ctx.store.currentTime(ctx.now());
   if (typeof iat !== 'number' || typeof exp !== 'number') throw bad('iat and exp required');
-  if (exp > iat + ctx.constants.T_ASSERT || now >= exp || iat < now - ctx.constants.T_ASSERT || iat > now + ctx.constants.T_SKEW) throw bad('iat/exp window');
+  if (exp > iat + ctx.constants.T_ASSERT || verifiedAt >= exp || iat < verifiedAt - ctx.constants.T_ASSERT || iat > verifiedAt + ctx.constants.T_SKEW) throw bad('iat/exp window');
   if (typeof payload.jti !== 'string') throw bad('jti required');
   // Activation is one conditional write: it succeeds only if this enrollment is still pending with this challenge.
   // A revocation that completed while the signature was being verified therefore wins (Section 7.3).
-  if (!(await ctx.store.activateKey(kid, key.enrollment, key.challenge.value, now))) {
-    const current = await ctx.store.getKey(kid);
-    if (current?.status === 'revoked') throw new OAuthError(401, 'key_revoked');
+  let activated;
+  try {
+    activated = await ctx.store.activateKey(kid, key.enrollment, key.challenge.value, verifiedAt, { notBefore: iat - ctx.constants.T_SKEW, expiresAt: exp });
+  } catch (error) {
+    if (isKeyActivationConflictError(error)) throw new OAuthError(400, 'invalid_request', 'public key is active for another Agent');
+    if (isAssertionWindowError(error)) throw bad('proof expired while awaiting activation');
+    throw error;
+  }
+  if (!activated) {
+    // A replacement enrollment cannot hide the expiry of the proof's original enrollment.
+    if ((await ctx.store.currentTime(ctx.now())) >= key.expiresAt) throw new OAuthError(401, 'key_revoked');
+    const current = await ctx.store.getKey(kid, handle);
+    if (current && (current.status === 'revoked' || current.status === 'expired' || (await ctx.store.currentTime(ctx.now())) >= current.expiresAt)) throw new OAuthError(401, 'key_revoked');
     throw new OAuthError(current && current.handle === handle ? 400 : 401, current && current.handle === handle ? 'invalid_assertion' : 'unknown_key', 'the key has no unconsumed challenge');
   }
   return keyRecord(ctx, { ...key, status: 'active', challenge: undefined });
 }
 
-/**
- * Section 7.3 and the table of Section 7.4: revoke a key. The key is written first, by one atomic operation; then
- * what it asserted is ended. Whatever a concurrent request does with that key, it either sees the key revoked when
- * it reads it again after its own write, or its write is seen here (see state.ts).
- */
-export async function revokeKeyEffects(ctx: IssuerContext, kid: string): Promise<void> {
-  const key = await ctx.store.revokeKey(kid, ctx.now());
-  if (!key) return;
-  const bound = { kid: key.kid, keyEnrollment: key.enrollment };
-  await denyOpenTransactions(ctx, bound, 'key_revoked');
-  await ctx.store.voidCodes(bound);
-  await ctx.store.revokeAccessTokens(bound);
+/** Section 7.3: revocation and all its effects are one enrollment-conditional store transaction. */
+export async function revokeKeyEffects(ctx: IssuerContext, key: Pick<AgentKey, 'kid' | 'enrollment'>, authorization: ManagementAuthorization): Promise<void> {
+  const revoked = await ctx.store.revokeKey(key.kid, key.enrollment, ctx.now(), authorization);
+  if (!revoked) throw new OAuthError(404, 'not_found');
 }
 
-/** Section 7.3: revoke every pending and active key of a handle; with an Owner Credential also every Delegated Credential for it. */
-export async function revokeAllKeys(ctx: IssuerContext, handle: string, cred: Credential): Promise<void> {
-  for (const k of await ctx.store.listKeys(handle)) if (k.status === 'active' || k.status === 'pending') await revokeKeyEffects(ctx, k.kid);
-  if (cred.kind === 'owner') for (const d of await ctx.store.listCredentials({ handle, kind: 'delegated' })) await ctx.store.deleteCredential(d.hash);
+/** Section 7.3: a stale bulk request can affect only the immutable Agent identity it authorized. */
+export async function revokeAllKeys(ctx: IssuerContext, handle: string, cred: ManagementAuthorization): Promise<void> {
+  if (!(await ctx.store.revokeAllKeys(handle, cred, ctx.now()))) throw new OAuthError(404, 'not_found');
 }
 
-/** Section 7.4: disable or enable an Account. The status is written first, then what depends on it is ended. */
-export async function setAccountStatus(ctx: IssuerContext, handle: string, clientId: string, status: 'enabled' | 'disabled'): Promise<Record<string, unknown>> {
-  const account = await ctx.store.setAccountStatus(handle, clientId, status);
+/** Section 7.4: status, invalidation fence and dependent records change in one store transaction. */
+export async function setAccountStatus(ctx: IssuerContext, handle: string, clientId: string, status: 'enabled' | 'disabled', authorization: ManagementAuthorization): Promise<Record<string, unknown>> {
+  const account = await ctx.store.setAccountStatus(handle, clientId, status, authorization, ctx.now());
   if (!account) throw new OAuthError(404, 'not_found', 'no account for this client');
-  if (status === 'disabled') {
-    await denyOpenTransactions(ctx, { handle, clientId }, 'access_denied', true); // only transactions past step 7
-    await ctx.store.voidCodes({ handle, clientId });
-    await ctx.store.revokeAccessTokens({ handle, clientId });
-  }
   return accountRecord(account);
 }
 
-/** Section 7.4 table, "Agent disabled": open transactions it asserted are denied, codes voided, tokens invalidated. */
-export async function setAgentEnabled(ctx: IssuerContext, handle: string, enabled: boolean): Promise<Agent | undefined> {
-  const agent = await ctx.store.setAgentEnabled(handle, enabled);
-  if (agent && !enabled) {
-    await denyOpenTransactions(ctx, { handle }, 'access_denied');
-    await ctx.store.voidCodes({ handle });
-    await ctx.store.revokeAccessTokens({ handle });
-  }
-  return agent;
+export async function setAgentEnabled(ctx: IssuerContext, agent: Agent, enabled: boolean): Promise<Agent | undefined> {
+  return ctx.store.setAgentEnabled(agent.handle, enabled, agent.sub, ctx.now());
 }
 
-/**
- * Section 7.4 table, "Agent deleted": as disabled, then keys, Consent Records, Accounts and Delegated Credentials are
- * deleted; the per-owner count of Section 7.6 is retained. An Agent created later with the same handle starts with none.
- */
+/** Deletion and the removal of dependent records are atomic; a replacement cannot be swept by stale cleanup. */
 export async function deleteAgent(ctx: IssuerContext, agent: Agent): Promise<void> {
-  await setAgentEnabled(ctx, agent.handle, false);
-  for (const k of await ctx.store.listKeys(agent.handle)) {
-    await revokeKeyEffects(ctx, k.kid);
-    await ctx.store.deleteKey(k.kid);
-  }
-  for (const c of await ctx.store.listConsents(agent.handle)) await ctx.store.deleteConsent(c.handle, c.clientId);
-  for (const a of await ctx.store.listAccounts(agent.handle)) await ctx.store.deleteAccount(a.handle, a.clientId);
-  for (const d of await ctx.store.listCredentials({ handle: agent.handle, kind: 'delegated' })) await ctx.store.deleteCredential(d.hash);
-  await ctx.store.deleteAgent(agent.handle);
+  if (!(await ctx.store.deleteAgent(agent.handle, agent.sub, ctx.now()))) throw new OAuthError(404, 'not_found');
 }
 
 /**
@@ -217,12 +215,11 @@ export function accountRecord(a: { clientId: string; status: string; firstSigned
 }
 
 /** Section 7.8: resolves the credential and checks that the handle belongs to its Owner. */
-export async function authorizeManagement(ctx: IssuerContext, authorization: string | undefined, handle: string, delegable: boolean): Promise<Credential> {
+export async function authorizeManagement(ctx: IssuerContext, authorization: string | undefined, handle: string, delegable: boolean): Promise<ManagementAuthorization> {
   const bearer = parseBearer(authorization);
-  const cred = bearer ? await ctx.store.getCredential(sha256(bearer)) : undefined;
-  if (!cred) throw new OAuthError(401, 'invalid_token', undefined, { 'WWW-Authenticate': 'Bearer error="invalid_token"' });
-  const agent = await ctx.store.getAgent(handle);
-  if (!agent || agent.ownerId !== cred.ownerId || (cred.kind === 'delegated' && cred.handle !== handle)) throw new OAuthError(404, 'not_found');
+  const cred = bearer ? await ctx.store.resolveManagement(sha256(bearer), handle) : 'invalid_token';
+  if (cred === 'invalid_token') throw new OAuthError(401, 'invalid_token', undefined, { 'WWW-Authenticate': 'Bearer error="invalid_token"' });
+  if (cred === 'not_found') throw new OAuthError(404, 'not_found');
   if (cred.kind === 'delegated' && !delegable) throw new OAuthError(403, 'insufficient_permission', undefined, { 'WWW-Authenticate': 'Bearer error="insufficient_scope"' });
   return cred;
 }

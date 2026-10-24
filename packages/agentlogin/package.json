@@ -1,6 +1,6 @@
 {
   "name": "agentlogin",
-  "version": "0.1.0",
+  "version": "0.2.0-beta.1",
   "description": "Agent Login client: sign a software agent in to web applications with its own key, over the open Agent Login protocol",
   "license": "Apache-2.0",
   "type": "module",
@@ -15,7 +15,8 @@
   "files": [
     "dist",
     "bin",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
   "repository": {
     "type": "git",
@@ -42,7 +43,9 @@
     "node": ">=22.12"
   },
   "publishConfig": {
-    "access": "public"
+    "access": "public",
+    "tag": "beta",
+    "registry": "https://registry.npmjs.org/"
   },
   "scripts": {
     "prepack": "tsc -b"

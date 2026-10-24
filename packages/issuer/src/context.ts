@@ -12,6 +12,11 @@ export interface IssuerContext {
   constants: Constants;
   store: Store;
   signingKey: SigningKey;
+  /** Locally provisioned private material; active authority is always read from Store. */
+  signingKeys: Map<string, SigningKey>;
+  jwksCacheSeconds: number;
+  ownerDeletionRetentionSeconds: number;
+  policyUri: string;
   /** Development only: http/loopback clients, private addresses in fetches, http issuer identifier. */
   allowInsecureClients: boolean;
   /** Admin bearer token for the bootstrap API and as RFC 7591 initial access token. */

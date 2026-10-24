@@ -5,7 +5,7 @@ import { createLocalJWKSet, decodeProtectedHeader, jwtVerify, type JSONWebKeySet
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { checkIssuerIdentifier, fetchMetadata, freshness, lookupIssuer, parseHandle, safeFetch, type IssuerMetadata } from 'agentlogin';
 import { ISSUER_ERROR_CODES, RelyingPartyError, type RelyingPartyErrorCode } from './errors.js';
-import type { PendingSignIn } from './seal.js';
+import { validAuthenticationRequest, type PendingSignIn } from './seal.js';
 
 const T_SKEW = 60;
 const T_CACHE = 86_400; // seconds, Section 1.5
@@ -46,11 +46,13 @@ export interface RelyingPartyOptions {
   /** Handle domain to Issuer Identifier, consulted before WebFinger. For development and private deployments. */
   staticIssuers?: Record<string, string>;
   /** ID Token algorithms accepted. Default `['ES256']`. */
-  idTokenAlgs?: Array<'ES256' | 'EdDSA'>;
+  idTokenAlgs?: Array<'ES256'>;
   /** Development only: http Issuers and loopback addresses. */
   allowInsecure?: boolean;
   /** Per-request limit for discovery, metadata, JWK Set, token and UserInfo requests. Default and maximum 10 000 ms (N_FETCH). */
   timeoutMs?: number;
+  /** Default maximum authentication age in seconds. Zero requires a fresh assertion for this request. */
+  maxAge?: number;
 }
 export interface BeginOptions {
   /** The Agent Handle the user or agent presented. */
@@ -59,7 +61,20 @@ export interface BeginOptions {
   issuer?: string;
   prompt?: 'consent' | 'none';
   scopes?: string[];
+  /** Application-controlled override of the configured maxAge; never copy untrusted login parameters here. */
+  maxAge?: number;
   returnTo?: string;
+}
+export interface IdTokenValidationOptions {
+  issuer: string;
+  nonce: string;
+  clientId: string;
+  metadata?: IssuerMetadata;
+  expectedHandle?: string;
+  /** The requested max_age, from state bound to the original Authentication Request. */
+  maxAge?: number;
+  /** The original request's Unix timestamp in seconds; required with maxAge. */
+  authenticationRequestedAt?: number;
 }
 export interface Begun {
   /** The Authentication Request URL (Section 5.1). */
@@ -132,6 +147,7 @@ export class RelyingParty {
     if (typeof o.stateSecret !== 'string' || o.stateSecret.length < 32) throw new Error('stateSecret must be a string of at least 32 characters');
     if (typeof o.clientId !== 'string' || !o.clientId) throw new Error('clientId is required');
     if (!URL.canParse(o.redirectUri)) throw new Error('redirectUri must be an absolute URL');
+    if (o.maxAge !== undefined && (!Number.isSafeInteger(o.maxAge) || o.maxAge < 0)) throw new Error('maxAge must be a non-negative safe integer');
     for (const i of o.issuers ?? []) {
       const c = typeof i === 'string' ? { issuer: i } : i;
       try {
@@ -150,6 +166,7 @@ export class RelyingParty {
       throw new Error('a top-level clientSecret is allowed only with exactly one Issuer and without federation: "any"; set clientSecret on the Issuer it belongs to');
     }
     this.algs = o.idTokenAlgs ?? ['ES256'];
+    if (this.algs.length !== 1 || this.algs[0] !== 'ES256') throw new Error('This RP release supports ES256 only');
     this.timeoutMs = Math.min(o.timeoutMs ?? 10_000, 10_000);
   }
 
@@ -230,6 +247,10 @@ export class RelyingParty {
 
   /** Section 5.1: build the Authentication Request (R-1) and record the Issuer for this `state` (R-2). */
   async begin(p: BeginOptions = {}): Promise<Begun> {
+    const maxAge = p.maxAge === undefined ? this.o.maxAge : p.maxAge;
+    if (maxAge !== undefined && (!Number.isSafeInteger(maxAge) || maxAge < 0)) {
+      throw new RelyingPartyError('invalid_request', 'maxAge must be a non-negative safe integer');
+    }
     let loginHint: string | undefined;
     if (p.handle !== undefined) {
       const h = parseHandle(p.handle);
@@ -240,7 +261,8 @@ export class RelyingParty {
     const issuer = await this.choose({ ...p, handle: loginHint });
     const m = await this.metadata(issuer);
     const { clientId } = this.clientFor(issuer);
-    const pending: PendingSignIn = { state: rnd(), nonce: rnd(), verifier: rnd(32), issuer, loginHint, returnTo: p.returnTo };
+    const pending: PendingSignIn = { state: rnd(), nonce: rnd(), verifier: rnd(32), issuer, loginHint, returnTo: p.returnTo,
+      ...(maxAge === undefined ? {} : { maxAge, authenticationRequestedAt: Math.floor(Date.now() / 1000) }) };
     const u = new URL(m.authorization_endpoint);
     const q: Record<string, string> = {
       response_type: 'code',
@@ -254,6 +276,7 @@ export class RelyingParty {
     };
     if (loginHint) q.login_hint = loginHint; // Section 9: sent whenever the expected handle is known (R-13)
     if (p.prompt) q.prompt = p.prompt;
+    if (maxAge !== undefined) q.max_age = String(maxAge);
     for (const [k, v] of Object.entries(q)) u.searchParams.set(k, v);
     return { url: u.href, pending };
   }
@@ -277,38 +300,58 @@ export class RelyingParty {
     return this.begin({ handle: p.loginHint, returnTo: p.returnTo });
   }
 
-  /** Sections 5.4 to 5.7: validate the redirect, exchange the code, validate the ID Token. */
-  async complete(p: { params: URLSearchParams; pending: PendingSignIn | null }): Promise<SignIn> {
+  /**
+   * Section 5.7 step 1: validate response members and the session/Issuer binding without consuming state or
+   * contacting the Issuer. Low-level callers must call this before atomically consuming pending state, then
+   * call `complete` even for an error response. Unrelated redirect_uri query parameters are left alone.
+   */
+  preflightCallback(p: { params: URLSearchParams; pending: PendingSignIn | null }): {
+    pending: PendingSignIn; code?: string; error?: string; errorDescription?: string;
+  } {
     const { params, pending } = p;
-    const one = (k: string) => {
-      const all = params.getAll(k);
-      if (all.length > 1) throw new RelyingPartyError('invalid_request', `repeated parameter ${k}`);
-      return all[0];
-    };
+    for (const name of ['state', 'iss', 'code', 'error', 'error_description', 'error_uri']) {
+      if (params.getAll(name).length > 1) throw new RelyingPartyError('invalid_request', `repeated parameter ${name}`);
+    }
     // Step 1 (R-2): `state` bound to this session, `iss` equal to the Issuer recorded for it.
-    const state = one('state');
+    const state = params.get('state');
     if (!pending || !state || !sameString(state, pending.state)) throw new RelyingPartyError('invalid_state', 'this sign-in was not started in this session, or it expired');
-    const iss = one('iss');
+    if (!validAuthenticationRequest(pending)) throw new RelyingPartyError('invalid_state', 'the stored authentication age policy is malformed');
+    const iss = params.get('iss');
     if (!iss || iss !== pending.issuer) throw new RelyingPartyError('issuer_mismatch', 'the response did not come from the Issuer the request was sent to');
     if (!this.issuers.has(pending.issuer) && this.o.federation !== 'any') throw new RelyingPartyError('issuer_not_accepted', 'this application does not accept that Issuer');
-    const error = one('error');
+    const code = params.get('code');
+    const error = params.get('error');
+    if ((code !== null && error !== null) || (!code && !error) ||
+        (code !== null && (params.has('error_description') || params.has('error_uri')))) {
+      throw new RelyingPartyError('invalid_request', 'the response must contain either a non-empty code or a non-empty error');
+    }
+    return { pending, code: code ?? undefined, error: error ?? undefined, errorDescription: params.get('error_description') ?? undefined };
+  }
+
+  /**
+   * Sections 5.4 to 5.7: validate the redirect, exchange the code, validate the ID Token. Low-level callers must
+   * call `preflightCallback`, then atomically consume server-side pending state before calling this method;
+   * createHandlers does this for you. A failed or uncertain exchange must never release the consumed state.
+   */
+  async complete(p: { params: URLSearchParams; pending: PendingSignIn | null }): Promise<SignIn> {
+    const { pending, code, error, errorDescription } = this.preflightCallback(p);
     if (error) {
       const known = (ISSUER_ERROR_CODES as readonly string[]).includes(error);
-      throw new RelyingPartyError(known ? (error as RelyingPartyErrorCode) : 'issuer_error', known ? `the Issuer answered ${error}` : 'the Issuer answered with an error', one('error_description')?.slice(0, 500));
+      throw new RelyingPartyError(known ? (error as RelyingPartyErrorCode) : 'issuer_error', known ? `the Issuer answered ${error}` : 'the Issuer answered with an error', errorDescription?.slice(0, 500));
     }
-    const code = one('code');
-    if (!code) throw new RelyingPartyError('invalid_request', 'no code in the response');
 
     await this.checkRelayConfiguration();
     // Token Request, only to the recorded Issuer's Token Endpoint (Section 5.6).
     const m = await this.metadata(pending.issuer);
     const { clientId, clientSecret } = this.clientFor(pending.issuer);
-    const form = new URLSearchParams({ grant_type: 'authorization_code', code, redirect_uri: this.o.redirectUri, code_verifier: pending.verifier });
+    const form = new URLSearchParams({ grant_type: 'authorization_code', code: code!, redirect_uri: this.o.redirectUri, code_verifier: pending.verifier });
     const headers: Record<string, string> = { 'content-type': 'application/x-www-form-urlencoded' };
     if (clientSecret) headers.authorization = `Basic ${Buffer.from(`${encodeURIComponent(clientId)}:${encodeURIComponent(clientSecret)}`).toString('base64')}`;
     else form.set('client_id', clientId);
     let status: number;
     let tok: unknown;
+    // Conservative start-of-request anchor: neither transport nor later JWKS/handle validation renews the token.
+    const tokenRequestAt = Math.floor(Date.now() / 1000);
     try {
       const r = await safeFetch(m.token_endpoint, { method: 'POST', headers, body: form.toString(), maxBytes: MAX_BYTES, timeoutMs: this.timeoutMs, allowPrivate: this.o.allowInsecure });
       status = r.status;
@@ -320,16 +363,26 @@ export class RelyingParty {
       const why = isObject(tok) && typeof tok.error === 'string' && /^[a-z_]{1,40}$/.test(tok.error) ? tok.error : `status ${status}`;
       throw new RelyingPartyError('token_request_failed', `the Issuer refused the code (${why})`);
     }
-    if (typeof tok.id_token !== 'string' || typeof tok.access_token !== 'string' || String(tok.token_type).toLowerCase() !== 'bearer') throw new RelyingPartyError('token_request_failed', 'malformed token response');
+    if (typeof tok.id_token !== 'string' || typeof tok.access_token !== 'string' || !tok.access_token ||
+        typeof tok.token_type !== 'string' || tok.token_type.toLowerCase() !== 'bearer' ||
+        typeof tok.expires_in !== 'number' || !Number.isSafeInteger(tok.expires_in) || tok.expires_in <= 0 || tok.expires_in > 600) {
+      throw new RelyingPartyError('token_request_failed', 'malformed token response');
+    }
+    const accessTokenExpiresAt = tokenRequestAt + tok.expires_in;
 
-    const claims = await this.validateIdToken(tok.id_token, { issuer: pending.issuer, nonce: pending.nonce, clientId, metadata: m });
-    const expiresIn = typeof tok.expires_in === 'number' && tok.expires_in > 0 ? Math.min(tok.expires_in, 3600) : 600;
-    return { ...this.identityOf(claims), claims, issuer: pending.issuer, accessToken: tok.access_token, accessTokenExpiresAt: Math.floor(Date.now() / 1000) + expiresIn, returnTo: pending.returnTo };
+    const claims = await this.validateIdToken(tok.id_token, { issuer: pending.issuer, nonce: pending.nonce, clientId, metadata: m, expectedHandle: pending.loginHint,
+      maxAge: pending.maxAge, authenticationRequestedAt: pending.authenticationRequestedAt });
+    if (Date.now() / 1000 >= accessTokenExpiresAt) throw new RelyingPartyError('reauthentication_required', 'The Access Token expired before sign-in validation completed');
+    return { ...this.identityOf(claims), claims, issuer: pending.issuer, accessToken: tok.access_token, accessTokenExpiresAt, returnTo: pending.returnTo };
   }
 
-  /** Section 5.7 steps 2 to 7 (R-3, R-4, R-14). Nothing from a token that fails is returned. */
-  async validateIdToken(idToken: string, x: { issuer: string; nonce: string; clientId: string; metadata?: IssuerMetadata }): Promise<JWTPayload> {
+  /**
+   * Section 5.7 steps 2 to 7 (R-3, R-4, R-14). `expectedHandle` must come from the pending sign-in bound to
+   * state, never from callback parameters. Nothing from a token that fails is returned.
+   */
+  async validateIdToken(idToken: string, x: IdTokenValidationOptions): Promise<JWTPayload> {
     const bad = (why: string, cause?: unknown) => new RelyingPartyError('invalid_id_token', `ID Token rejected: ${why}`, undefined, { cause });
+    if (!validAuthenticationRequest(x)) throw bad('malformed authentication age policy');
     let header;
     try {
       header = decodeProtectedHeader(idToken);
@@ -350,11 +403,23 @@ export class RelyingParty {
     if (typeof payload.aud !== 'string') throw bad('aud is not a single string');
     if (typeof payload.sub !== 'string' || payload.sub.length === 0 || payload.sub.length > 255) throw bad('sub');
     if (typeof payload.exp !== 'number') throw bad('exp');
-    if (typeof payload.iat !== 'number' || payload.iat > Math.floor(Date.now() / 1000) + T_SKEW) throw bad('iat is in the future');
+    if (typeof payload.iat !== 'number' || payload.iat > Date.now() / 1000 + T_SKEW) throw bad('iat is in the future');
     if (typeof payload.nonce !== 'string' || !sameString(payload.nonce, x.nonce)) throw bad('nonce'); // step 5
     if (payload.actor_type !== 'agent') throw bad('actor_type is not agent'); // step 6
 
     // Step 7, Section 2.5: the handle-to-Issuer binding.
+    const expectedHandle = x.expectedHandle === undefined ? undefined : parseHandle(x.expectedHandle);
+    if (expectedHandle === null) throw new RelyingPartyError('handle_binding_failed', 'the expected handle is invalid');
+    let returnedHandle;
+    if (payload.email !== undefined) {
+      if (typeof payload.email !== 'string' || payload.email_verified !== true) throw bad('email without email_verified true');
+      returnedHandle = parseHandle(payload.email);
+      if (!returnedHandle) throw bad('email is not an Agent Handle');
+      // parseHandle preserves local-part octets and lowercases the A-label domain (Section 2.1).
+      if (expectedHandle && returnedHandle.handle !== expectedHandle.handle) {
+        throw new RelyingPartyError('handle_binding_failed', 'the returned handle does not match the expected handle bound to this sign-in');
+      }
+    }
     const homeIss = payload.home_iss;
     if (homeIss !== undefined) {
       const cfg = this.issuers.get(x.issuer);
@@ -363,13 +428,24 @@ export class RelyingParty {
       const ok = Array.isArray(accepted) && ((accepted.length === 1 && accepted[0] === '*') || accepted.includes(homeIss));
       if (!ok) throw new RelyingPartyError('handle_binding_failed', "home_iss is not among the Relay's home_issuers");
       if (this.issuers.has(homeIss)) throw new RelyingPartyError('configuration_error', 'this Home Issuer is accepted directly and through the Relay; per-owner caps would be counted twice (Section 9 item 10)');
+      if (!returnedHandle && !expectedHandle) throw new RelyingPartyError('handle_binding_failed', 'a Relay token requires a returned or pre-bound handle');
     }
-    if (payload.email !== undefined) {
-      if (typeof payload.email !== 'string' || payload.email_verified !== true) throw bad('email without email_verified true');
+    const bindingHandle = returnedHandle ?? (homeIss !== undefined ? expectedHandle : undefined);
+    if (bindingHandle) {
       const expected = typeof homeIss === 'string' ? homeIss : x.issuer;
-      const discovered = await this.resolve(payload.email);
+      const discovered = await this.resolve(bindingHandle.handle);
       if (discovered !== expected) throw new RelyingPartyError('handle_binding_failed', "the handle's domain does not designate this Issuer");
       if (expected !== x.issuer) await this.metadata(expected); // Section 2.2: the designated Issuer's metadata names itself
+    }
+    // Discovery and key retrieval can consume the remaining lifetime. Recheck time at the point of acceptance.
+    const now = Date.now() / 1000;
+    if (payload.exp <= now) throw bad('expired');
+    if (payload.iat! > now + T_SKEW) throw bad('iat is in the future');
+    if (x.maxAge !== undefined) {
+      const authTime = payload.auth_time;
+      if (typeof authTime !== 'number' || !Number.isFinite(authTime) || authTime < 0 || authTime > now || authTime > payload.iat!) throw bad('auth_time');
+      if (x.authenticationRequestedAt! > now) throw bad('authentication request is in the future');
+      if (x.maxAge === 0 ? authTime < x.authenticationRequestedAt! : now - authTime > x.maxAge) throw bad('authentication is too old');
     }
     return payload;
   }

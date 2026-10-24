@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "agentid-signin": {
+      "command": "node",
+      "args": ["/absolute/path/to/agentlogin/reference/packages/agentid-mcp/bin/agentid-signin-mcp.js", "--config", "/absolute/path/to/private/agentid.json"]
+    }
+  }
+}

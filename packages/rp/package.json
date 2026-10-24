@@ -1,6 +1,6 @@
 {
   "name": "@agentlogin/rp",
-  "version": "0.1.0",
+  "version": "0.2.0-beta.1",
   "description": "Relying-party kit for Agent Login: accept sign-ins from software agents with an open, federated OpenID Connect profile",
   "license": "Apache-2.0",
   "type": "module",
@@ -11,7 +11,8 @@
   },
   "files": [
     "dist",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
   "repository": {
     "type": "git",
@@ -28,13 +29,18 @@
     "ai-agents"
   ],
   "dependencies": {
-    "agentlogin": "^0.1.0",
+    "agentlogin": "0.2.0-beta.1",
     "jose": "^6.1.0"
   },
   "engines": {
-    "node": ">=22.12"
+    "node": ">=22.13"
   },
   "scripts": {
     "prepack": "tsc -b"
+  },
+  "publishConfig": {
+    "access": "public",
+    "tag": "beta",
+    "registry": "https://registry.npmjs.org/"
   }
 }

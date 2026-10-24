@@ -1,0 +1,46 @@
+{
+  "name": "@agentlogin/mcp",
+  "version": "0.2.0-beta.1",
+  "description": "Local Agent Login tools with private keys, isolated application sessions and explicit target configuration",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": "./dist/index.js",
+    "./cli": "./dist/cli.js"
+  },
+  "bin": {
+    "agentlogin-mcp": "bin/agentlogin-mcp.js"
+  },
+  "files": [
+    "dist",
+    "bin",
+    "README.md",
+    "skills",
+    "examples",
+    "LICENSE"
+  ],
+  "scripts": {
+    "prepack": "tsc -b"
+  },
+  "dependencies": {
+    "agentlogin": "0.2.0-beta.1",
+    "@modelcontextprotocol/server": "2.3.1",
+    "jose": "^6.1.0",
+    "zod": "4.6.7"
+  },
+  "engines": {
+    "node": ">=22.13"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/agentlogin/reference.git",
+    "directory": "packages/mcp"
+  },
+  "publishConfig": {
+    "access": "public",
+    "tag": "beta",
+    "registry": "https://registry.npmjs.org/"
+  }
+}

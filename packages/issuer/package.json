@@ -1,6 +1,6 @@
 {
   "name": "@agentlogin/issuer",
-  "version": "0.1.0",
+  "version": "0.2.0-beta.1",
   "description": "Reference Agent Login issuer: an OpenID Provider that signs software agents in with their own keys",
   "license": "Apache-2.0",
   "type": "module",
@@ -12,7 +12,8 @@
   "files": [
     "dist",
     "static",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
   "repository": {
     "type": "git",
@@ -26,5 +27,13 @@
   },
   "scripts": {
     "prepack": "tsc -b"
+  },
+  "engines": {
+    "node": ">=22.13"
+  },
+  "publishConfig": {
+    "access": "public",
+    "tag": "beta",
+    "registry": "https://registry.npmjs.org/"
   }
 }

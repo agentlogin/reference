@@ -1,16 +1,9 @@
-// How state changes without locks. The issuer holds none: several issuer processes may share one store, so every
-// guarantee rests on store operations that are atomic with explicit preconditions (see store.ts). Two patterns
-// build on them.
-//
-// 1. A transaction changes by compare-and-swap. A handler reads it, decides, and writes against the version it
-//    read; if another request got there first, the write is refused and the handler reads and decides again.
-//
-// 2. Where an invariant spans two records (a transaction and the key that asserted it, a code and that key), the
-//    change is written first and the other record is read again afterwards. Revocation writes the key first and then
-//    ends what the key asserted. Whichever order two requests interleave in, one of them sees the other's write:
-//    a revoked key never keeps a live transaction, code or token.
+// Transactions use a store compare-and-swap that commits their dependent effects atomically. Immutable Agent
+// subjects, key enrollment IDs and monotonic Agent/Account disable versions keep delayed reads and writes from
+// becoming valid again after a deletion, re-enrollment, or disable/re-enable cycle.
 import type { IssuerContext } from './context.js';
-import { TERMINAL, type DenyReason, type SubjectFilter, type Transaction } from './store.js';
+import { isAssertionSubjectError, isAssertionWindowError, isTransactionExpiredError, isTransactionTokenError, TERMINAL, type DenyReason, type SubjectFilter, type Transaction, type TransitionEffects } from './store.js';
+import { OAuthError } from './errors.js';
 
 /** The transaction as it stands now. Expiry is a function of time, not a stored status (Section 6.2). */
 export function effective(ctx: IssuerContext, tx: Transaction): Transaction {
@@ -24,15 +17,22 @@ export function ended(ctx: IssuerContext, tx: Transaction, status: 'completed' |
 }
 
 /** Writes `next` if the transaction is still at `expectedVersion`. On success `next.version` is the stored version. */
-export async function commit(ctx: IssuerContext, next: Transaction, expectedVersion: number): Promise<boolean> {
-  const ok = await ctx.store.updateTransaction(next, expectedVersion);
-  if (ok) next.version = expectedVersion + 1;
-  return ok;
-}
-
-/** Gives up the place a transaction holds under a per-owner cap, if any (Section 7.6). */
-export async function releasePlace(ctx: IssuerContext, tx: Transaction): Promise<void> {
-  if (tx.passedCap && tx.ownerId) await ctx.store.releaseSignup({ ownerId: tx.ownerId, clientId: tx.clientId, txnId: tx.id });
+export async function commit(ctx: IssuerContext, next: Transaction, expectedVersion: number, effects: Omit<TransitionEffects, 'now'> = {}): Promise<boolean> {
+  let updated;
+  try {
+    updated = await ctx.store.updateTransaction(next, expectedVersion, { ...effects, now: ctx.now() });
+  } catch (error) {
+    // An external adapter can load a separate copy of the issuer package (including source vs dist in tests).
+    if (isAssertionSubjectError(error)) throw new OAuthError(401, error.error);
+    if (isTransactionExpiredError(error)) throw new OAuthError(410, 'transaction_expired');
+    if (isTransactionTokenError(error)) throw new OAuthError(401, 'invalid_token', undefined, { 'WWW-Authenticate': 'Bearer error="invalid_token"' });
+    if (isAssertionWindowError(error)) {
+      throw new OAuthError(400, 'invalid_assertion', 'assertion expired while awaiting acceptance');
+    }
+    throw error;
+  }
+  if (updated) Object.assign(next, updated);
+  return updated !== undefined;
 }
 
 /**
@@ -47,7 +47,6 @@ export async function denyTransaction(ctx: IssuerContext, id: string, reason: De
     if (TERMINAL.has(cur.status)) return cur;
     const next = ended(ctx, cur, 'denied', reason);
     if (await commit(ctx, next, stored.version)) {
-      await releasePlace(ctx, next);
       return next;
     }
   }
@@ -61,18 +60,18 @@ export async function denyOpenTransactions(ctx: IssuerContext, filter: SubjectFi
 }
 
 /** What a transaction, code or Access Token is bound to. */
-export interface Subject { handle: string; kid: string; keyEnrollment: string; clientId: string }
+export interface Subject { handle: string; kid: string; keyEnrollment: string; clientId: string; agentSub: string; agentVersion: number; accountVersion: number }
 
 /**
  * Whether the subject still stands (Sections 3.3, 7.4): the asserting key is the same enrollment, active and
  * unexpired; the Agent exists and is enabled; the Account is not disabled. Otherwise the reason it does not.
  */
 export async function subjectState(ctx: IssuerContext, s: Subject): Promise<null | 'key_revoked' | 'access_denied'> {
-  const key = await ctx.store.getKey(s.kid);
-  if (!key || key.handle !== s.handle || key.enrollment !== s.keyEnrollment || key.status !== 'active' || ctx.now() >= key.expiresAt) return 'key_revoked';
+  const key = await ctx.store.getKey(s.kid, s.handle);
+  if (!key || key.handle !== s.handle || key.enrollment !== s.keyEnrollment || key.agentSub !== s.agentSub || key.status !== 'active' || (await ctx.store.currentTime(ctx.now())) >= key.expiresAt) return 'key_revoked';
   const agent = await ctx.store.getAgent(s.handle);
-  if (!agent || !agent.enabled) return 'access_denied';
+  if (!agent || agent.sub !== s.agentSub || !agent.enabled || agent.authorizationVersion !== s.agentVersion) return 'access_denied';
   const account = await ctx.store.getAccount(s.handle, s.clientId);
-  if (account?.status === 'disabled') return 'access_denied';
+  if (account?.status === 'disabled' || (account?.authorizationVersion ?? 0) !== s.accountVersion) return 'access_denied';
   return null;
 }

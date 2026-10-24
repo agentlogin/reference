@@ -3,6 +3,7 @@ import { calculateJwkThumbprint, createRemoteJWKSet, decodeProtectedHeader, jwtV
 import { createHash, randomBytes } from 'node:crypto';
 import { AgentClient, rnd } from './agent.js';
 import { call, callContext, obj, type CallContext, type Exchange, type Res } from './http.js';
+import { authorizationRedirectMatches, concurrentAccessTokens, redirectMatches, singleUseContinueError, validContinueNext, validateMetadata, validateForbiddenMetadata } from './validation.js';
 
 export interface HarnessOptions {
   issuer: string;
@@ -147,7 +148,7 @@ class Harness {
     const redirect = new URL(obj(c.json).redirect);
     const code = redirect.searchParams.get('code')!;
     const token = await this.exchange(client, code, s.verifier);
-    return { ...s, tx, redirect, code, token: obj(token.json), tokenRes: token };
+    return { ...s, tx, assertUrl: s.tx.next.url, redirect, code, token: obj(token.json), tokenRes: token };
   }
   async exchange(client: RegisteredClient, code: string, verifier: string, over: Record<string, string> = {}) {
     const form = { grant_type: 'authorization_code', code, redirect_uri: client.redirect_uri, code_verifier: verifier, ...over };
@@ -268,7 +269,7 @@ class Harness {
   /** Transactions this run left waiting for the Owner; refused at the end so that nobody is asked to approve a test. */
   private awaitingOwner = new Set<string>();
 
-  async bootstrap() {
+  async bootstrap(): Promise<boolean> {
     const existing = Boolean(this.o.handle && this.o.ownerCredential);
     if (!this.o.adminToken && !existing) throw new Error('the harness needs an admin token, or an existing handle with its Owner Credential');
     // Everything that can be decided from the options is decided before the issuer or the operator's Agent is touched.
@@ -280,6 +281,17 @@ class Harness {
     const m = await call(`${this.o.issuer}/.well-known/openid-configuration`);
     expect(m.status === 200, `metadata → ${m.status}`);
     this.meta = obj(m.json);
+    await this.check('I-1', 'Metadata contains the REQUIRED members and values of 2.4', async () => {
+      expect(m.json !== null && typeof m.json === 'object' && !Array.isArray(m.json), 'metadata must be a JSON object');
+      expect(m.headers.get('content-type')?.split(';')[0]?.trim().toLowerCase() === 'application/json', 'metadata must have Content-Type application/json');
+      validateMetadata(this.meta, this.o.issuer, Boolean(this.o.adminToken));
+    });
+    await this.check('I-2', 'Only authorization_code grants; no end_session_endpoint, plain PKCE, none or RS256 signing algorithms', async () => {
+      validateForbiddenMetadata(this.meta);
+    });
+    // Invalid endpoints must never receive the operator's credentials. Return the discovery failures as a report
+    // before enrollment, registration or transaction creation can run against malformed metadata.
+    if (this.results.some((r) => r.outcome === 'fail')) return false;
     if (existing) {
       this.credential = this.o.ownerCredential!;
       const listed = await call(`${this.meta.agents_endpoint}/${encodeURIComponent(this.o.handle!)}/keys`, { headers: { authorization: `Bearer ${this.credential}` } });
@@ -318,6 +330,7 @@ class Harness {
         throw new Error(`the client fixture cannot exchange a code${error === 'invalid_client' ? ' (the client secret is not accepted: invalid_client)' : ''}: the Token Endpoint answered ${exchanged.status} ${error ?? ''}`.trim());
       }
     }
+    return true;
   }
   /** Leaves an existing Agent as it was found: revokes the keys this run enrolled and refuses the approvals it left waiting. */
   async cleanup(): Promise<void> {
@@ -338,7 +351,7 @@ class Harness {
   run(): Promise<Report> {
     return callContext.run(this.cx, async () => {
       try {
-        await this.bootstrap();
+        if (!await this.bootstrap()) return this.report();
         return await this.checks();
       } finally {
         await this.cleanup();
@@ -349,25 +362,6 @@ class Harness {
     const m = this.meta;
     const iss = this.o.issuer;
 
-    await this.check('I-1', 'Metadata contains the REQUIRED members and values of 2.4', async () => {
-      for (const k of ['transaction_endpoint', 'agents_endpoint', 'handle_domains', 'agent_key_algs_supported', 'agent_login_versions_supported', 'jwks_uri', 'token_endpoint', 'userinfo_endpoint', 'authorization_endpoint']) expect(m[k] !== undefined, `missing ${k}`);
-      expect(m.issuer === iss, 'issuer mismatch');
-      expect(m.client_id_metadata_document_supported === true, 'client_id_metadata_document_supported');
-      expect(m.authorization_response_iss_parameter_supported === true, 'authorization_response_iss_parameter_supported');
-      expect(m.code_challenge_methods_supported?.includes('S256'), 'S256');
-      expect(m.id_token_signing_alg_values_supported?.includes('ES256'), 'ES256');
-      expect(m.agent_key_algs_supported?.includes('ES256'), 'agent_key_algs_supported ES256');
-      for (const s of ['openid', 'email', 'profile', 'owner_profile', 'owner_email']) expect(m.scopes_supported?.includes(s), `scope ${s}`);
-      expect(m.token_endpoint_auth_methods_supported?.includes('none') && m.token_endpoint_auth_methods_supported?.includes('client_secret_basic'), 'auth methods');
-      expect(m.agent_login_versions_supported?.includes('1.0'), 'versions');
-    });
-    await this.check('I-2', 'No end_session_endpoint, plain or none; grant_types_supported is authorization_code', async () => {
-      expect(m.end_session_endpoint === undefined, 'end_session_endpoint present');
-      expect(!m.code_challenge_methods_supported?.includes('plain'), 'plain');
-      expect(!m.id_token_signing_alg_values_supported?.includes('none'), 'none');
-      expect(JSON.stringify(m.grant_types_supported) === '["authorization_code"]', `grant_types ${JSON.stringify(m.grant_types_supported)}`);
-      expect(JSON.stringify(m.response_types_supported) === '["code"]', 'response_types');
-    });
     await this.check('I-3', 'Rejects requests without PKCE, with plain, without state/nonce, or with a repeated parameter', async () => {
       const cases: Array<[string, Record<string, string | undefined>, Array<[string, string]>]> = [
         ['no code_challenge', { code_challenge: undefined, code_challenge_method: undefined }, []],
@@ -383,7 +377,49 @@ class Harness {
         const redirect = typeof j.redirect === 'string' ? new URL(j.redirect) : null;
         const err = j.error ?? redirect?.searchParams.get('error');
         expect(r.status === 400 && err === 'invalid_request', `${name}: ${r.status} ${r.text.slice(0, 160)}`);
-        if (redirect) expect(redirect.origin + redirect.pathname === this.client.redirect_uri && redirect.searchParams.get('iss') === iss, `${name}: error redirect target`);
+        if (redirect) expect(redirectMatches(redirect, this.client.redirect_uri) && redirect.searchParams.get('iss') === iss, `${name}: error redirect target`);
+      }
+      // Core 5.2 applies to unknown extensions too, including duplicates split across query and POST body.
+      for (const source of ['query', 'body', 'query-and-body'] as const) {
+        for (const accept of ['application/json', 'text/html']) {
+          const a = this.authUrl(this.client);
+          const url = new URL(source === 'query' ? a.url : m.authorization_endpoint);
+          const body = source === 'query' ? undefined : new URLSearchParams();
+          if (body) for (const [name, value] of Object.entries(a.params)) if (value !== undefined) body.append(name, value);
+          const destination = body ?? url.searchParams;
+          destination.append('x-conformance-extension', 'first');
+          (source === 'query-and-body' ? url.searchParams : destination).append('x-conformance-extension', 'second');
+          const r = await call(url.href, { method: body ? 'POST' : 'GET',
+            headers: { accept, ...(body ? { 'content-type': 'application/x-www-form-urlencoded' } : {}) }, body: body?.toString() });
+          const j = obj(r.json);
+          const target = accept === 'text/html' ? r.headers.get('location') : j.redirect;
+          expect(r.status === (accept === 'text/html' ? 303 : 400), `repeated unknown parameter in ${source} (${accept}) → ${r.status}`);
+          expect(typeof target === 'string' && URL.canParse(target) &&
+            authorizationRedirectMatches(new URL(target), this.client.redirect_uri, a.params.state, iss, 'error') &&
+            new URL(target).searchParams.get('error') === 'invalid_request', `repeated unknown parameter in ${source}: error redirect`);
+          if (accept === 'application/json') expect(j.error === 'invalid_request' && j.transaction_id === undefined, `repeated unknown parameter in ${source}: JSON error`);
+        }
+      }
+    });
+    await this.check('I-56', 'Registration requires an explicit supported authentication method and its conditional metadata', async () => {
+      if (!this.o.adminToken || typeof m.registration_endpoint !== 'string') throw new Skip('needs an authenticated registration endpoint');
+      const reg = (metadata: Record<string, unknown>) => call(m.registration_endpoint, { method: 'POST',
+        headers: { authorization: `Bearer ${this.o.adminToken}` }, json: { redirect_uris: ['https://rp-method.example/cb'], ...metadata } });
+      const methods = m.token_endpoint_auth_methods_supported as string[];
+      const invalid: Array<[string, Record<string, unknown>]> = [
+        ['missing method', {}], ['null method', { token_endpoint_auth_method: null }],
+        ['empty method', { token_endpoint_auth_method: '' }], ['public client method', { token_endpoint_auth_method: 'none' }],
+      ];
+      if (methods.includes('private_key_jwt')) invalid.push(['private_key_jwt without keys', { token_endpoint_auth_method: 'private_key_jwt' }]);
+      for (const [name, metadata] of invalid) {
+        const r = await reg(metadata);
+        const body = obj(r.json);
+        expect(r.status === 400 && body.error === 'invalid_client_metadata' && body.client_id === undefined && body.client_secret === undefined,
+          `${name} → ${r.status} ${body.error ?? ''}`);
+      }
+      for (const method of ['client_secret_basic', 'client_secret_post'].filter((value) => methods.includes(value))) {
+        const r = await reg({ token_endpoint_auth_method: method });
+        expect(r.status === 201 && obj(r.json).token_endpoint_auth_method === method, `explicit ${method} → ${r.status}`);
       }
     });
     await this.check('I-4', 'Does not redirect on a mismatched redirect_uri; answers 400 directly', async () => {
@@ -423,16 +459,17 @@ class Harness {
       const csp = wait.headers.get('content-security-policy') ?? '';
       expect(/frame-ancestors 'none'/.test(csp) && /script-src/.test(csp) && !/unsafe-inline[^;]*;?/.test(csp.split('script-src')[1]?.split(';')[0] ?? ''), `CSP: ${csp}`);
     });
-    await this.check('I-9', 'Identifiers, challenges and tokens have at least 128 bits', async () => {
+    await this.check('I-9', 'Identifier and token encodings can hold 128 bits; the identifier alone discloses no credential', async () => {
       const s = await this.start();
       for (const [k, v] of [['transaction_id', s.tx.transaction_id], ['challenge', s.tx.challenge], ['session_token', s.tx.session_token]] as const) expect(entropyBits(v) >= 128, `${k}: at most ${entropyBits(v)} bits`);
       const a = await this.assert(s.tx, this.agent, { accept_disclosure: true });
       const t = obj(a.json);
       expect(entropyBits(t.transaction_token) >= 128, `transaction_token: at most ${entropyBits(t.transaction_token)} bits`);
-      const secret = typeof t.next?.url === 'string' ? new URL(t.next.url).pathname.split('/').pop() : undefined;
-      expect(entropyBits(secret) >= 128, `continue URL secret: at most ${entropyBits(secret)} bits`);
       const anon = await this.get(s.tx);
       expect(anon.status === 200 && obj(anon.json).transaction_token === undefined && obj(anon.json).session_token === undefined && obj(anon.json).next?.url === undefined, 'GET with the identifier alone reveals a credential or the continue URL');
+    });
+    await this.check('I-9', 'Entropy generation for identifiers, challenges, tokens and continue URLs', async () => {
+      throw new Skip('not observable black-box: encoding length does not establish entropy, and the continue URL secret has no prescribed location or encoding');
     });
     await this.check('I-10', 'Every response carries iss, url, status and next; errors on an existing transaction carry status and next', async () => {
       const s = await this.start();
@@ -591,7 +628,7 @@ class Harness {
       const a4 = obj((await this.assert(s4.tx, fresh)).json);
       expect(a4.status === 'awaiting_consent' && a4.consent_reason === 'first_visit', 'review required after consent revocation');
     });
-    await this.check('I-17', 'Continue URL released per 6.5; JSON answers {redirect}; ready continue single use; denied continue repeatable', async () => {
+    await this.check('I-17', 'Continue URL released per 6.5; JSON answers {redirect}; ready continue single use; denied continuation may be repeated', async () => {
       const s = await this.start();
       const a = obj((await this.assert(s.tx, this.agent, { accept_disclosure: true })).json);
       const asSession = obj((await this.get(s.tx, s.tx.session_token)).json);
@@ -602,34 +639,53 @@ class Harness {
       expect(none.status === 401, `anonymous continue → ${none.status}`);
       const c = await this.cont(a.next.url, a.transaction_token);
       const r = new URL(obj(c.json).redirect);
-      expect(c.status === 200 && r.searchParams.get('code') && r.searchParams.get('state') === s.params.state && r.searchParams.get('iss') === iss, `continue → ${c.status} ${c.text.slice(0, 160)}`);
+      expect(c.status === 200 && authorizationRedirectMatches(r, this.client.redirect_uri, s.params.state, iss, 'code'), `continue → ${c.status} ${c.text.slice(0, 160)}`);
       const twice = await this.cont(a.next.url, a.transaction_token);
-      expect(twice.status === 410 && obj(twice.json).error === 'transaction_expired' && obj(twice.json).status === 'completed', `second continue → ${twice.status}`);
+      expect(twice.status === 410 && singleUseContinueError(twice.json, 'completed', m.transaction_endpoint), `second continue → ${twice.status}`);
       // deliver_to_session path, HTML redirect
       const s2 = await this.start();
       const a2 = obj((await this.assert(s2.tx, this.agent, { accept_disclosure: true, deliver_to_session: true })).json);
       const sess = obj((await this.get(s2.tx, s2.tx.session_token)).json);
       expect(typeof sess.next?.url === 'string', 'continue URL released to the Session Holder with deliver_to_session');
       const html = await call(sess.next.url, { headers: { accept: 'text/html', authorization: `Bearer ${s2.tx.session_token}` } });
-      expect(html.status === 303 && (html.headers.get('location') ?? '').startsWith(this.client.redirect_uri) && (html.headers.get('cache-control') ?? '').includes('no-store'), `html continue → ${html.status} ${html.headers.get('cache-control')}`);
+      expect(html.status === 303 && authorizationRedirectMatches(new URL(html.headers.get('location') ?? 'https://invalid.example/'), this.client.redirect_uri, s2.params.state, iss, 'code') && (html.headers.get('cache-control') ?? '').includes('no-store'), `html continue → ${html.status} ${html.headers.get('cache-control')}`);
       expect(a2.transaction_token !== undefined, 'agent still receives a transaction_token');
-      // denied path repeatable
+      // A denied continuation may be repeatable or single-use.
       const s3 = await this.start(this.client, { prompt: 'none' });
       const fresh = await this.newAgent(this.ownerId ?? (() => { throw new Skip('needs adminToken'); })());
       const a3 = obj((await this.assert(s3.tx, fresh)).json);
       expect(a3.status === 'denied', 'denied');
       const d1 = await this.cont(a3.next.url, a3.transaction_token);
       const d2 = await this.cont(a3.next.url, a3.transaction_token);
-      expect(d1.status === 200 && d2.status === 200, 'denied continue repeatable');
+      const deniedRedirect = obj(d1.json).redirect;
+      expect(d1.status === 200 && typeof deniedRedirect === 'string', `first denied continue → ${d1.status}`);
+      const errorUrl = new URL(deniedRedirect);
+      const boundError = (u: URL) => authorizationRedirectMatches(u, this.client.redirect_uri, s3.params.state, iss, 'error');
+      expect(boundError(errorUrl), 'denied continuation returns a bound error response');
+      const repeated = obj(d2.json).redirect;
+      const sameError = typeof repeated === 'string' && URL.canParse(repeated) && boundError(new URL(repeated)) && new URL(repeated).searchParams.get('error') === errorUrl.searchParams.get('error');
+      expect((d2.status === 200 && sameError) || (d2.status === 410 && singleUseContinueError(d2.json, 'denied', m.transaction_endpoint)), `optional repeated denied continue → ${d2.status} ${obj(d2.json).error ?? ''}`);
+      this.log(`INFO I-17 denied continuation is ${d2.status === 200 ? 'repeatable' : 'single use'} (either is permitted)`);
     });
-    await this.check('I-19', 'A code is redeemed once under concurrent Token Requests', async () => {
+    const concurrentlyIssuedTokens: string[] = [];
+    await this.check('I-19', 'A fresh code succeeds sequentially; concurrent Token Requests redeem at most once', async () => {
+      const sequential = await this.signIn();
+      expect(sequential.tokenRes.status === 200 && typeof sequential.token.access_token === 'string' && typeof sequential.token.id_token === 'string', `sequential redemption → ${sequential.tokenRes.status}`);
       for (let round = 0; round < 3; round += 1) {
         const { code, verifier } = await this.codeFor();
         const results = await Promise.all(Array.from({ length: 6 }, () => this.exchange(this.client, code, verifier)));
-        const ok = results.filter((r) => r.status === 200);
-        expect(ok.length === 1, `round ${round}: concurrent redemptions answered ${results.map((r) => r.status).join(', ')}`);
-        expect(results.filter((r) => r.status !== 200).every((r) => r.status === 400 && obj(r.json).error === 'invalid_grant'), 'the other redemptions answer invalid_grant');
+        concurrentlyIssuedTokens.push(...concurrentAccessTokens(results));
       }
+    });
+    await this.check('I-19', 'Replay invalidates any token returned during concurrent redemption (SHOULD, Section 5.4)', async () => {
+      if (concurrentlyIssuedTokens.length === 0) throw new Skip('no token was returned before replay invalidated the concurrent redemptions; there is no issued token to test');
+      let stillUsable = 0;
+      for (const token of concurrentlyIssuedTokens) {
+        const ui = await call(m.userinfo_endpoint, { headers: { authorization: `Bearer ${token}` } });
+        if (ui.status === 200) stillUsable += 1;
+        else expect(ui.status === 401 && obj(ui.json).error === 'invalid_token', `UserInfo after replay → ${ui.status} ${obj(ui.json).error ?? ''}`);
+      }
+      if (stillUsable) throw new Skip(`${stillUsable} token(s) remain usable after replay: the Section 5.4 revocation recommendation (SHOULD) was not followed`);
     });
     await this.check('I-19', 'A Registered Client must authenticate: a wrong secret or none answers 401 invalid_client and no tokens', async () => {
       if (!this.client.client_secret) throw new Skip('needs a Registered Client');
@@ -820,7 +876,9 @@ class Harness {
       const c2 = new URL(obj((await this.cont(a2.next.url, a2.transaction_token)).json).redirect);
       const del = await call(`${m.agents_endpoint}/${encodeURIComponent(fresh.handle)}/keys`, { method: 'DELETE', headers: { authorization: `Bearer ${this.credential}` } });
       expect(del.status === 204, 'revoke all');
-      const after = obj((await this.get(open.tx, a.transaction_token)).json);
+      const revokedRead = await this.get(open.tx, a.transaction_token);
+      expect(revokedRead.status === 401 && obj(revokedRead.json).error === 'invalid_token' && !obj(revokedRead.json).next?.url, 'revocation invalidates the transaction bearer and withholds the continue URL');
+      const after = obj((await this.get(open.tx)).json);
       expect(after.status === 'denied' && after.reason === 'key_revoked', `open transaction → ${after.status} ${after.reason}`);
       const ex = await this.exchange(this.client, c2.searchParams.get('code')!, s2.verifier);
       expect(ex.status === 400 && obj(ex.json).error === 'invalid_grant', `unredeemed code → ${ex.status}`);
@@ -843,7 +901,9 @@ class Harness {
       const acct = `${m.agents_endpoint}/${encodeURIComponent(fresh.handle)}/accounts/${encodeURIComponent(this.client.client_id)}`;
       const dis = await call(acct, { method: 'PATCH', headers: { authorization: `Bearer ${this.credential}` }, json: { status: 'disabled' } });
       expect(dis.status === 200 && obj(dis.json).status === 'disabled', `disable → ${dis.status}`);
-      const after = obj((await this.get(open.tx, a.transaction_token)).json);
+      const deniedRead = await this.get(open.tx, a.transaction_token);
+      expect(deniedRead.status === 200 && validContinueNext(obj(deniedRead.json).next, m.transaction_endpoint), 'Account disable retains the transaction bearer for the denial continuation');
+      const after = obj(deniedRead.json);
       expect(after.status === 'denied' && after.reason === 'access_denied', `open → ${after.status} ${after.reason}`);
       const later = obj((await this.assert((await this.start()).tx, fresh)).json);
       expect(later.status === 'denied' && later.reason === 'access_denied', `later → ${later.status}`);
@@ -974,6 +1034,76 @@ class Harness {
         this.credential = saved;
       }
     });
+    await this.check('I-32', 'max_age rejects malformed and repeated values; an empty value is omitted', async () => {
+      for (const value of ['-1', '+1', '1.5', '1e3', 'NaN', 'Infinity', ' 1']) {
+        const response = await call(this.authUrl(this.client, { max_age: value }).url);
+        expect(response.status === 400 && obj(response.json).error === 'invalid_request', `invalid max_age ${JSON.stringify(value)} → ${response.status} ${obj(response.json).error ?? ''}`);
+      }
+      const empty = await this.start(this.client, { max_age: '' }); // RFC 6749 Section 3.1: no value means omitted.
+      expect(empty.tx.status === 'awaiting_agent', 'an empty optional max_age must behave as omitted');
+      const repeated = await call(this.authUrl(this.client, { max_age: '1' }, [['max_age', '2']]).url);
+      expect(repeated.status === 400 && obj(repeated.json).error === 'invalid_request', 'repeated max_age must be invalid_request');
+    });
+    const startAgeReady = async (maxAge: string) => {
+      const started = await this.start(this.client, { max_age: maxAge });
+      const assertionStart = performance.now();
+      const asserted = obj((await this.assert(started.tx, this.agent, { accept_disclosure: true })).json);
+      const assertionEnd = performance.now();
+      expect(asserted.status === 'ready', `max_age=${maxAge} assertion → ${asserted.status} ${asserted.reason ?? ''}`);
+      return { started, asserted, assertionStart, assertionEnd };
+    };
+    await this.check('I-32', 'Positive max_age expires before code issuance', async () => {
+      const continuation = await startAgeReady('1');
+      await sleep(2100); // More than two whole-second ticks; the transaction's ordinary lifetime remains live.
+      const denied = await this.cont(continuation.asserted.next.url, continuation.asserted.transaction_token);
+      expect(denied.status === 200 && typeof obj(denied.json).redirect === 'string', `stale authentication continuation → ${denied.status}`);
+      expect(new URL(obj(denied.json).redirect).searchParams.get('error') === 'login_required', 'over-age authentication must not issue a code');
+      const state = obj((await this.get(continuation.asserted, continuation.asserted.transaction_token)).json);
+      expect(state.status === 'denied' && state.reason === 'login_required', 'stale completion must retain denied/login_required');
+    });
+    await this.check('I-32', 'Zero max_age permits delayed delivery and preserves the original authentication time', async () => {
+      const zero = await startAgeReady('0');
+      await sleep(2100);
+      const completed = await this.cont(zero.asserted.next.url, zero.asserted.transaction_token);
+      expect(completed.status === 200 && typeof obj(completed.json).redirect === 'string', `delayed zero-age continuation → ${completed.status}`);
+      const redirect = new URL(obj(completed.json).redirect);
+      expect(!!redirect.searchParams.get('code'), 'zero requires fresh authentication for the request, not immediate delivery');
+      const exchangeStart = performance.now();
+      const tokens = await this.exchange(this.client, redirect.searchParams.get('code')!, zero.started.verifier);
+      const exchangeEnd = performance.now();
+      expect(tokens.status === 200, `delayed max_age=0 exchange → ${tokens.status}`);
+      const { payload } = await jwtVerify(obj(tokens.json).id_token, createRemoteJWKSet(new URL(m.jwks_uri)), { issuer: iss, audience: this.client.client_id });
+      expect(typeof payload.auth_time === 'number' && typeof payload.iat === 'number', 'max_age=0 requires auth_time and iat');
+      // As in I-49, compare readings from the Issuer's clock against measured elapsed intervals. This detects
+      // both reused old authentication and replacing the original time with a value just before token issuance.
+      const gap = payload.iat - payload.auth_time;
+      const least = (exchangeStart - zero.assertionEnd) / 1000 - 1;
+      const most = (exchangeEnd - zero.assertionStart) / 1000 + 1;
+      expect(gap > least && gap < most, `max_age=0 auth_time must be the time this request's assertion was accepted: observed iat - auth_time ${gap}s, expected between ${least.toFixed(3)} and ${most.toFixed(3)}s`);
+    });
+    await this.check('I-32', 'Positive max_age expires before token issuance', async () => {
+      // Code acquisition must fit inside the requested age, while redemption must happen after it. Retry with
+      // a wider window if ordinary network/DB scheduling consumed the first one; other I-32 probes are independent.
+      for (const maxAge of [3, 10]) {
+        const candidate = await startAgeReady(String(maxAge));
+        const codeRequestedAt = performance.now();
+        const issued = await this.cont(candidate.asserted.next.url, candidate.asserted.transaction_token);
+        expect(issued.status === 200 && typeof obj(issued.json).redirect === 'string', `max_age code continuation → ${issued.status}`);
+        const redirect = new URL(obj(issued.json).redirect);
+        if (redirect.searchParams.get('error') === 'login_required') continue;
+        const code = redirect.searchParams.get('code');
+        expect(!!code, 'fresh max_age continuation must issue a code');
+        await sleep(Math.max(1, candidate.assertionEnd + (maxAge + 1) * 1000 + 100 - performance.now()));
+        // Section 1.5's T_CODE is 60s. A long scheduler/transport stall cannot prove which expiry was enforced.
+        if (performance.now() - codeRequestedAt >= 59_000) throw new Skip('infrastructure delay approached the ordinary 60-second code lifetime; authentication-age rejection could not be isolated');
+        const refused = await this.exchange(this.client, code!, candidate.started.verifier);
+        if (performance.now() - codeRequestedAt >= 59_000) throw new Skip('infrastructure delay approached the ordinary 60-second code lifetime during exchange; authentication-age rejection could not be isolated');
+        expect(refused.status === 400 && obj(refused.json).error === 'invalid_grant' && obj(refused.json).access_token === undefined && obj(refused.json).id_token === undefined, 'an unused code with stale authentication must not yield tokens');
+        return;
+      }
+      throw new Skip('could not acquire a fresh code within either the 3-second or 10-second authentication-age window; token-age enforcement is inconclusive, independent completion and zero-age probes still ran');
+    });
+
     await this.check('I-33', 'session_token accepted as Bearer on the resource; continue answers only to the credential that released it', async () => {
       const s = await this.start();
       const g = await this.get(s.tx, s.tx.session_token);
@@ -990,7 +1120,7 @@ class Harness {
       const r = await this.signIn();
       const g = await this.get(r.tx, r.tx.transaction_token);
       expect(g.status === 200 && obj(g.json).status === 'completed' && obj(g.json).next?.action === 'none', `GET completed → ${g.status} ${g.text.slice(0, 120)}`);
-      const post = await call(`${r.tx.url}/assertion`, { method: 'POST', json: { assertion: await this.agent.assertion(iss, { transaction_id: r.tx.transaction_id, challenge: rnd() }) } });
+      const post = await call(r.assertUrl, { method: 'POST', json: { assertion: await this.agent.assertion(iss, { transaction_id: r.tx.transaction_id, challenge: rnd() }) } });
       expect(post.status === 410 && obj(post.json).error === 'transaction_expired' && obj(post.json).status === 'completed', `POST after completion → ${post.status} ${post.text.slice(0, 120)}`);
     });
     await this.check('I-38', 'Authentication Request by GET and POST; request, request_uri, response_mode and response_type refused on the JSON, HTML and POST paths; state and nonce never rejected on length', async () => {
@@ -1009,7 +1139,7 @@ class Harness {
       const errorAt = (name: string, target: unknown, error: string, state: string | undefined) => {
         expect(typeof target === 'string' && target.length > 0, `${name}: no redirect URL`);
         const l = new URL(target);
-        expect(l.origin + l.pathname === this.client.redirect_uri && l.searchParams.get('error') === error && l.searchParams.get('state') === state && l.searchParams.get('iss') === iss, `${name}: error redirect ${target}`);
+        expect(redirectMatches(l, this.client.redirect_uri) && l.searchParams.get('error') === error && l.searchParams.get('state') === state && l.searchParams.get('iss') === iss, `${name}: error redirect ${target}`);
       };
       for (const [name, over, error] of cases) {
         const u = this.authUrl(this.client, over);
@@ -1053,14 +1183,14 @@ class Harness {
       const loc = h.headers.get('location');
       expect(h.status === 303 && !!loc, `HTML step 3 failure → ${h.status} ${loc ?? h.text.slice(0, 120)}`);
       const l = new URL(loc!);
-      expect(l.origin + l.pathname === this.client.redirect_uri && l.searchParams.get('error') === 'invalid_request' && l.searchParams.get('state') === a.params.state && l.searchParams.get('iss') === iss, `HTML error redirect ${loc}`);
+      expect(redirectMatches(l, this.client.redirect_uri) && l.searchParams.get('error') === 'invalid_request' && l.searchParams.get('state') === a.params.state && l.searchParams.get('iss') === iss, `HTML error redirect ${loc}`);
       expect((h.headers.get('cache-control') ?? '').includes('no-store'), 'no-store on the error redirect');
       const scope = this.authUrl(this.client, { scope: 'email profile' });
       const j = await call(scope.url);
       const jb = obj(j.json);
       expect(j.status === 400 && jb.error === 'invalid_scope' && typeof jb.redirect === 'string', `JSON step 4 failure → ${j.status} ${j.text.slice(0, 160)}`);
       const r = new URL(jb.redirect);
-      expect(r.origin + r.pathname === this.client.redirect_uri && r.searchParams.get('error') === 'invalid_scope' && r.searchParams.get('state') === scope.params.state && r.searchParams.get('iss') === iss, `JSON redirect member ${jb.redirect}`);
+      expect(redirectMatches(r, this.client.redirect_uri) && r.searchParams.get('error') === 'invalid_scope' && r.searchParams.get('state') === scope.params.state && r.searchParams.get('iss') === iss, `JSON redirect member ${jb.redirect}`);
       const h4 = await call(scope.url, { headers: { accept: 'text/html' } });
       expect(h4.status === 303 && new URL(h4.headers.get('location') ?? 'http://invalid/').searchParams.get('error') === 'invalid_scope', `HTML step 4 failure → ${h4.status} ${h4.headers.get('location') ?? ''}`);
       const unknown = this.authUrl({ ...this.client, client_id: `unknown-${rnd(4)}` });
@@ -1077,14 +1207,20 @@ class Harness {
         expect(bh.status === 400 && !bh.headers.get('location') && (bh.headers.get('content-type') ?? '').includes('text/html'), `Open Client document the Issuer must refuse (${oc.name}), HTML path → ${bh.status} ${bh.headers.get('content-type')} ${bh.headers.get('location') ?? ''}`);
       }
     });
-    await this.check('I-40', 'Loopback IP literal redirect_uri of a Registered Client matches with any port and nothing else differing; everything else by simple string comparison', async () => {
+    await this.check('I-40', 'Registered loopback port variation is optional; other URI differences are rejected', async () => {
       const exact = `https://rp-${slug()}.example/cb`;
       const reg = await this.register({ redirect_uris: ['http://127.0.0.1:8080/cb', 'http://[::1]:8080/cb', 'http://localhost:8080/cb', exact] });
       const at = (redirect_uri: string): RegisteredClient => ({ ...reg, redirect_uri });
-      const v4 = await this.start(at('http://127.0.0.1:49152/cb'));
-      expect(v4.tx.client?.redirect_host === '127.0.0.1:49152', `IPv4 loopback with another port: redirect_host ${v4.tx.client?.redirect_host}`);
-      const v6 = await this.start(at('http://[::1]:49153/cb'));
-      expect(v6.tx.status === 'awaiting_agent', 'IPv6 loopback with another port');
+      for (const uri of ['http://127.0.0.1:8080/cb', 'http://[::1]:8080/cb']) {
+        const same = await this.start(at(uri));
+        expect(same.tx.status === 'awaiting_agent', `exact registered loopback redirect ${uri}`);
+      }
+      for (const uri of ['http://127.0.0.1:49152/cb', 'http://[::1]:49153/cb']) {
+        const variant = await call(this.authUrl(at(uri)).url);
+        expect((variant.status === 200 && obj(variant.json).status === 'awaiting_agent') || (variant.status === 400 && obj(variant.json).error === 'invalid_request' && obj(variant.json).redirect === undefined && !variant.headers.get('location')), `optional loopback port variation → ${variant.status} ${variant.text.slice(0, 120)}`);
+        if (variant.status === 200) expect(obj(variant.json).client?.redirect_host === new URL(uri).host, 'accepted loopback variant reports its actual redirect host');
+        this.log(`INFO I-40 ${uri}: port variation ${variant.status === 200 ? 'accepted' : 'refused'} (either is permitted)`);
+      }
       const same = await this.start(at(exact));
       expect(same.tx.status === 'awaiting_agent', 'exact https redirect_uri');
       // Only the port may differ. Each of these is another string that a URL parser would equate with a registered value or with its host.
@@ -1167,7 +1303,7 @@ class Harness {
       expect(swapped.status === 400 && obj(swapped.json).error === 'invalid_assertion', `assertion typ on an enrollment proof → ${swapped.status} ${obj(swapped.json).error}`);
     });
     await this.check('I-43', 'Bodies of an existing transaction carry next.url for continue only for the credential that releases it (ready and denied); error precedence invalid_transaction, invalid_token, transaction_expired, then any other', async () => {
-      interface T { tx: Record<string, any>; assertUrl: string; reviewUrl: string; token: string; session: string; continueUrl: string; status: string }
+      interface T { tx: Record<string, any>; assertUrl: string; reviewUrl: string; token: string; session: string; continueUrl: string; status: string; state: string | undefined }
       const auth = (t?: string): Record<string, string> => (t ? { authorization: `Bearer ${t}` } : {});
       /** A transaction taken through the review step, which makes its assertion and review URLs known; `allow` leaves it ready, `deny` denied. */
       const through = async (decision: 'allow' | 'deny', deliver: boolean): Promise<T> => {
@@ -1176,8 +1312,8 @@ class Harness {
         expect(a.status === 'awaiting_consent' && typeof a.next?.url === 'string' && typeof a.transaction_token === 'string', `prompt=consent → ${a.status} ${a.reason ?? ''}`);
         const d = await call(a.next.url, { method: 'POST', headers: auth(a.transaction_token), json: { decision } });
         const t = obj(d.json);
-        expect(d.status === 200 && t.status === (decision === 'allow' ? 'ready' : 'denied') && typeof t.next?.url === 'string', `${decision} → ${d.status} ${t.status ?? t.error}`);
-        return { tx: s.tx, assertUrl: s.tx.next.url, reviewUrl: a.next.url, token: a.transaction_token, session: s.tx.session_token, continueUrl: t.next.url, status: t.status };
+        expect(d.status === 200 && t.status === (decision === 'allow' ? 'ready' : 'denied') && validContinueNext(t.next, m.transaction_endpoint), `${decision} → ${d.status} ${t.status ?? t.error}`);
+        return { tx: s.tx, assertUrl: s.tx.next.url, reviewUrl: a.next.url, token: a.transaction_token, session: s.tx.session_token, continueUrl: t.next.url, status: t.status, state: s.params.state };
       };
       /** One request and what its answer must be: HTTP status, error (none for a 200), the transaction's status, and next.url released or withheld. */
       const says = async (name: string, request: Promise<Res>, status: number, error: string | undefined, t: T, released: boolean) => {
@@ -1185,7 +1321,20 @@ class Harness {
         const j = obj(r.json);
         expect(r.status === status && j.error === error, `${name} → ${r.status} ${j.error ?? ''}, expected ${status} ${error ?? ''}`);
         expect(j.status === t.status && j.next?.action === 'continue', `${name}: the body must carry status ${t.status} and next continue, has ${j.status} and ${j.next?.action}`);
-        expect(released ? j.next.url === t.continueUrl : j.next.url === undefined, `${name}: next.url must be ${released ? 'released to' : 'withheld from'} this requester`);
+        expect(released ? validContinueNext(j.next, m.transaction_endpoint) : j.next.url === undefined, `${name}: a valid next.url must be ${released ? 'released to' : 'withheld from'} this requester`);
+        if (released) t.continueUrl = j.next.url;
+      };
+      /** Follow the latest advertised URL with the credential that released it; rotation cannot issue a second code. */
+      const continues = async (t: T, bearer: string) => {
+        const response = t.status === 'ready' ? 'code' : 'error';
+        const first = await this.cont(t.continueUrl, bearer);
+        const redirect = obj(first.json).redirect;
+        const bound = (value: unknown) => typeof value === 'string' && URL.canParse(value) && authorizationRedirectMatches(new URL(value), this.client.redirect_uri, t.state, iss, response);
+        expect(first.status === 200 && bound(redirect), `${t.status}: the latest released continue URL → ${first.status}, expected a bound ${response} response`);
+        const again = await this.cont(t.continueUrl, bearer);
+        const repeated = obj(again.json).redirect;
+        const repeatableError = t.status === 'denied' && again.status === 200 && bound(repeated) && new URL(repeated).searchParams.get('error') === new URL(redirect).searchParams.get('error');
+        expect(repeatableError || (again.status === 410 && singleUseContinueError(again.json, t.status === 'ready' ? 'completed' : 'denied', m.transaction_endpoint)), `${t.status}: reuse of the released continue URL → ${again.status}`);
       };
       const replay = async (t: T, bearer?: string) => call(t.assertUrl, { method: 'POST', headers: auth(bearer), json: { assertion: await this.agent.assertion(iss, t.tx as never) } });
       const decide = (t: T, bearer?: string, body: unknown = { decision: 'allow' }) => call(t.reviewUrl, { method: 'POST', headers: auth(bearer), json: body });
@@ -1205,6 +1354,7 @@ class Harness {
       await says('ready: decision without a credential and with a malformed body (invalid_token before invalid_request)', decide(r, undefined, { decision: 'maybe' }), 401, 'invalid_token', r, false);
       await says('ready: decision that is not JSON, with the session_token (invalid_token before invalid_request)', garbled(r.reviewUrl, r.session), 401, 'invalid_token', r, false);
       await says('ready: decision with the transaction_token', decide(r, r.token), 400, 'invalid_request', r, true);
+      await continues(r, r.token);
 
       const rd = await through('allow', true);
       await says('ready, deliver_to_session: GET with the session_token', read(rd, rd.session), 200, undefined, rd, true);
@@ -1212,6 +1362,7 @@ class Harness {
       await says('ready, deliver_to_session: second assertion with the session_token', replay(rd, rd.session), 409, 'assertion_replayed', rd, true);
       await says('ready, deliver_to_session: second assertion, anonymous', replay(rd), 409, 'assertion_replayed', rd, false);
       await says('ready, deliver_to_session: decision with the session_token', decide(rd, rd.session), 401, 'invalid_token', rd, true);
+      await continues(rd, rd.session);
 
       const d = await through('deny', false);
       await says('denied: GET, anonymous', read(d), 200, undefined, d, false);
@@ -1228,12 +1379,14 @@ class Harness {
       await says('denied: decision with the transaction_token', decide(d, d.token), 410, 'transaction_expired', d, true);
       await says('denied: decision with the transaction_token and a malformed body (transaction_expired before invalid_request)', decide(d, d.token, { decision: 'maybe' }), 410, 'transaction_expired', d, true);
       await says('denied: decision that is not JSON, with the transaction_token (transaction_expired before invalid_request)', garbled(d.reviewUrl, d.token), 410, 'transaction_expired', d, true);
+      await continues(d, d.token);
 
       const dd = await through('deny', true);
       await says('denied, deliver_to_session: GET with the session_token', read(dd, dd.session), 200, undefined, dd, true);
       await says('denied, deliver_to_session: GET, anonymous', read(dd), 200, undefined, dd, false);
       await says('denied, deliver_to_session: assertion with the session_token', replay(dd, dd.session), 410, 'transaction_expired', dd, true);
       await says('denied, deliver_to_session: decision with the session_token', decide(dd, dd.session), 401, 'invalid_token', dd, true);
+      await continues(dd, dd.session);
 
       // invalid_transaction comes first: an unknown identifier answers 404 whatever else is wrong with the request.
       const ghostId = rnd();
@@ -1547,9 +1700,9 @@ class Harness {
         expect(onHost.status === 201 && obj(onHost.json).relay_issuer === relay.issuer, `relay_issuer with redirect URIs on its host → ${onHost.status} ${obj(onHost.json).error ?? ''} ${obj(onHost.json).error_description ?? ''}`);
       }
 
-      // Section 3.2: id_token_signed_response_alg is ES256, an advertised EdDSA, or refused.
-      const offered: string[] = (m.id_token_signing_alg_values_supported as string[]).filter((alg) => alg === 'ES256' || alg === 'EdDSA');
-      for (const alg of ['RS256', 'none', 'HS256', 'PS256', 'ES384', 'EdDSA', 'es256'].filter((x) => !offered.includes(x))) {
+      // Section 3.2: id_token_signed_response_alg is ES256, an advertised Ed25519, or refused.
+      const offered: string[] = (m.id_token_signing_alg_values_supported as string[]).filter((alg) => alg === 'ES256' || alg === 'Ed25519');
+      for (const alg of ['RS256', 'none', 'HS256', 'PS256', 'ES384', 'EdDSA', 'Ed25519', 'es256'].filter((x) => !offered.includes(x))) {
         const r = await reg({ id_token_signed_response_alg: alg });
         expect(r.status === 400 && obj(r.json).error === 'invalid_client_metadata', `id_token_signed_response_alg ${alg} → ${r.status} ${r.text.slice(0, 120)}`);
       }
@@ -1735,10 +1888,13 @@ class Harness {
       expect(gap > least && gap < most, `auth_time must be the time the assertion was accepted: the token was issued ${((e0 - a1) / 1000).toFixed(1)} to ${((e1 - a0) / 1000).toFixed(1)} s after the assertion, but iat - auth_time is ${gap} s`);
     });
 
+    return this.report();
+  }
+  private report(): Report {
     const passed = this.results.filter((r) => r.outcome === 'pass').length;
     const failed = this.results.filter((r) => r.outcome === 'fail').length;
     const skipped = this.results.filter((r) => r.outcome === 'skip').length;
-    return { issuer: iss, results: this.results, passed, failed, skipped };
+    return { issuer: this.o.issuer, results: this.results, passed, failed, skipped };
   }
 }
 

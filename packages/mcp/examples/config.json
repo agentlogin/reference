@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "stateDirectory": "/absolute/private/agentlogin",
+  "identities": {
+    "scout": {
+      "handle": "scout@example.com",
+      "ownerPortal": "https://issuer.example/owner",
+      "ownerApprovalPath": "/identity/transactions/{transaction_id}",
+      "enrollmentEndpoint": "https://issuer.example/identity/enrollment-requests",
+      "enrollmentCredentialEnv": "PROVIDER_API_KEY"
+    }
+  },
+  "applications": {
+    "notes": {
+      "name": "Example Notes",
+      "origin": "https://notes.example",
+      "loginPath": "/auth/agent/login",
+      "sessionCheck": { "path": "/me", "handlePointer": "/handle", "issuerPointer": "/iss", "subjectPointer": "/sub" },
+      "logoutPath": "/logout",
+      "operations": {
+        "list_notes": { "description": "Read a page of this agent's notes; pass next_cursor as before for the next page", "method": "GET", "path": "/notes", "queryFields": ["before"], "output": { "notes": "/notes", "next_cursor": "/next_cursor" } },
+        "save_note": { "description": "Save a note using a stable id for an explicit retry", "method": "POST", "path": "/notes", "inputFields": ["id", "text"], "output": { "saved": "/saved", "note": "/note" } }
+      }
+    }
+  },
+  "catalogFiles": []
+}

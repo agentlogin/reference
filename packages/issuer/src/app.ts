@@ -1,4 +1,5 @@
 // HTTP surface of the issuer. Section numbers refer to Agent Login Core 1.0 draft 0.1.
+import { ownerAddressKey } from './owner-address.js';
 import { Hono, type Context } from 'hono';
 import { cors } from 'hono/cors';
 import { getCookie, setCookie } from 'hono/cookie';
@@ -8,7 +9,7 @@ import { AGENT_KEY_ALGS, OWNER_SCOPES, SCOPES, VERSION } from './constants.js';
 import type { IssuerContext } from './context.js';
 import { OAuthError } from './errors.js';
 import { redirectUriMatches, registerClient, resolveClient, type ClientContext } from './clients.js';
-import type { Client, OwnerVerifiedVia, SessionAuth, Transaction } from './store.js';
+import { isTransactionTokenError, type Client, type OwnerVerifiedVia, type SessionAuth, type Transaction } from './store.js';
 import * as tx from './transactions.js';
 import { authenticateClient, exchangeCode, userinfo } from './tokens.js';
 import * as agents from './agents.js';
@@ -53,7 +54,9 @@ export function createIssuerApp(ctx: IssuerContext): Hono {
       const extra = (c.get as unknown as (k: string) => unknown)('txError') as Record<string, unknown> | undefined;
       return c.json({ ...body, ...extra }, err.status as 400, { ...NO_STORE, ...err.headers });
     }
-    console.error(err);
+    // Database errors can include complete failing rows in message/detail/cause. Never log that payload.
+    const code = 'code' in err && typeof err.code === 'string' && /^[0-9A-Z]{5}$/.test(err.code) ? err.code : undefined;
+    console.error('Issuer request failed', { category: 'internal_error', sqlState: code });
     return c.json({ error: 'server_error' }, 500, NO_STORE);
   });
 
@@ -85,15 +88,22 @@ export function createIssuerApp(ctx: IssuerContext): Hono {
         agents_endpoint: `${base}/agents`,
         handle_domains: ctx.handleDomains,
         agent_login_versions_supported: [VERSION],
+        op_policy_uri: ctx.policyUri,
         service_documentation: 'https://github.com/agentlogin/spec',
       },
       200,
       { 'Cache-Control': 'public, max-age=3600' },
     ),
   );
-  app.get('/.well-known/jwks.json', (c) =>
-    c.json({ keys: [{ ...ctx.signingKey.publicJwk, kid: ctx.signingKey.kid, use: 'sig', alg: 'ES256' }] }, 200, { 'Cache-Control': 'public, max-age=3600' }),
+  app.get('/.well-known/jwks.json', async (c) =>
+    c.json({ keys: (await ctx.store.listSigningKeys()).map((key) => ({ ...key.publicJwk,kid:key.kid,use:'sig',alg:'ES256' })) }, 200,
+      { 'Cache-Control': `public, max-age=${ctx.jwksCacheSeconds}` }),
   );
+  app.get('/policy', (c) => c.json({
+    issuer: base,
+    owner_deletion_quota_retention_seconds: ctx.ownerDeletionRetentionSeconds,
+    description: 'Completed sign-ups remain counted while an Owner exists. After deletion, this fixed retention period links a verified address to its counts only; identity, credentials and consent are never inherited. Zero ends inheritance immediately. Each deletion keeps the period in force when it occurred.',
+  },200,{'Cache-Control':'no-store'}));
   // Section 2.2: WebFinger for handles in the served domains (per-handle lookups only).
   app.get('/.well-known/webfinger', async (c) => {
     // The query value is decoded once by the framework; the `acct:` URI inside it carries its own percent-encoding
@@ -151,6 +161,9 @@ export function createIssuerApp(ctx: IssuerContext): Hono {
     let state: string | undefined;
     try {
       state = one('state');
+      // Section 5.2 step 3 applies to every parameter, including unknown extensions and query/body duplicates.
+      // Validate after the client and redirect URI so this error uses the validated redirect target.
+      for (const k of Object.keys(q)) one(k);
       const nonce = one('nonce');
       const codeChallenge = one('code_challenge');
       const method = one('code_challenge_method');
@@ -159,7 +172,14 @@ export function createIssuerApp(ctx: IssuerContext): Hono {
       const prompt = one('prompt');
       const loginHintRaw = one('login_hint');
       const responseMode = one('response_mode');
-      for (const k of ['max_age', 'claims', 'display', 'ui_locales', 'id_token_hint', 'acr_values']) one(k); // ignored, but not repeatable
+      // RFC 6749 Section 3.1: an optional parameter without a value is omitted, not the numeric value zero.
+      const maxAgeRaw = one('max_age') || undefined;
+      if (maxAgeRaw !== undefined && !/^\d+$/.test(maxAgeRaw)) {
+        return redirectError('invalid_request', 'max_age must be non-negative integer seconds', state);
+      }
+      // Decimal integers have no protocol upper bound. Saturation preserves their effect over our safe timestamps.
+      const maxAge = maxAgeRaw === undefined ? undefined : Math.min(Number(maxAgeRaw), Number.MAX_SAFE_INTEGER);
+      for (const k of ['claims', 'display', 'ui_locales', 'id_token_hint', 'acr_values']) one(k); // ignored, but not repeatable
       if (one('request') !== undefined) return redirectError('request_not_supported', 'request objects are not supported', state);
       if (one('request_uri') !== undefined) return redirectError('request_uri_not_supported', 'request_uri is not supported', state);
       if (responseMode !== undefined && responseMode !== 'query') return redirectError('invalid_request', 'response_mode must be query', state);
@@ -187,6 +207,7 @@ export function createIssuerApp(ctx: IssuerContext): Hono {
         nonce,
         codeChallenge,
         prompt: promptValue,
+        maxAge,
         loginHint,
         requester: ua ? { user_agent: ua.slice(0, 200) } : undefined,
         sessionSecret,
@@ -206,8 +227,10 @@ export function createIssuerApp(ctx: IssuerContext): Hono {
   // ---- Section 6: the transaction -----------------------------------------------------------------
   /** Loads the transaction, its client and the viewer; stores status/next for error bodies. */
   async function loadTx(c: Context): Promise<{ t: Transaction; client: Client; viewer: tx.Viewer }> {
-    const t = await tx.loadTransaction(ctx, c.req.param('id') ?? '');
-    const client = (await ctx.store.getClient(t.clientId))!;
+    const initial = await tx.loadTransaction(ctx, c.req.param('id') ?? '');
+    const client = (await ctx.store.getClient(initial.clientId))!;
+    // Client resolution may yield across an explicit key revocation. Identify authority from the final read.
+    const t = await tx.loadTransaction(ctx, initial.id);
     let viewer: tx.Viewer;
     try {
       viewer = tx.identifyViewer(t, parseBearer(c.req.header('authorization')), getCookie(c, 'als') ?? null);
@@ -227,7 +250,12 @@ export function createIssuerApp(ctx: IssuerContext): Hono {
     try {
       return await change();
     } catch (e) {
-      await loadTx(c).catch(() => undefined);
+      let refreshed;
+      try { refreshed = await loadTx(c); } catch (latest) {
+        if (latest instanceof OAuthError && (latest.error === 'invalid_token' || latest.error === 'invalid_transaction')) throw latest;
+      }
+      if (refreshed && tx.isTerminal(refreshed.t.status) && e instanceof OAuthError && !['invalid_transaction', 'invalid_token'].includes(e.error)) throw new OAuthError(410, 'transaction_expired');
+      if (isTransactionTokenError(e)) throw new OAuthError(401, 'invalid_token', undefined, { 'WWW-Authenticate': 'Bearer error="invalid_token"' });
       throw e;
     }
   }
@@ -240,7 +268,7 @@ export function createIssuerApp(ctx: IssuerContext): Hono {
   app.get('/transactions/:id/wait', async (c) => {
     const { t, client, viewer } = await loadTx(c);
     const r = tx.resource(ctx, t, client, viewer);
-    const name = escapeHtml(client.clientName ?? new URL(t.redirectUri).host);
+    const name = escapeHtml(tx.presentedClient(t, client).clientName ?? new URL(t.redirectUri).host);
     const html = page(
       'Sign in with your agent',
       `<p>Signing in to <strong>${name}</strong>.</p><p id="status">Waiting for your agent to sign in.</p>` +
@@ -316,21 +344,21 @@ export function createIssuerApp(ctx: IssuerContext): Hono {
   };
   app.post('/agents/:handle/keys', async (c) => {
     const handle = handleOf(c);
-    await agents.authorizeManagement(ctx, c.req.header('authorization'), handle, true);
-    const r = await agents.enrollKey(ctx, handle, await jsonBody(c));
+    const auth = await agents.authorizeManagement(ctx, c.req.header('authorization'), handle, true);
+    const r = await agents.enrollKey(ctx, handle, await jsonBody(c), auth);
     return c.json({ ...r.record, challenge: r.challenge, proof_url: r.proof_url }, 201, NO_STORE);
   });
   app.post('/agents/:handle/keys/:kid/proof', async (c) => c.json(await agents.proveKey(ctx, handleOf(c), (c.req.param('kid') ?? ''), await jsonBody(c)), 200, NO_STORE));
   app.get('/agents/:handle/keys', async (c) => {
     const handle = handleOf(c);
-    await agents.authorizeManagement(ctx, c.req.header('authorization'), handle, true);
-    return c.json({ keys: (await agents.listLiveKeys(ctx, handle)).map((k) => agents.keyRecord(ctx, k)) }, 200, NO_STORE);
+    const cred = await agents.authorizeManagement(ctx, c.req.header('authorization'), handle, true);
+    return c.json({ keys: (await agents.listLiveKeys(ctx, handle, cred)).map((k) => agents.keyRecord(ctx, k)) }, 200, NO_STORE);
   });
   app.get('/agents/:handle/keys/:kid', async (c) => {
     const handle = handleOf(c);
-    await agents.authorizeManagement(ctx, c.req.header('authorization'), handle, true);
-    const k = await agents.getLiveKey(ctx, (c.req.param('kid') ?? ''));
-    if (!k || k.handle !== handle) throw new OAuthError(404, 'not_found');
+    const cred = await agents.authorizeManagement(ctx, c.req.header('authorization'), handle, true);
+    const k = await agents.getLiveKey(ctx, (c.req.param('kid') ?? ''), handle, cred);
+    if (!k || k.handle !== handle || k.agentSub !== cred.agentSub) throw new OAuthError(404, 'not_found');
     return c.json(agents.keyRecord(ctx, k), 200, NO_STORE);
   });
   app.patch('/agents/:handle/keys/:kid', async (c) => {
@@ -338,8 +366,8 @@ export function createIssuerApp(ctx: IssuerContext): Hono {
     const body = await jsonBody(c);
     const wantsPermissions = isPlainObject(body) && body.permissions !== undefined;
     const cred = await agents.authorizeManagement(ctx, c.req.header('authorization'), handle, !wantsPermissions);
-    const k = await agents.getLiveKey(ctx, (c.req.param('kid') ?? ''));
-    if (!k || k.handle !== handle) throw new OAuthError(404, 'not_found');
+    const k = await agents.getLiveKey(ctx, (c.req.param('kid') ?? ''), handle, cred);
+    if (!k || k.handle !== handle || k.agentSub !== cred.agentSub) throw new OAuthError(404, 'not_found');
     if (!isPlainObject(body)) throw new OAuthError(400, 'invalid_request');
     const patch: { name?: string; shareOwner?: boolean } = {};
     if (wantsPermissions) {
@@ -350,16 +378,16 @@ export function createIssuerApp(ctx: IssuerContext): Hono {
     }
     if (typeof body.name === 'string') patch.name = body.name.slice(0, 200);
     // One atomic field update on this enrollment: it cannot bring back a key that is being revoked at the same time.
-    const patched = await ctx.store.patchKey(k.kid, k.enrollment, patch);
+    const patched = await ctx.store.patchKey(k.kid, k.enrollment, patch, cred);
     if (!patched) throw new OAuthError(404, 'not_found');
     return c.json(agents.keyRecord(ctx, patched), 200, NO_STORE);
   });
   app.delete('/agents/:handle/keys/:kid', async (c) => {
     const handle = handleOf(c);
-    await agents.authorizeManagement(ctx, c.req.header('authorization'), handle, true);
-    const k = await agents.getLiveKey(ctx, (c.req.param('kid') ?? ''));
-    if (!k || k.handle !== handle) throw new OAuthError(404, 'not_found');
-    await agents.revokeKeyEffects(ctx, k.kid);
+    const cred = await agents.authorizeManagement(ctx, c.req.header('authorization'), handle, true);
+    const k = await agents.getLiveKey(ctx, (c.req.param('kid') ?? ''), handle, cred);
+    if (!k || k.handle !== handle || k.agentSub !== cred.agentSub) throw new OAuthError(404, 'not_found');
+    await agents.revokeKeyEffects(ctx, k, cred);
     return c.body(null, 204, NO_STORE);
   });
   app.delete('/agents/:handle/keys', async (c) => {
@@ -370,22 +398,23 @@ export function createIssuerApp(ctx: IssuerContext): Hono {
   });
   app.get('/agents/:handle/accounts', async (c) => {
     const handle = handleOf(c);
-    await agents.authorizeManagement(ctx, c.req.header('authorization'), handle, true);
-    return c.json({ accounts: (await ctx.store.listAccounts(handle)).map(agents.accountRecord) }, 200, NO_STORE);
+    const cred = await agents.authorizeManagement(ctx, c.req.header('authorization'), handle, true);
+    const accounts = await ctx.store.readManagementAccounts(handle, cred);
+    if (!accounts) throw new OAuthError(404, 'not_found');
+    return c.json({ accounts: accounts.map(agents.accountRecord) }, 200, NO_STORE);
   });
   app.patch('/agents/:handle/accounts/:client_id', async (c) => {
     const handle = handleOf(c);
-    await agents.authorizeManagement(ctx, c.req.header('authorization'), handle, true);
+    const cred = await agents.authorizeManagement(ctx, c.req.header('authorization'), handle, true);
     const body = await jsonBody(c);
     if (!isPlainObject(body) || (body.status !== 'enabled' && body.status !== 'disabled')) throw new OAuthError(400, 'invalid_request', 'status must be enabled or disabled');
-    const cred = await agents.authorizeManagement(ctx, c.req.header('authorization'), handle, true);
     if (cred.kind === 'delegated' && body.status === 'enabled') throw new OAuthError(403, 'insufficient_permission', 'a Delegated Credential may only disable', { 'WWW-Authenticate': 'Bearer error="insufficient_scope"' });
-    return c.json(await agents.setAccountStatus(ctx, handle, (c.req.param('client_id') ?? ''), body.status), 200, NO_STORE);
+    return c.json(await agents.setAccountStatus(ctx, handle, (c.req.param('client_id') ?? ''), body.status, cred), 200, NO_STORE);
   });
   app.delete('/agents/:handle/consents/:client_id', async (c) => {
     const handle = handleOf(c);
-    await agents.authorizeManagement(ctx, c.req.header('authorization'), handle, true);
-    await ctx.store.deleteConsent(handle, (c.req.param('client_id') ?? ''));
+    const cred = await agents.authorizeManagement(ctx, c.req.header('authorization'), handle, true);
+    if (!(await ctx.store.deleteConsent(handle, (c.req.param('client_id') ?? ''), cred))) throw new OAuthError(404, 'not_found');
     return c.body(null, 204, NO_STORE);
   });
 
@@ -400,7 +429,7 @@ export function createIssuerApp(ctx: IssuerContext): Hono {
     const cred = await ownerOf(c);
     const t = await tx.loadTransaction(ctx, c.req.param('id') ?? '');
     if (t.ownerId !== cred.ownerId) throw new OAuthError(404, 'invalid_transaction');
-    const client = (await ctx.store.getClient(t.clientId))!;
+    const client = tx.presentedClient(t, (await ctx.store.getClient(t.clientId))!);
     // Section 6.6: the approval view names the client with its redirect_host, the requested Owner Claims and the handle;
     // a client registered with relay_issuer is named as a Relay that forwards the Owner Claims under its op_policy_uri,
     // which Section 4.4 has the Issuer read from the Relay's metadata.
@@ -438,11 +467,12 @@ export function createIssuerApp(ctx: IssuerContext): Hono {
   app.post('/owner/sessions/email', async (c) => {
     const b = await jsonBody(c);
     if (!isPlainObject(b) || typeof b.email !== 'string') throw new OAuthError(400, 'invalid_request', 'email required');
+    try { ownerAddressKey(b.email); } catch { throw new OAuthError(400,'invalid_request','Valid email required'); }
     if (!ctx.sendOwnerCode) throw new OAuthError(501, 'not_supported', 'no delivery channel for one-time codes is configured');
     const owner = await ctx.store.getOwnerByEmail(b.email);
     if (owner) {
       const code = randomId();
-      const expiresAt = ctx.now() + OWNER_CODE_TTL;
+      const expiresAt = await ctx.store.currentTime(ctx.now()) + OWNER_CODE_TTL;
       await ctx.store.putOwnerCode({ ownerId: owner.id, hash: sha256(code), expiresAt }); // replaces an earlier code for this Owner
       await ctx.sendOwnerCode({ email: owner.email, code, expiresAt });
     }
@@ -453,9 +483,10 @@ export function createIssuerApp(ctx: IssuerContext): Hono {
     if (!isPlainObject(b) || typeof b.email !== 'string' || typeof b.code !== 'string') throw new OAuthError(400, 'invalid_request', 'email and code required');
     const owner = await ctx.store.getOwnerByEmail(b.email);
     const pending = owner && (await ctx.store.takeOwnerCode(owner.id)); // single use: taken whether or not it matches
-    if (!owner || !pending || ctx.now() >= pending.expiresAt || !safeEqual(sha256(b.code), pending.hash)) throw new OAuthError(401, 'invalid_token', 'the code is wrong, used or expired', { 'WWW-Authenticate': 'Bearer error="invalid_token"' });
+    const now = await ctx.store.currentTime(ctx.now());
+    if (!owner || !pending || now >= pending.expiresAt || !safeEqual(sha256(b.code), pending.hash)) throw new OAuthError(401, 'invalid_token', 'the code is wrong, used or expired', { 'WWW-Authenticate': 'Bearer error="invalid_token"' });
     const credential = randomSecret();
-    await ctx.store.putCredential({ hash: sha256(credential), ownerId: owner.id, kind: 'owner', sessionAuth: 'email_only', createdAt: ctx.now() });
+    await ctx.store.putCredential({ hash: sha256(credential), ownerId: owner.id, kind: 'owner', sessionAuth: 'email_only', createdAt: now });
     return c.json({ owner_id: owner.id, credential, session_auth: 'email_only' }, 200, NO_STORE);
   });
 
@@ -464,6 +495,7 @@ export function createIssuerApp(ctx: IssuerContext): Hono {
     requireAdmin(c);
     const b = await jsonBody(c);
     if (!isPlainObject(b) || typeof b.email !== 'string') throw new OAuthError(400, 'invalid_request', 'email required');
+    try { ownerAddressKey(b.email); } catch { throw new OAuthError(400,'invalid_request','Valid email required'); }
     const id = randomId();
     const via = b.verified_via;
     const sessionAuth = parseSessionAuth(b.session_auth);
@@ -489,7 +521,7 @@ export function createIssuerApp(ctx: IssuerContext): Hono {
     if (!h || !domainServed(h.domain, ctx.handleDomains)) throw new OAuthError(400, 'invalid_request', 'handle not in a served domain');
     if (!(await ctx.store.getOwner(b.owner_id))) throw new OAuthError(404, 'not_found', 'owner');
     if (await ctx.store.getAgent(h.handle)) throw new OAuthError(409, 'invalid_request', 'handle exists');
-    await ctx.store.putAgent({ ...h, sub: randomSecret(), ownerId: b.owner_id, name: typeof b.name === 'string' ? b.name : undefined, preferredUsername: typeof b.preferred_username === 'string' ? b.preferred_username : h.local, enabled: true, createdAt: ctx.now() });
+    if (!(await ctx.store.putAgent({ ...h, sub: randomSecret(), ownerId: b.owner_id, name: typeof b.name === 'string' ? b.name : undefined, preferredUsername: typeof b.preferred_username === 'string' ? b.preferred_username : h.local, enabled: true, authorizationVersion: 0, createdAt: ctx.now() }))) throw new OAuthError(409, 'invalid_request', 'handle exists');
     return c.json({ handle: h.handle, owner_id: b.owner_id }, 201, NO_STORE);
   });
   app.patch('/admin/agents/:handle', async (c) => {
@@ -498,7 +530,7 @@ export function createIssuerApp(ctx: IssuerContext): Hono {
     const a = await ctx.store.getAgent(handle);
     const b = await jsonBody(c);
     if (!a || !isPlainObject(b) || typeof b.enabled !== 'boolean') throw new OAuthError(400, 'invalid_request');
-    await agents.setAgentEnabled(ctx, a.handle, b.enabled);
+    if (!(await agents.setAgentEnabled(ctx, a, b.enabled))) throw new OAuthError(404, 'not_found');
     return c.json({ handle, enabled: b.enabled }, 200, NO_STORE);
   });
   app.post('/admin/credentials', async (c) => {
@@ -513,7 +545,7 @@ export function createIssuerApp(ctx: IssuerContext): Hono {
     const credential = randomSecret();
     const sessionAuth = kind === 'owner' ? parseSessionAuth(b.session_auth) : undefined;
     if (sessionAuth && strongest(owner.verifiedVia, methodOf(sessionAuth)) !== owner.verifiedVia) {
-      await ctx.store.putOwner({ ...owner, verifiedVia: methodOf(sessionAuth) }); // Section 7.5: the strongest method used
+      await ctx.store.putOwner({ ...owner, verifiedVia: methodOf(sessionAuth) },ctx.now()); // Section 7.5: the strongest method used
     }
     await ctx.store.putCredential({ hash: sha256(credential), ownerId: b.owner_id, kind, handle, sessionAuth, createdAt: ctx.now() });
     return c.json({ credential, kind, handle, session_auth: sessionAuth }, 201, NO_STORE);
@@ -571,4 +603,3 @@ async function deferredJsonBody(c: Context): Promise<() => unknown> {
 function page(title: string, body: string): string {
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escapeHtml(title)}</title><style>body{font:16px/1.5 system-ui,sans-serif;max-width:36rem;margin:4rem auto;padding:0 1rem;color:#222}.muted{color:#666;font-size:.9em}code{font-size:.9em}</style></head><body><h1>${escapeHtml(title)}</h1>${body}</body></html>`;
 }
-

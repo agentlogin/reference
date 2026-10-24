@@ -3,20 +3,23 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, symlinkSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, symlinkSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { parsePackOutput } from '../../../scripts/release.mjs';
 
 const root = fileURLToPath(new URL('../../..', import.meta.url));
-const packages = ['issuer', 'conformance', 'agentlogin', 'rp'];
+const packages = ['issuer', 'conformance', 'agentlogin', 'rp', 'store-postgres', 'rp-store-postgres'];
 
 for (const name of packages) {
-  test(`package ${name}: the packed tarball has its entry points and runs without the source`, async () => {
+  test(`package ${name}: the packed tarball has its entry points and runs without the source`, async (t) => {
     const dir = join(root, 'packages', name);
     const out = mkdtempSync(join(tmpdir(), `al-pack-${name}-`));
+    t.after(() => rmSync(out, { recursive: true, force: true }));
     // `npm pack` runs the package's prepack script, which builds: a tarball never ships a stale or missing build.
-    const tarball = (JSON.parse(execFileSync('npm', ['pack', '--json', '--pack-destination', out], { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })) as Array<{ filename: string }>)[0]!.filename;
+    const packageName = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8')).name;
+    const tarball = parsePackOutput(execFileSync('npm', ['pack', '--json', '--pack-destination', out], { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }), packageName).filename;
     execFileSync('tar', ['-xzf', join(out, tarball), '-C', out]);
     const installed = join(out, 'package');
     symlinkSync(join(root, 'node_modules'), join(installed, 'node_modules')); // its dependencies, as an install would provide them
