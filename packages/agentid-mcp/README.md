@@ -1,6 +1,6 @@
 # AgentID sign-in MCP adapter
 
-This local stdio plugin starts **AgentID by AgentMail** sign-ins for one exact
+This experimental local stdio plugin starts **AgentID by AgentMail** sign-ins for one exact
 configured inbox and named, allowlisted apps. It is a separate integration from
 `@agentlogin/mcp` and does not claim Agent Login Core
 compatibility, enrollment, domain delegation or conformance.
@@ -15,7 +15,8 @@ separately in the browser which completed the handoff.
 
 ## Setup
 
-Requires Node 22.13+. In this source checkout:
+Use Node.js 22.23.4 or a supported later release. After the experimental beta is
+published, install `@agentlogin/agentid-mcp@0.2.0-beta.1` explicitly. In a source checkout:
 
 ```sh
 npm ci

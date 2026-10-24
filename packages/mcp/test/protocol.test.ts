@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -17,6 +17,7 @@ for (const mode of ['legacy', { pin: '2026-07-28' }] as const) {
     const client = new Client({ name: 'agentlogin-mcp-test', version: '1.0.0' }, { versionNegotiation: { mode } });
     try {
       await client.connect(transport);
+      assert.equal(client.getServerVersion()?.version, JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version);
       const tools = await client.listTools();
       assert.equal(tools.tools.length, 9);
       assert.equal(tools.tools.find((v) => v.name === 'agentlogin_request')?.annotations?.readOnlyHint, false);

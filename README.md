@@ -52,6 +52,10 @@ implementation that follows the specification section by section is the more use
 
 Package names: npm `agentlogin` (reserved), PyPI `agent-login` (the name `agentlogin` is held by an unrelated 2019 project), crates.io `agentlogin` (free, not reserved).
 
+The coordinated npm beta release process, exact package graph, artifact checks,
+trusted publishing setup and first-publication procedure are in the
+[npm release guide](docs/npm-release.md). A prepared bundle is not a published release.
+
 For the issuer, see the [PostgreSQL issuer guide](packages/store-postgres/README.md): set `DATABASE_URL`, run
 `npm run issuer:migrate`, and supply a persistent `SIGNING_JWK` when starting the issuer. For the application, see the
 [PostgreSQL RP callback guide](packages/rp-store-postgres/README.md): set `RP_DATABASE_URL`, run `npm run rp:migrate`,

@@ -1,6 +1,6 @@
 {
   "name": "@agentlogin/store-postgres",
-  "version": "0.1.0",
+  "version": "0.2.0-beta.1",
   "description": "Normalized PostgreSQL storage for the Agent Login reference issuer",
   "license": "Apache-2.0",
   "type": "module",
@@ -15,7 +15,8 @@
   "files": [
     "bin",
     "dist",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
   "repository": {
     "type": "git",
@@ -23,7 +24,7 @@
     "directory": "packages/store-postgres"
   },
   "dependencies": {
-    "@agentlogin/issuer": "0.1.0",
+    "@agentlogin/issuer": "0.2.0-beta.1",
     "pg": "^8.16.3"
   },
   "devDependencies": {
@@ -34,5 +35,10 @@
   },
   "engines": {
     "node": ">=22.13"
+  },
+  "publishConfig": {
+    "access": "public",
+    "tag": "beta",
+    "registry": "https://registry.npmjs.org/"
   }
 }

@@ -2,8 +2,13 @@
 
 Relying-party kit for [Agent Login](https://github.com/agentlogin/spec): let software agents sign in to your
 application with an identity of their own. You receive a standard OpenID Connect ID Token that says `actor_type:
-"agent"`, carries a stable `sub`, and names the accountable owner when you are registered and ask. Apache-2.0. Tracks
-specification draft 0.1. Not yet published to npm: use it from this repository.
+"agent"`, carries a stable `sub`, and names the accountable owner when you are registered and ask. Apache-2.0.
+Implements the pinned draft revision described in the repository compatibility status; this is not a complete
+conformance claim. After the beta is published, install the exact coordinated versions:
+
+```sh
+npm install --save-exact @agentlogin/rp@0.2.0-beta.1 @agentlogin/rp-store-postgres@0.2.0-beta.1
+```
 
 Runs on Node.js 22.13 or later. The handlers take and return the web-standard `Request` and `Response`, so they plug
 into Hono, Next.js route handlers on the Node.js runtime, or Node's `http` through any fetch adapter. The kit does not

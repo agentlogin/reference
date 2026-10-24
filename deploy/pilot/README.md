@@ -157,6 +157,10 @@ PostgreSQL tests cover these transitions locally; they do not substitute for thi
 
 ## Recovery and completion
 
+Run the [disposable operational rehearsals](ops/README.md) for older-backup restoration, full database outage,
+PostgreSQL signing rotation, bounded dataset-growth measurements and the credential-free public monitor.
+Keep local evidence separate from live routing, hosted capacity and confirmed alert-delivery evidence.
+
 Keep a tested backup and restore procedure. A restore that can lose acknowledged revocations is a security event:
 rotate both application secrets across all replicas before reopening traffic, and coordinate the Issuer's own
 restore/invalidation procedure. Never restore or rotate one replica independently and accept both secret sets.

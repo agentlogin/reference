@@ -1,6 +1,6 @@
 {
   "name": "@agentlogin/conformance",
-  "version": "0.1.0",
+  "version": "0.2.0-beta.1",
   "description": "Black-box conformance harness for Agent Login issuers",
   "license": "Apache-2.0",
   "type": "module",
@@ -12,7 +12,8 @@
   "files": [
     "dist",
     "bin",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
   "repository": {
     "type": "git",
@@ -30,5 +31,10 @@
   },
   "scripts": {
     "prepack": "tsc -b"
+  },
+  "publishConfig": {
+    "access": "public",
+    "tag": "beta",
+    "registry": "https://registry.npmjs.org/"
   }
 }

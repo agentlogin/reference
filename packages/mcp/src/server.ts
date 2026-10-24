@@ -1,4 +1,5 @@
 import { McpServer } from '@modelcontextprotocol/server';
+import { readFileSync } from 'node:fs';
 import { z } from 'zod';
 import { identifier } from './config.js';
 import { LoginRuntime, safeError } from './runtime.js';
@@ -8,8 +9,9 @@ const pair = { identity: identifier, application: identifier };
 const operationId = z.string().uuid();
 const read = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false };
 const write = { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true };
+const packageVersion = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version as string;
 export function createServer(runtime: LoginRuntime, enrollment = new EnrollmentRuntime(runtime.config)): McpServer {
-  const server = new McpServer({ name: 'agentlogin', version: '0.1.0' });
+  const server = new McpServer({ name: 'agentlogin', version: packageVersion });
   const invoke = async (fn: () => unknown | Promise<unknown>) => {
     try {
       runtime.rateLimit();

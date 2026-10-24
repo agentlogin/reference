@@ -1,0 +1,115 @@
+name: Prepare or publish npm beta
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Exact committed prerelease version, for example 0.2.0-beta.1
+        required: true
+        type: string
+      commit:
+        description: Full reviewed commit SHA at main HEAD when dispatching
+        required: true
+        type: string
+      publish:
+        description: Publish the tested artifacts to the beta tag
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: npm-beta-release
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    if: github.repository == 'agentlogin/reference' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: agentlogin_test
+          POSTGRES_PASSWORD: local-test-password
+          POSTGRES_DB: agentlogin_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U agentlogin_test -d agentlogin_test"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      RELEASE_VERSION: ${{ inputs.version }}
+      RELEASE_COMMIT: ${{ inputs.commit }}
+      REQUIRE_POSTGRES_TESTS: '1'
+      AGENTLOGIN_TEST_POSTGRES_URL: postgresql://agentlogin_test:local-test-password@localhost:5432/agentlogin_test
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.commit }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '22.23.4'
+          package-manager-cache: false
+      - name: Validate release identity
+        run: |
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          import { execFileSync } from 'node:child_process';
+          import { readFileSync } from 'node:fs';
+          assert.match(process.env.RELEASE_COMMIT, /^[0-9a-f]{40}$/);
+          assert.equal(process.env.RELEASE_COMMIT, process.env.GITHUB_SHA, 'Provenance must describe the actual dispatch commit');
+          assert.match(process.env.RELEASE_VERSION, /^0\.\d+\.\d+-beta\.[1-9]\d*$/);
+          assert.equal(JSON.parse(readFileSync('packages/agentlogin/package.json')).version, process.env.RELEASE_VERSION);
+          assert.equal(execFileSync('git', ['rev-parse', 'HEAD'], {encoding:'utf8'}).trim(), process.env.RELEASE_COMMIT);
+          execFileSync('git', ['merge-base', '--is-ancestor', process.env.RELEASE_COMMIT, 'origin/main']);
+          NODE
+      - run: npm install --global npm@12.2.1 --ignore-scripts --registry=https://registry.npmjs.org/
+      - run: npm ci
+      - name: Full regression suite including PostgreSQL and installed consumer
+        run: npm test
+      - run: npm audit --omit=dev --audit-level=low
+      - name: Prepare and independently verify exact package artifacts
+        run: |
+          node scripts/release.mjs prepare "$RUNNER_TEMP/npm-beta"
+          node scripts/release.mjs verify "$RUNNER_TEMP/npm-beta"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: npm-beta
+          path: ${{ runner.temp }}/npm-beta/
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    needs: prepare
+    if: inputs.publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: npm-beta
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      RELEASE_VERSION: ${{ inputs.version }}
+      RELEASE_COMMIT: ${{ inputs.commit }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.commit }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '22.23.4'
+          package-manager-cache: false
+      - run: npm install --global npm@12.2.1 --ignore-scripts --registry=https://registry.npmjs.org/
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: npm-beta
+          path: ${{ runner.temp }}/npm-beta
+      - name: Verify and publish the tested bytes using OIDC
+        run: node scripts/release.mjs publish "$RUNNER_TEMP/npm-beta"

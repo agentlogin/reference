@@ -6,6 +6,7 @@ import { copyFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync, lstatSy
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
+import { parsePackOutput } from '../../../scripts/release.mjs';
 
 const run = promisify(execFile);
 const root = fileURLToPath(new URL('../../..', import.meta.url));
@@ -29,7 +30,7 @@ test('clean consumer installs only declared packed dependencies and runs the Pos
   }
   for (const path of [...packages.map((name) => `packages/${name}`), 'examples/rp-hono']) {
     const packed = await run('npm', ['pack', '--ignore-scripts', '--json', '--pack-destination', out], { cwd: join(root, path), maxBuffer: 2_000_000, signal: t.signal });
-    const artifact = JSON.parse(packed.stdout)[0];
+    const artifact = parsePackOutput(packed.stdout, JSON.parse(readFileSync(join(root, path, 'package.json'), 'utf8')).name);
     const metadata = { ...sourceLock.packages[path] };
     assert.equal(metadata.name ?? JSON.parse(readFileSync(join(root, path, 'package.json'), 'utf8')).name, artifact.name);
     assert.equal(metadata.version, artifact.version);

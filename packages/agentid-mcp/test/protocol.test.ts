@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -20,6 +20,7 @@ for (const mode of ['legacy', { pin: '2026-07-28' }] as const) {
     const client = new Client({ name: 'agentid-test', version: '1.0.0' }, { versionNegotiation: { mode } });
     try {
       await client.connect(transport);
+      assert.equal(client.getServerVersion()?.version, JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version);
       const tools = (await client.listTools()).tools;
       assert.equal(tools.length, 6); assert.equal(tools.some((tool) => /authorize|send|revoke/.test(tool.name)), false);
       assert.equal(tools.find((tool) => tool.name === 'agentid_connect')?.annotations?.readOnlyHint, false);

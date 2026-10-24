@@ -11,13 +11,19 @@ It is an implementation, not a conformance certification. No provider is preferr
 
 ## Install and configure
 
-Requires Node.js 22.13 or later. During development, install the locally packed
-`agentlogin` and `@agentlogin/mcp` tarballs together. Registry installation is available
-only after these versions have actually been published; this repository does not
-publish them as part of a build.
+Use Node.js 22.23.4 or a supported later release. The beta package version is
+`0.2.0-beta.1`. After that exact release is published, install it without selecting
+the `latest` tag:
 
 ```sh
-npm install /absolute/artifacts/agentlogin-0.1.0.tgz /absolute/artifacts/agentlogin-mcp-0.1.0.tgz
+npm install --save-exact @agentlogin/mcp@0.2.0-beta.1
+```
+
+For development or release rehearsal, install the matching locally packed
+`agentlogin` and `@agentlogin/mcp` tarballs together. A build does not publish them:
+
+```sh
+npm install /absolute/artifacts/agentlogin-0.2.0-beta.1.tgz /absolute/artifacts/agentlogin-mcp-0.2.0-beta.1.tgz
 ```
 
 Copy [the example configuration](examples/config.json), replace the reserved example

@@ -1,12 +1,14 @@
 import { McpServer } from '@modelcontextprotocol/server';
+import { readFileSync } from 'node:fs';
 import { z } from 'zod';
 import { identifier, uuid } from './config.js';
 import { publicError } from './http.js';
 import { AgentIdRuntime } from './runtime.js';
 
 const read = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true };
+const packageVersion = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version as string;
 export function createServer(runtime: AgentIdRuntime): McpServer {
-  const server = new McpServer({ name: 'agentid-signin', version: '0.1.0' });
+  const server = new McpServer({ name: 'agentid-signin', version: packageVersion });
   const invoke = async (fn: () => unknown | Promise<unknown>) => {
     try {
       const result = await fn();

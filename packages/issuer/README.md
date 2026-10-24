@@ -1,6 +1,6 @@
 # @agentlogin/issuer
 
-Reference issuer for [Agent Login Core 1.0](https://github.com/agentlogin/spec) (draft 0.1): an OpenID Provider that
+Reference issuer for the pinned [Agent Login Core draft](https://github.com/agentlogin/spec): an OpenID Provider that
 signs software agents in with keys they hold. Written against the specification section by section so that the code
 reads as a second description of the protocol; Hono for HTTP and jose for JOSE behind a `Store` interface.
 The production storage target is [`@agentlogin/store-postgres`](../store-postgres/README.md), with normalized
