@@ -26,8 +26,17 @@ function fake(overrides = {}) {
 test('public probe checks bindings and discloses its unauthenticated scope', async () => {
   const result = await probe({ application, issuer }, fake());
   assert.equal(result.passed, true);
+  assert.equal(result.issuerReadiness, false);
   assert.equal(result.authenticatedSignIn, false);
   assert.equal(result.alertDeliveryVerified, false);
+});
+test('optional deployment readiness verifies the issuer database endpoint without changing Core discovery', async () => {
+  const result = await probe({ application, issuer, issuerReadiness: true }, fake({ [issuer + '/readyz']: { status: 'ready' } }));
+  assert.equal(result.issuerReadiness, true);
+  await assert.rejects(probe({ application, issuer, issuerReadiness: true }, fake({ [issuer + '/readyz']: { status: 'unavailable' } })));
+  await assert.rejects(probe({ application, issuer, issuerReadiness: true }, async (url, init) => url === issuer + '/readyz'
+    ? Response.json({ status: 'unavailable' }, { status: 503 }) : fake()(url, init)));
+  await assert.rejects(probe({ application, issuer, issuerReadiness: 'true' }, fake()));
 });
 for (const [name, override] of Object.entries({
   'wrong issuer': { [issuer + '/.well-known/openid-configuration']: { ...metadata, issuer: 'https://other.example' } },

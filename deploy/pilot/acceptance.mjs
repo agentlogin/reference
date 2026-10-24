@@ -4,7 +4,6 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
 import { createInterface } from 'node:readline/promises';
-import { AgentLogin, FileKeystore, MemoryCookieJar } from 'agentlogin';
 
 export function origin(value) {
   const url = new URL(value);
@@ -61,6 +60,7 @@ export async function logoutAndVerify(base, cookies, request, replay = fetch) {
 }
 
 export async function lifecycle({ base, issuer, handle, keyFile, waitForRevocation, report = () => {} }) {
+  const { AgentLogin, FileKeystore, MemoryCookieJar } = await import('agentlogin');
   const cookies = new MemoryCookieJar();
   const agent = new AgentLogin({ handle, issuer, keystore: new FileKeystore(keyFile), cookies, timeoutMs: 10_000, maxFollowBodyBytes: 64 * 1024 });
   const request = (path, method = 'GET', body) => agent.fetch(base + path, {

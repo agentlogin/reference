@@ -71,6 +71,9 @@ PILOT_BASE_URL=https://workspace.sentfrom.ai PILOT_ISSUER=https://identity.sentf
 It bounds response sizes/time, rejects redirects, checks app readiness/metadata/unauthenticated denial and Issuer
 metadata/public signing keys, and exits nonzero on failure. It does not sign in, mutate state, or prove delivery
 of an alert. Do not log full authentication URLs, headers, bodies, cookies, credentials or raw database errors.
+The public probe needs only Node, without an SDK installation. For a deployment that exposes an Issuer
+database-readiness route, set `PILOT_ISSUER_READINESS=true` to require `GET /readyz` to return `ready` too.
+This optional route is not part of Agent Login Core. Leave it unset for other Issuers.
 
 These are proposed beta alert settings until an operator configures and proves them:
 

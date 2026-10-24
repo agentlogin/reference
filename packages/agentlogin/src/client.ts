@@ -572,12 +572,19 @@ export class AgentLogin {
     if (cookie) headers.set('cookie', cookie);
     headers.delete('authorization');
     let res: Response;
+    let requestTimeout: AbortSignal | undefined;
+    let signal: AbortSignal | undefined;
     try {
-      const timeout = AbortSignal.timeout(Math.min(this.opts.timeoutMs ?? 10_000, budget?.left() ?? Infinity));
-      const signal = init.signal ? AbortSignal.any([init.signal, timeout]) : timeout;
+      requestTimeout = AbortSignal.timeout(Math.min(this.opts.timeoutMs ?? 10_000, budget?.left() ?? Infinity));
+      signal = init.signal ? AbortSignal.any([init.signal, requestTimeout]) : requestTimeout;
       res = await run(() => fetch(u, { ...init, headers, redirect: 'manual', signal }));
     } catch (e) {
       if (e instanceof AgentLoginError && e.code === 'timeout') throw e;
+      // The native timer may fire just before the monotonic budget check observes expiry.
+      // Classify by the signal which actually won; caller cancellation remains a network error.
+      if (requestTimeout?.aborted && signal?.reason === requestTimeout.reason) {
+        throw new AgentLoginError('application request timed out', 'timeout');
+      }
       throw new AgentLoginError(`request to ${u.host} failed: ${(e as Error).message}`, 'network_error');
     }
     await run(() => this.cookies.store(u, res.headers.getSetCookie()));

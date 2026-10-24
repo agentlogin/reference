@@ -5,11 +5,17 @@ import { createPublicKey } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
 import { origin, readJson, smoke } from '../acceptance.mjs';
 
-export async function probe({ application, issuer }, request = fetch) {
+export async function probe({ application, issuer, issuerReadiness = false }, request = fetch) {
+  assert.equal(typeof issuerReadiness, 'boolean');
   const app = origin(application), id = origin(issuer);
   const started = performance.now();
   await smoke(app, request);
   const get = (path) => request(id + path, { redirect: 'error', signal: AbortSignal.timeout(10_000), headers: { accept: 'application/json' } });
+  // A deployment-specific endpoint, not a requirement of Agent Login Core.
+  if (issuerReadiness) {
+    const ready = await readJson(await get('/readyz'), 200);
+    assert.equal(ready.status, 'ready');
+  }
   const metadata = await readJson(await get('/.well-known/openid-configuration'), 200);
   assert.equal(metadata.issuer, id);
   for (const key of ['authorization_endpoint', 'token_endpoint', 'userinfo_endpoint', 'jwks_uri']) {
@@ -39,12 +45,13 @@ export async function probe({ application, issuer }, request = fetch) {
     }
     createPublicKey({ key, format: 'jwk' });
   }
-  return { passed: true, checkedAt: new Date().toISOString(), durationMs: Math.round(performance.now() - started), publicApplication: true, issuerMetadata: true, publicSigningKeys: true, authenticatedSignIn: false, alertDeliveryVerified: false };
+  return { passed: true, checkedAt: new Date().toISOString(), durationMs: Math.round(performance.now() - started), publicApplication: true, issuerMetadata: true, issuerReadiness, publicSigningKeys: true, authenticatedSignIn: false, alertDeliveryVerified: false };
 }
 
 if (import.meta.url === pathToFileURL(process.argv[1] ?? '').href) {
   try {
-    console.log(JSON.stringify(await probe({ application: process.env.PILOT_BASE_URL, issuer: process.env.PILOT_ISSUER })));
+    assert.ok([undefined, 'true', 'false'].includes(process.env.PILOT_ISSUER_READINESS));
+    console.log(JSON.stringify(await probe({ application: process.env.PILOT_BASE_URL, issuer: process.env.PILOT_ISSUER, issuerReadiness: process.env.PILOT_ISSUER_READINESS === 'true' })));
   } catch {
     // No raw request/response, tokens, cookies, private claims or driver error values enter alert text.
     console.log(JSON.stringify({ passed: false, checkedAt: new Date().toISOString(), error: 'public_probe_failed', alertDeliveryVerified: false }));

@@ -4,6 +4,20 @@ import http from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { AgentLogin, AgentLoginError, MemoryCookieJar, MemoryKeystore } from '../src/index.js';
 
+test('native request timeout keeps its classification even before the overall timer, while caller cancellation stays distinct', async (t) => {
+  const timeout = new AbortController();
+  t.mock.method(AbortSignal, 'timeout', () => timeout.signal);
+  t.mock.method(globalThis, 'fetch', async (_url: unknown, init: RequestInit) => {
+    timeout.abort(new DOMException('native request deadline', 'TimeoutError'));
+    throw init.signal!.reason;
+  });
+  const al = new AgentLogin({ handle: 'scout@example.com', issuer: 'https://issuer.example' });
+  await assert.rejects(al.fetch('https://app.example'), (e: unknown) => e instanceof AgentLoginError && e.code === 'timeout');
+  // Both signals are now aborted, but AbortSignal.any records the caller as the first input/winner.
+  await assert.rejects(al.fetch('https://app.example', { signal: AbortSignal.abort(new Error('caller cancelled')) }),
+    (e: unknown) => e instanceof AgentLoginError && e.code === 'network_error');
+});
+
 test('cookie headers prefer longer paths and preserve creation order when replacing equal-path cookies', async () => {
   const jar = new MemoryCookieJar();
   const url = new URL('https://app.example/account/settings');
