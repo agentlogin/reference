@@ -1,0 +1,41 @@
+{
+  "version": 1,
+  "kind": "applications",
+  "updatedAt": "2026-10-24T16:48:20Z",
+  "entries": [
+    {
+      "id": "agent-workspace",
+      "kind": "application",
+      "protocol": "agent-login",
+      "name": "Agent Workspace",
+      "operator": "SentFrom.ai",
+      "homepage": "https://workspace.sentfrom.ai",
+      "clientType": "open",
+      "clientId": "https://workspace.sentfrom.ai/client-metadata.json",
+      "initiateLoginUri": "https://workspace.sentfrom.ai/auth/agent/login",
+      "status": "candidate",
+      "specRevision": "a000e29c7af91d3fd8a5a4ad6241e2b10aabcc78",
+      "evidence": [
+        {
+          "kind": "domain_control",
+          "protocol": "agent-login",
+          "url": "https://github.com/agentlogin/reference/blob/main/docs/evidence/2026-10-24-sentfrom-workspace.md",
+          "observedAt": "2026-10-24T16:48:20Z",
+          "expiresAt": "2026-11-23T00:00:00Z",
+          "reviewer": "SentFrom.ai; Codex-assisted self-report",
+          "revision": "a000e29c7af91d3fd8a5a4ad6241e2b10aabcc78"
+        },
+        {
+          "kind": "protocol_test",
+          "protocol": "agent-login",
+          "url": "https://github.com/agentlogin/reference/blob/main/docs/evidence/2026-10-24-sentfrom-workspace.md",
+          "observedAt": "2026-10-24T00:56:53Z",
+          "expiresAt": "2026-11-23T00:00:00Z",
+          "reviewer": "SentFrom.ai; Codex-assisted self-report",
+          "revision": "a000e29c7af91d3fd8a5a4ad6241e2b10aabcc78"
+        }
+      ],
+      "updatedAt": "2026-10-24T16:48:20Z"
+    }
+  ]
+}
