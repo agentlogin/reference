@@ -113,10 +113,10 @@ No release command sets or moves `latest` for a beta. Install the explicit beta
 version rather than relying on a default tag.
 
 During the first approval, registry metadata also exposed `0.0.0-stage` with the
-description “Temporary package placeholder for staged publishing.” The release
+description "Temporary package placeholder for staged publishing." The release
 operator did not submit a placeholder publication command. Record this observed
 registry behavior separately from the reviewed beta artifact; it is not a version
-to install or reproduce. No authenticated tag-removal request was made.
+to install or reproduce. The attempted tag removal did not complete.
 
 The package-wide metadata index initially returned `404` while the exact version
 and direct dist-tag endpoints already exposed the publication. Such a `404` does
