@@ -73,7 +73,11 @@ bytes, inventory, license and package manifests against the same source commit.
 Before publishing, confirm that the npm account controls the `agentlogin` name and
 has publish access to the `@agentlogin` organization. A public registry `404` for a
 scoped package does not prove that the account owns its scope. At preparation time,
-`agentlogin@0.0.0` existed under `sentviaai`; the seven scoped packages were absent.
+`agentlogin@0.0.0` existed under `sentviaai`; the seven scoped package lookups
+returned `404`.
+The initial `0.2.0-beta.1` archives were published on 2026-11-02 with maintainer
+authentication. Registry integrity and downloaded bytes were checked against the
+original release manifest. This manual publication has no CI provenance.
 
 Use [npm trusted publishing](https://docs.npmjs.com/trusted-publishers/) for ongoing
 releases. Configure each package for organization `agentlogin`, repository
@@ -88,7 +92,37 @@ and required human 2FA, using `--access public --tag beta --ignore-scripts` and 
 explicit npm registry. Do not create placeholder releases or place a long-lived
 write token in this repository. A local bootstrap does not have CI provenance;
 record that limitation instead of claiming it does. Configure and verify OIDC
-promptly afterwards; npm says a new trusted publisher must first publish within two days.
+for the next reviewed publication when it can complete within npm's
+[two-day activation window](https://docs.npmjs.com/trusted-publishers/#trusted-publisher-configuration-expiry).
+A workflow that only verifies and skips existing versions does not exercise OIDC
+publication or add provenance to those versions. Do not repack an existing version
+or publish a placeholder just to activate a trusted publisher.
+
+### Initial registry tags
+
+npm assigned both `beta` and `latest` to each of the seven newly published scoped
+packages despite the explicit `--tag beta`. This behavior is also described in
+[npm/cli issue 8490](https://github.com/npm/cli/issues/8490). The release verifier
+therefore accepts this recorded initial default only for `0.2.0-beta.1` of
+`@agentlogin/issuer`, `@agentlogin/conformance`, `@agentlogin/agentid-mcp`,
+`@agentlogin/rp`, `@agentlogin/mcp`, `@agentlogin/store-postgres`, and
+`@agentlogin/rp-store-postgres`. Matching immutable artifact bytes and the exact
+`beta` tag remain mandatory. Other names and versions receive no exception, and
+an existing `latest` default must remain unchanged throughout publication.
+No release command sets or moves `latest` for a beta. Install the explicit beta
+version rather than relying on a default tag.
+
+During the first approval, registry metadata also exposed `0.0.0-stage` with the
+description "Temporary package placeholder for staged publishing." The release
+operator did not submit a placeholder publication command. Record this observed
+registry behavior separately from the reviewed beta artifact; it is not a version
+to install or reproduce. The attempted tag removal did not complete.
+
+The package-wide metadata index initially returned `404` while the exact version
+and direct dist-tag endpoints already exposed the publication. Such a `404` does
+not prove a name or version is absent. Reconcile the exact version's integrity and
+direct tags; inconsistent visibility stops publication for review rather than
+triggering another upload.
 
 The release workflow pins npm `12.2.1`, satisfying npm's current OIDC minimum, on
 Node `22.23.4`. It uses GitHub-hosted runners, no dependency cache, commit-pinned
@@ -110,7 +144,8 @@ scripts. See [npm provenance](https://docs.npmjs.com/generating-provenance-state
 4. Publication requires the canonical repository, `main` dispatch, matching
    immutable version tag and source commit equal to the workflow dispatch commit.
    It also checks that the commit is reachable from `main`. It uses the
-   `beta` tag explicitly. Never promote a beta to `latest`.
+   `beta` tag explicitly. Preserve existing default tags; the seven recorded
+   initial scoped publications above are the only `latest` reconciliation exception.
 5. Read back every published version's `dist.integrity`, then perform installation
    using only the public package names and pinned beta version in a fresh directory.
    Run the actual first-customer and second-site acceptance flows before announcing

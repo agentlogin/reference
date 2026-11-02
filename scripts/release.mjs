@@ -12,6 +12,13 @@ export const registry = 'https://registry.npmjs.org/';
 export const repository = 'git+https://github.com/agentlogin/reference.git';
 // Dependencies precede consumers. The AgentID adapter is a separate experimental integration.
 export const packageFolders = ['agentlogin', 'issuer', 'conformance', 'agentid-mcp', 'rp', 'mcp', 'store-postgres', 'rp-store-postgres'];
+// These seven initial publications were recorded on 2026-11-02. npm assigned
+// their first beta to both beta and latest despite an explicit --tag beta.
+// This is historical reconciliation, not permission to promote a future beta.
+const initialLatestNames = new Set([
+  '@agentlogin/issuer', '@agentlogin/conformance', '@agentlogin/agentid-mcp',
+  '@agentlogin/rp', '@agentlogin/mcp', '@agentlogin/store-postgres', '@agentlogin/rp-store-postgres',
+]);
 const root = fileURLToPath(new URL('..', import.meta.url));
 const json = (path) => JSON.parse(readFileSync(path, 'utf8'));
 const digest = (bytes, algorithm = 'sha256', encoding = 'hex') => createHash(algorithm).update(bytes).digest(encoding);
@@ -204,18 +211,38 @@ export function verifyBundle(out) {
 }
 
 async function registryVersion(p) {
-  const response = await fetch(`${registry}${encodeURIComponent(p.name)}/${p.version}`, { signal: AbortSignal.timeout(15_000) });
+  const response = await fetch(`${registry}${encodeURIComponent(p.name)}/${p.version}`, { redirect: 'error', signal: AbortSignal.timeout(15_000) });
   if (response.status === 404) return null;
   assert.equal(response.status, 200, `Cannot check registry state for ${p.name}`);
   return response.json();
 }
 
-async function verifyRegistryTags(p) {
-  const response = await fetch(`${registry}${encodeURIComponent(p.name)}`, { signal: AbortSignal.timeout(15_000) });
+export async function readRegistryTags(p, fetcher = fetch) {
+  // The package-wide index can lag an accepted first publication. Use the
+  // direct dist-tag endpoint separately from immutable version metadata.
+  const response = await fetcher(`${registry}-/package/${encodeURIComponent(p.name)}/dist-tags`, { redirect: 'error', signal: AbortSignal.timeout(15_000) });
+  if (response.status === 404) return null;
   assert.equal(response.status, 200, `Cannot read dist-tags for ${p.name}`);
-  const metadata = await response.json();
-  assert.notEqual(metadata['dist-tags']?.latest, p.version, `${p.name} beta must not be the latest release`);
-  assert.equal(metadata['dist-tags']?.beta, p.version, `${p.name} beta dist-tag does not identify this release`);
+  const tags = await response.json();
+  assertRegistryTagMap(p, tags);
+  return tags;
+}
+
+function assertRegistryTagMap(p, tags) {
+  assert.ok(tags && typeof tags === 'object' && !Array.isArray(tags)
+    && Object.values(tags).every(value => typeof value === 'string' && value.length > 0), `Cannot read dist-tags for ${p.name}`);
+}
+
+export function validateRegistryTags(p, tags, previousLatest) {
+  assertRegistryTagMap(p, tags);
+  assert.equal(tags.beta, p.version, `${p.name} beta dist-tag does not identify this release`);
+  const initialLatest = p.version === '0.2.0-beta.1' && initialLatestNames.has(p.name);
+  assert.ok(tags.latest !== p.version || initialLatest, `${p.name} beta must not be the latest release`);
+  if (previousLatest !== undefined) assert.equal(tags.latest, previousLatest, `${p.name} existing latest dist-tag changed`);
+}
+
+async function verifyRegistryTags(p, previousLatest) {
+  validateRegistryTags(p, await readRegistryTags(p), previousLatest);
 }
 
 export async function reconcilePublishedVersion(p, lookup = registryVersion, checkTags = verifyRegistryTags) {
@@ -224,6 +251,16 @@ export async function reconcilePublishedVersion(p, lookup = registryVersion, che
   assert.equal(existing.dist?.integrity, p.integrity, `${p.name} already exists with different bytes`);
   await checkTags(p);
   return true;
+}
+
+export async function preflightPublishedVersion(p, lookup = registryVersion, lookupTags = readRegistryTags) {
+  const tags = await lookupTags(p);
+  const exists = await reconcilePublishedVersion(p, lookup, () => validateRegistryTags(p, tags));
+  if (!exists) {
+    assert.notEqual(tags?.beta, p.version, `${p.name} version is pending registry visibility; reconcile before publishing`);
+    assert.notEqual(tags?.latest, p.version, `${p.name} version is pending registry visibility; reconcile before publishing`);
+  }
+  return { exists, latest: tags?.latest };
 }
 
 export function validateDispatchCommit(releaseCommit, githubSha) {
@@ -246,17 +283,17 @@ async function publish(out) {
   git('merge-base', '--is-ancestor', manifest.sourceCommit, 'origin/main');
   // Preflight every immutable version before making any mutation. An identical
   // prior artifact is safe to resume; a different artifact is never overwritten.
+  const previousLatest = new Map();
+  for (const p of manifest.packages) previousLatest.set(p.name, (await preflightPublishedVersion(p)).latest);
+  const checkTags = (p) => verifyRegistryTags(p, previousLatest.get(p.name));
   for (const p of manifest.packages) {
-    await reconcilePublishedVersion(p);
-  }
-  for (const p of manifest.packages) {
-    if (await reconcilePublishedVersion(p)) { console.log(`Verified existing ${p.name}@${p.version}`); continue; }
+    if (await reconcilePublishedVersion(p, registryVersion, checkTags)) { console.log(`Verified existing ${p.name}@${p.version}`); continue; }
     // An uncertain publish is reconciled by immutable name/version+integrity on rerun.
     // Never build or execute package lifecycle scripts in the OIDC-enabled job.
     run('npm', ['publish', join(out, p.filename), '--access', 'public', '--tag', 'beta', '--provenance', '--ignore-scripts', '--registry', registry], root, { stdio: 'inherit' });
-    assert.ok(await reconcilePublishedVersion(p), `${p.name} publication must be read back before proceeding`);
+    assert.ok(await reconcilePublishedVersion(p, registryVersion, checkTags), `${p.name} publication must be read back before proceeding`);
   }
-  for (const p of manifest.packages) assert.ok(await reconcilePublishedVersion(p), `${p.name} is absent at final release verification`);
+  for (const p of manifest.packages) assert.ok(await reconcilePublishedVersion(p, registryVersion, checkTags), `${p.name} is absent at final release verification`);
   console.log(`Verified all ${manifest.packages.length} published beta artifacts and distribution tags`);
 }
 
