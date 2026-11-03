@@ -1,6 +1,6 @@
 {
   "name": "@agentlogin/agentid-mcp",
-  "version": "0.2.0-beta.1",
+  "version": "0.2.0-beta.2",
   "description": "AgentID by AgentMail sign-in handoffs for explicitly configured apps and inboxes",
   "license": "Apache-2.0",
   "type": "module",
