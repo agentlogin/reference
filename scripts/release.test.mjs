@@ -25,7 +25,7 @@ test('release refuses stable versions, latest, private registry and mismatched s
     (p) => { p.publishConfig.tag = 'latest'; },
     (p) => { p.publishConfig.registry = 'https://registry.example/'; },
     (p) => { p.repository.url = 'git+https://github.com/other/reference.git'; },
-    (p) => { p.version = '0.2.0-beta.2'; },
+    (p) => { p.version = `${version}.different`; },
   ]) {
     const packages = manifests(); mutate(packages[0]);
     assert.throws(() => validateManifests(packages, version));
