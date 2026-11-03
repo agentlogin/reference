@@ -21,7 +21,7 @@
     "directory": "packages/issuer"
   },
   "dependencies": {
-    "@hono/node-server": "^1.19.0",
+    "@hono/node-server": "2.1.3",
     "hono": "^4.9.0",
     "jose": "^6.1.0"
   },
