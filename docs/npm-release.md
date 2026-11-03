@@ -1,6 +1,9 @@
 # npm beta release
 
 The first supported package release is `0.2.0-beta.1`, under the `beta` dist-tag.
+This source prepares `0.2.0-beta.2`, updating the issuer HTTP adapter to patched
+`@hono/node-server` 2.1.3. It does not change the protocol or previously published
+archives. The new version is unpublished until registry verification completes.
 It implements the working Agent Login draft described in
 [draft status](draft-0.2-status.md); the package version does not publish or ratify
 the specification. `@agentlogin/agentid-mcp` is an experimental, separate AgentMail
@@ -133,7 +136,7 @@ scripts. See [npm provenance](https://docs.npmjs.com/generating-provenance-state
 ## Dispatch and recovery
 
 1. Merge reviewed source to `main` and record the full commit SHA. Tag that same
-   commit `v0.2.0-beta.1`; do not move an existing tag to different code.
+   commit `v0.2.0-beta.2`; do not move an existing tag to different code.
 2. Dispatch **Prepare or publish npm beta** from `main`, supplying that version and
    SHA while it is still `main` HEAD. npm provenance identifies the workflow's
    dispatch commit, so an older checkout is not permitted. Leave `publish=false`

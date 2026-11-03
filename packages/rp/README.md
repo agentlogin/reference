@@ -7,7 +7,7 @@ Implements the pinned draft revision described in the repository compatibility s
 conformance claim. After the beta is published, install the exact coordinated versions:
 
 ```sh
-npm install --save-exact @agentlogin/rp@0.2.0-beta.1 @agentlogin/rp-store-postgres@0.2.0-beta.1
+npm install --save-exact @agentlogin/rp@0.2.0-beta.2 @agentlogin/rp-store-postgres@0.2.0-beta.2
 ```
 
 Runs on Node.js 22.13 or later. The handlers take and return the web-standard `Request` and `Response`, so they plug

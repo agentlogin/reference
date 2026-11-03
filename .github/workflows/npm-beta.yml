@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: Exact committed prerelease version, for example 0.2.0-beta.1
+        description: Exact committed prerelease version, for example 0.2.0-beta.2
         required: true
         type: string
       commit:

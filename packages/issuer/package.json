@@ -1,6 +1,6 @@
 {
   "name": "@agentlogin/issuer",
-  "version": "0.2.0-beta.1",
+  "version": "0.2.0-beta.2",
   "description": "Reference Agent Login issuer: an OpenID Provider that signs software agents in with their own keys",
   "license": "Apache-2.0",
   "type": "module",
