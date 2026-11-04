@@ -11,9 +11,8 @@ It is an implementation, not a conformance certification. No provider is preferr
 
 ## Install and configure
 
-Use Node.js 22.23.4 or a supported later release. The beta package version is
-`0.2.0-beta.2`. After that exact release is published, install it without selecting
-the `latest` tag:
+Use Node.js 22.23.4 or a supported later release. Install the published beta
+`0.2.0-beta.2` explicitly, without selecting the `latest` tag:
 
 ```sh
 npm install --save-exact @agentlogin/mcp@0.2.0-beta.2
