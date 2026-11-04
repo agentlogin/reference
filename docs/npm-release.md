@@ -139,7 +139,7 @@ scripts. See [npm provenance](https://docs.npmjs.com/generating-provenance-state
 ## Dispatch and recovery
 
 1. Merge reviewed source to `main` and record the full commit SHA. Tag that same
-   commit `v0.2.0-beta.2`; do not move an existing tag to different code.
+   commit with its new release version; do not reuse or move an existing tag.
 2. Dispatch **Prepare or publish npm beta** from `main`, supplying that version and
    SHA while it is still `main` HEAD. npm provenance identifies the workflow's
    dispatch commit, so an older checkout is not permitted. Leave `publish=false`
