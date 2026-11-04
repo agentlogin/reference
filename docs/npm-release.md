@@ -1,9 +1,12 @@
 # npm beta release
 
-The first supported package release is `0.2.0-beta.1`, under the `beta` dist-tag.
-This source prepares `0.2.0-beta.2`, updating the issuer HTTP adapter to patched
+The current supported package release is `0.2.0-beta.2`, under the `beta` dist-tag.
+This release updates the issuer HTTP adapter to patched
 `@hono/node-server` 2.1.3. It does not change the protocol or previously published
-archives. The new version is unpublished until registry verification completes.
+archives. Install the exact version; existing `latest` defaults are unchanged.
+The [release manifest](https://github.com/agentlogin/reference/releases/download/v0.2.0-beta.2/release.json)
+records the source revision and archive hashes. Publication uses maintainer-authenticated
+uploads of the verified archives; this release has no CI provenance.
 It implements the working Agent Login draft described in
 [draft status](draft-0.2-status.md); the package version does not publish or ratify
 the specification. `@agentlogin/agentid-mcp` is an experimental, separate AgentMail

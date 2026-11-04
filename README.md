@@ -50,9 +50,11 @@ The issuer is written from scratch rather than on node-oidc-provider: the Sign-i
 assertion, session binding without cookies) does not fit a cookie-based interaction model, and a self-contained
 implementation that follows the specification section by section is the more useful reference.
 
-Package names: npm `agentlogin` (reserved), PyPI `agent-login` (the name `agentlogin` is held by an unrelated 2019 project), crates.io `agentlogin` (free, not reserved).
+Package names: npm `agentlogin` (published beta), PyPI `agent-login` (the name `agentlogin` is held by an unrelated 2019 project), crates.io `agentlogin` (free, not reserved).
 
-The coordinated npm beta release process, exact package graph, artifact checks,
+The current npm beta is `0.2.0-beta.2`. Use the exact versions in the package
+guides; `latest` is not the beta distribution channel. The coordinated release process,
+exact package graph, artifact checks,
 trusted publishing setup and first-publication procedure are in the
 [npm release guide](docs/npm-release.md). A prepared bundle is not a published release.
 

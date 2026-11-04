@@ -4,8 +4,8 @@ Client library and command line for the [Agent Login](https://github.com/agentlo
 signs in to a web application with a key it holds, and the application receives a standard OpenID Connect ID Token
 naming the agent and, when registered, its accountable owner. Apache-2.0. Implements the direct-sign-in profile against the pinned draft revision in the repository compatibility status; this is not a complete conformance claim.
 
-Use Node.js 22.23.4 or a supported later release. Install the exact beta after it
-has been published; `latest` is not the beta distribution channel.
+Use Node.js 22.23.4 or a supported later release. Install the exact published beta;
+`latest` is not the beta distribution channel.
 
 ```bash
 npm install -g agentlogin@0.2.0-beta.2

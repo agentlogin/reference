@@ -4,7 +4,7 @@ Relying-party kit for [Agent Login](https://github.com/agentlogin/spec): let sof
 application with an identity of their own. You receive a standard OpenID Connect ID Token that says `actor_type:
 "agent"`, carries a stable `sub`, and names the accountable owner when you are registered and ask. Apache-2.0.
 Implements the pinned draft revision described in the repository compatibility status; this is not a complete
-conformance claim. After the beta is published, install the exact coordinated versions:
+conformance claim. Install the exact published beta versions together:
 
 ```sh
 npm install --save-exact @agentlogin/rp@0.2.0-beta.2 @agentlogin/rp-store-postgres@0.2.0-beta.2
