@@ -10,3 +10,5 @@ export { seal, unseal } from './seal.js';
 export type { PendingSignIn } from './seal.js';
 export { MemoryCallbackStateStore, SqliteCallbackStateStore } from './callback-store.js';
 export type { CallbackStateStore, CallbackClaim } from './callback-store.js';
+export { TrustedProviderPolicy, agentLoginTrustedProviders } from './trusted-providers.js';
+export type { IssuerAcceptancePolicy, TrustedProviderPolicyOptions } from './trusted-providers.js';

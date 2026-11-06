@@ -33,6 +33,12 @@ policy during integration; the sign-in button does not ask end users to adopt th
 directory. There is no automatic subscription to its entries. Anyone can host a
 copy or maintain a different acceptance policy.
 
+The separate [trusted-provider programme draft](../trusted-providers/README.md)
+proposes an explicitly chosen, automatically updated issuer acceptance policy. It
+uses separate admission decisions and an approval feed; catalog records do not
+populate that feed, and this directory remains a discovery aid. The programme is
+not operational and no candidate is promoted by its introduction.
+
 ## Submission and review
 
 Submit a pull request containing the operator's identity/contact page, exact issuer
