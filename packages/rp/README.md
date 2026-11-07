@@ -94,6 +94,23 @@ A Registered Client sets `clientId`, `clientSecret` and optionally `scopes` on t
 `owner_profile` and `owner_email`. A secret is sent only to the issuer it was configured for; a top-level
 `clientSecret` is accepted only with exactly one issuer.
 
+### Optional shared provider policy (unreleased)
+
+The source tree adds `issuerPolicy: agentLoginTrustedProviders()` for websites that
+explicitly choose the proposed Agent Login list. This helper is not in the published
+`0.2.0-beta.2` package, and the programme is not yet operational. See the
+[programme and integration example](../../trusted-providers/README.md) for its
+admission rules, trust model, expiry and availability limits.
+
+Choosing it permits future reviewed additions and removals without asking the
+website again. It checks all issuers, including explicitly configured entries, at
+sign-in and completion. Use `issuers: []` and an Open Client metadata URL for shared
+admission; exact issuer entries can add per-issuer registered credentials but cannot
+bypass the policy. It requires a presented handle and forbids accept-any federation,
+Relays and top-level secrets. It never turns candidate catalog records into trust.
+Feed failure returns HTTP 503 (`issuer_policy_unavailable`); an unapproved issuer
+remains refused. Application sessions and permissions remain the website's concern.
+
 ## Authentication freshness
 
 Set `maxAge` on `RelyingPartyOptions` to request a maximum authentication age in seconds; trusted application

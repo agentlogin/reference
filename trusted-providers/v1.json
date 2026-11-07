@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "programme": "agentlogin-trusted-providers",
+  "profile": "agent-login-core-1.0-draft-0.2-direct-es256",
+  "status": "draft",
+  "revision": 1,
+  "issuedAt": "2026-11-06T00:00:00.000Z",
+  "expiresAt": "2026-11-07T00:00:00.000Z",
+  "providers": []
+}

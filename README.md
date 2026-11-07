@@ -14,6 +14,11 @@ The implementation milestones are:
 3. Agent CLI, TypeScript SDK and local MCP/plugin: private enrollment, disclosure review, application sessions and bounded named operations. Python SDK work is separate.
 4. Optional provider/application catalogs with review evidence, validation and a static directory. Relay implementation and independent interoperability remain separate milestones.
 
+An optional [trusted-provider programme](trusted-providers/README.md) is being
+prepared separately from the discovery catalogs. Websites would explicitly choose
+its reviewed, automatically updated issuer policy. It is still a draft with no
+approved providers; the source helper is not in the published beta packages.
+
 | Package | Purpose |
 | --- | --- |
 | `packages/mcp` | Local MCP tools and skills for enrollment, sign-in, configured application operations and logout |

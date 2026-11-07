@@ -216,12 +216,13 @@ export function errorMessage(e: RelyingPartyError): string {
       return "The agent's provider could not be reached. Try again shortly.";
     case 'configuration_error':
     case 'state_store_failed':
+    case 'issuer_policy_unavailable':
       return 'Sign-in is not available right now.';
     default:
       return 'The sign-in could not be completed.';
   }
 }
-/** The default error response: status by kind of failure (400, 500 or 502), text from `errorMessage`. */
+/** The default error response: status by kind of failure (400, 500, 502 or 503), text from `errorMessage`. */
 export function errorPage(e: RelyingPartyError): Response {
   const html = `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Sign-in not completed</title><body style="font:16px/1.5 system-ui,sans-serif;max-width:32rem;margin:4rem auto;padding:0 1rem"><h1>Sign-in not completed</h1><p>${escapeHtml(errorMessage(e))}</p><p style="color:#666;font-size:.85em">${escapeHtml(e.code)}</p></body>`;
   return new Response(html, { status: e.status, headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' } });

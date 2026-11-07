@@ -3,9 +3,11 @@
 // through the address-filtering fetch of Section 2.2, which needs node:dns and node:http.
 import { createLocalJWKSet, decodeProtectedHeader, jwtVerify, type JSONWebKeySet, type JWTPayload } from 'jose';
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
+import { isIP } from 'node:net';
 import { checkIssuerIdentifier, fetchMetadata, freshness, lookupIssuer, parseHandle, safeFetch, type IssuerMetadata } from 'agentlogin';
 import { ISSUER_ERROR_CODES, RelyingPartyError, type RelyingPartyErrorCode } from './errors.js';
 import { validAuthenticationRequest, type PendingSignIn } from './seal.js';
+import type { IssuerAcceptancePolicy } from './trusted-providers.js';
 
 const T_SKEW = 60;
 const T_CACHE = 86_400; // seconds, Section 1.5
@@ -39,6 +41,8 @@ export interface RelyingPartyOptions {
   scopes?: string[];
   /** Issuers you accept. One Relay covers every Home Issuer that Relay accepts; do not also list a Home Issuer it relays. */
   issuers: Array<string | IssuerConfig>;
+  /** Explicit managed acceptance policy. It also gates locally configured issuers; no Relay or federation:any. */
+  issuerPolicy?: IssuerAcceptancePolicy;
   /** `allowlist` (default): only the Issuers above. `any`: any Issuer that a presented handle designates; apply your own per-Issuer limits (Section 9 item 10). */
   federation?: 'allowlist' | 'any';
   /** At least 32 characters; encrypts the per-sign-in cookie. */
@@ -113,6 +117,8 @@ export interface SignIn {
   /** A bearer credential, usable only at the Issuer's UserInfo Endpoint until `accessTokenExpiresAt` (Section 9 item 5). Do not log it; discard it when it expires. */
   accessToken: string;
   accessTokenExpiresAt: number;
+  /** Original, state-bound handle; retained for policy checks even when email was not requested. */
+  requestedHandle?: string;
   returnTo?: string;
 }
 /** What `recheck` needs; keep it in your session for as long as the Access Token lives. */
@@ -121,6 +127,8 @@ export interface LiveCheck {
   accessToken: string;
   accessTokenExpiresAt: number;
   sub: string;
+  /** State-bound or validated handle. Required when using an issuer policy. */
+  handle?: string;
 }
 export interface ClientMetadataInput {
   clientName?: string;
@@ -138,6 +146,7 @@ export class RelyingParty {
   private readonly relay?: IssuerConfig;
   private readonly algs: string[];
   private readonly timeoutMs: number;
+  private readonly issuerPolicy?: IssuerAcceptancePolicy;
   private readonly discoveryCache = new Map<string, { issuer: string; until: number }>();
   private readonly jwksCache = new Map<string, JwksEntry>();
   /** When a JWK Set was last refetched because of an unknown `kid`: a throttle, kept apart from the cache lifetime. */
@@ -148,6 +157,18 @@ export class RelyingParty {
     if (typeof o.clientId !== 'string' || !o.clientId) throw new Error('clientId is required');
     if (!URL.canParse(o.redirectUri)) throw new Error('redirectUri must be an absolute URL');
     if (o.maxAge !== undefined && (!Number.isSafeInteger(o.maxAge) || o.maxAge < 0)) throw new Error('maxAge must be a non-negative safe integer');
+    this.issuerPolicy = o.issuerPolicy;
+    if (this.issuerPolicy) {
+      if (typeof this.issuerPolicy.assertAccepted !== 'function') throw new Error('issuerPolicy must implement assertAccepted');
+      if (o.federation === 'any' || o.clientSecret !== undefined) throw new Error('issuerPolicy cannot be combined with federation:any or a top-level clientSecret');
+      // Dynamic admissions use an Open Client. Registered credentials remain bound to explicit entries.
+      let clientUrl: URL;
+      try { clientUrl = new URL(o.clientId); } catch { throw new Error('issuerPolicy requires an HTTPS Open Client metadata URL'); }
+      if (clientUrl.href !== o.clientId || clientUrl.protocol !== 'https:' || clientUrl.username || clientUrl.password ||
+          clientUrl.hash || o.clientId.endsWith('#') || clientUrl.pathname === '/' || isIP(clientUrl.hostname.replace(/^\[|\]$/g, ''))) {
+        throw new Error('issuerPolicy requires an HTTPS Open Client metadata URL');
+      }
+    }
     for (const i of o.issuers ?? []) {
       const c = typeof i === 'string' ? { issuer: i } : i;
       try {
@@ -157,10 +178,11 @@ export class RelyingParty {
       }
       this.issuers.set(c.issuer, { ...c });
     }
-    if (this.issuers.size === 0 && o.federation !== 'any') throw new Error('configure at least one Issuer, or federation: "any"');
+    if (this.issuers.size === 0 && o.federation !== 'any' && !this.issuerPolicy) throw new Error('configure at least one Issuer, issuerPolicy, or federation: "any"');
     const relays = [...this.issuers.values()].filter((i) => i.relay);
     if (relays.length > 1) throw new Error('configure at most one Relay (Section 9 item 10)');
     this.relay = relays[0];
+    if (this.relay && this.issuerPolicy) throw new Error('issuerPolicy cannot be combined with a Relay');
     if (this.relay && o.federation === 'any') throw new Error('a Relay cannot be combined with federation: "any": per-owner caps would be counted twice (Section 9 item 10)');
     if (o.clientSecret && (this.issuers.size !== 1 || o.federation === 'any')) {
       throw new Error('a top-level clientSecret is allowed only with exactly one Issuer and without federation: "any"; set clientSecret on the Issuer it belongs to');
@@ -171,8 +193,22 @@ export class RelyingParty {
   }
 
   get options(): Readonly<RelyingPartyOptions> { return this.o; }
-  /** True when `issuer` is one this Relying Party is configured to accept (Section 5.8). */
+  /** Static configuration membership only. With issuerPolicy, use assertAcceptedIssuer for current acceptance. */
   isConfigured(issuer: string): boolean { return this.issuers.has(issuer); }
+  /** Current acceptance, including managed policy and exact reviewed handle domain. Does not replace discovery. */
+  async assertAcceptedIssuer(issuer: string, handle?: string): Promise<void> {
+    if (this.issuerPolicy) {
+      const parsed = handle === undefined ? null : parseHandle(handle);
+      if (!parsed) throw new RelyingPartyError('handle_required', 'a known Agent Handle is required by this issuer policy');
+      try { await this.issuerPolicy.assertAccepted(issuer, parsed.handle); }
+      catch (e) {
+        if (e instanceof RelyingPartyError && (e.code === 'issuer_not_accepted' || e.code === 'issuer_policy_unavailable')) throw e;
+        throw new RelyingPartyError('issuer_policy_unavailable', 'the issuer acceptance policy is unavailable', undefined, { cause: e });
+      }
+      return;
+    }
+    if (!this.issuers.has(issuer) && this.o.federation !== 'any') throw new RelyingPartyError('issuer_not_accepted', 'this application does not accept that Issuer');
+  }
   /** Client identifier and, only for the Issuer it was configured for, the secret. */
   private clientFor(issuer: string): { clientId: string; clientSecret?: string } {
     const c = this.issuers.get(issuer);
@@ -204,11 +240,38 @@ export class RelyingParty {
     }
     return found.issuer;
   }
+  /** Additional capability and domain checks for the managed programme's fixed direct Core profile. */
+  private checkPolicyMetadata(m: IssuerMetadata, handle?: string): void {
+    if (!this.issuerPolicy) return;
+    const bad = () => new RelyingPartyError('issuer_not_accepted', 'the Issuer does not meet this policy profile');
+    const supportsAlgorithms = (value: unknown) => Array.isArray(value) && value.includes('ES256') &&
+      value.every((alg) => alg === 'ES256' || alg === 'Ed25519');
+    if (m.home_issuers !== undefined || !Array.isArray(m.agent_login_versions_supported) ||
+        !m.agent_login_versions_supported.every((version) => typeof version === 'string') ||
+        !m.agent_login_versions_supported.includes('1.0') || !supportsAlgorithms(m.agent_key_algs_supported) ||
+        !supportsAlgorithms(m.id_token_signing_alg_values_supported)) throw bad();
+    const expected = handle === undefined ? null : parseHandle(handle);
+    if (!expected || !Array.isArray(m.handle_domains)) throw bad();
+    let matched = false;
+    for (const item of m.handle_domains) {
+      if (typeof item !== 'string') throw bad();
+      const wildcard = item.startsWith('*.');
+      const name = wildcard ? item.slice(2) : item;
+      const parsed = parseHandle(`policy-check@${name}`);
+      if (!parsed || parsed.domain !== name) throw bad();
+      if (wildcard ? expected.domain.endsWith(`.${name}`) : expected.domain === name) matched = true;
+    }
+    if (!matched) throw bad();
+  }
   /** Section 2.4 metadata; `issuer` in it must equal the identifier (Section 2.2). */
-  private async metadata(issuer: string): Promise<IssuerMetadata> {
+  private async metadata(issuer: string, handle?: string): Promise<IssuerMetadata> {
+    if (this.issuerPolicy) await this.assertAcceptedIssuer(issuer, handle);
     try {
-      return await fetchMetadata(issuer, { allowInsecure: this.o.allowInsecure, timeoutMs: this.timeoutMs });
+      const metadata = await fetchMetadata(issuer, { allowInsecure: this.o.allowInsecure, timeoutMs: this.timeoutMs });
+      this.checkPolicyMetadata(metadata, handle);
+      return metadata;
     } catch (e) {
+      if (e instanceof RelyingPartyError) throw e;
       const configured = this.issuers.has(issuer);
       throw new RelyingPartyError(configured && /does not equal|invalid issuer/.test((e as Error).message) ? 'configuration_error' : 'discovery_failed', configured ? 'metadata of a configured Issuer is unavailable or does not match its identifier' : 'Issuer metadata unavailable', undefined, { cause: e });
     }
@@ -231,11 +294,13 @@ export class RelyingParty {
   /** Chooses the Issuer for a sign-in (Section 9 item 10). Nothing is fetched from an Issuer that is not accepted. */
   private async choose(p: BeginOptions): Promise<string> {
     if (p.issuer) {
+      if (this.issuerPolicy) { await this.assertAcceptedIssuer(p.issuer, p.handle); return p.issuer; }
       if (!this.issuers.has(p.issuer)) throw new RelyingPartyError('issuer_not_accepted', 'this application does not accept that Issuer');
       return p.issuer;
     }
     if (p.handle) {
       const discovered = await this.resolve(p.handle);
+      if (this.issuerPolicy) { await this.assertAcceptedIssuer(discovered, p.handle); return discovered; }
       if (this.issuers.has(discovered)) return discovered;
       if (this.relay) return this.relay.issuer;
       if (this.o.federation === 'any') return discovered;
@@ -259,7 +324,9 @@ export class RelyingParty {
     }
     await this.checkRelayConfiguration();
     const issuer = await this.choose({ ...p, handle: loginHint });
-    const m = await this.metadata(issuer);
+    await this.assertAcceptedIssuer(issuer, loginHint);
+    if (this.issuerPolicy && await this.resolve(loginHint!) !== issuer) throw new RelyingPartyError('handle_binding_failed', 'the handle does not designate this Issuer');
+    const m = await this.metadata(issuer, loginHint);
     const { clientId } = this.clientFor(issuer);
     const pending: PendingSignIn = { state: rnd(), nonce: rnd(), verifier: rnd(32), issuer, loginHint, returnTo: p.returnTo,
       ...(maxAge === undefined ? {} : { maxAge, authenticationRequestedAt: Math.floor(Date.now() / 1000) }) };
@@ -278,6 +345,7 @@ export class RelyingParty {
     if (p.prompt) q.prompt = p.prompt;
     if (maxAge !== undefined) q.max_age = String(maxAge);
     for (const [k, v] of Object.entries(q)) u.searchParams.set(k, v);
+    await this.assertAcceptedIssuer(issuer, loginHint);
     return { url: u.href, pending };
   }
 
@@ -287,6 +355,12 @@ export class RelyingParty {
    * for `login_hint` yields exactly that Issuer. Every other case is `issuer_not_accepted`.
    */
   async beginInitiated(p: { iss: string; loginHint?: string; returnTo?: string }): Promise<Begun> {
+    if (this.issuerPolicy) {
+      await this.assertAcceptedIssuer(p.iss, p.loginHint);
+      // Policy membership never substitutes for the handle domain's delegation to this issuer.
+      if (await this.resolve(p.loginHint!) !== p.iss) throw new RelyingPartyError('issuer_not_accepted', 'the handle does not designate this Issuer');
+      return this.begin({ issuer: p.iss, handle: p.loginHint, returnTo: p.returnTo });
+    }
     const refuse = () => new RelyingPartyError('issuer_not_accepted', 'this application does not accept that Issuer');
     if (this.issuers.has(p.iss)) return this.begin({ issuer: p.iss, handle: p.loginHint && parseHandle(p.loginHint) ? p.loginHint : undefined, returnTo: p.returnTo });
     if (this.o.federation !== 'any' || !p.loginHint) throw refuse();
@@ -318,7 +392,7 @@ export class RelyingParty {
     if (!validAuthenticationRequest(pending)) throw new RelyingPartyError('invalid_state', 'the stored authentication age policy is malformed');
     const iss = params.get('iss');
     if (!iss || iss !== pending.issuer) throw new RelyingPartyError('issuer_mismatch', 'the response did not come from the Issuer the request was sent to');
-    if (!this.issuers.has(pending.issuer) && this.o.federation !== 'any') throw new RelyingPartyError('issuer_not_accepted', 'this application does not accept that Issuer');
+    if (!this.issuerPolicy && !this.issuers.has(pending.issuer) && this.o.federation !== 'any') throw new RelyingPartyError('issuer_not_accepted', 'this application does not accept that Issuer');
     const code = params.get('code');
     const error = params.get('error');
     if ((code !== null && error !== null) || (!code && !error) ||
@@ -335,6 +409,7 @@ export class RelyingParty {
    */
   async complete(p: { params: URLSearchParams; pending: PendingSignIn | null }): Promise<SignIn> {
     const { pending, code, error, errorDescription } = this.preflightCallback(p);
+    await this.assertAcceptedIssuer(pending.issuer, pending.loginHint);
     if (error) {
       const known = (ISSUER_ERROR_CODES as readonly string[]).includes(error);
       throw new RelyingPartyError(known ? (error as RelyingPartyErrorCode) : 'issuer_error', known ? `the Issuer answered ${error}` : 'the Issuer answered with an error', errorDescription?.slice(0, 500));
@@ -342,7 +417,7 @@ export class RelyingParty {
 
     await this.checkRelayConfiguration();
     // Token Request, only to the recorded Issuer's Token Endpoint (Section 5.6).
-    const m = await this.metadata(pending.issuer);
+    const m = await this.metadata(pending.issuer, pending.loginHint);
     const { clientId, clientSecret } = this.clientFor(pending.issuer);
     const form = new URLSearchParams({ grant_type: 'authorization_code', code: code!, redirect_uri: this.o.redirectUri, code_verifier: pending.verifier });
     const headers: Record<string, string> = { 'content-type': 'application/x-www-form-urlencoded' };
@@ -352,6 +427,7 @@ export class RelyingParty {
     let tok: unknown;
     // Conservative start-of-request anchor: neither transport nor later JWKS/handle validation renews the token.
     const tokenRequestAt = Math.floor(Date.now() / 1000);
+    await this.assertAcceptedIssuer(pending.issuer, pending.loginHint);
     try {
       const r = await safeFetch(m.token_endpoint, { method: 'POST', headers, body: form.toString(), maxBytes: MAX_BYTES, timeoutMs: this.timeoutMs, allowPrivate: this.o.allowInsecure });
       status = r.status;
@@ -372,8 +448,9 @@ export class RelyingParty {
 
     const claims = await this.validateIdToken(tok.id_token, { issuer: pending.issuer, nonce: pending.nonce, clientId, metadata: m, expectedHandle: pending.loginHint,
       maxAge: pending.maxAge, authenticationRequestedAt: pending.authenticationRequestedAt });
+    // validateIdToken checks policy before its final time checks. Do not insert an awaited operation here.
     if (Date.now() / 1000 >= accessTokenExpiresAt) throw new RelyingPartyError('reauthentication_required', 'The Access Token expired before sign-in validation completed');
-    return { ...this.identityOf(claims), claims, issuer: pending.issuer, accessToken: tok.access_token, accessTokenExpiresAt, returnTo: pending.returnTo };
+    return { ...this.identityOf(claims), claims, issuer: pending.issuer, accessToken: tok.access_token, accessTokenExpiresAt, requestedHandle: pending.loginHint, returnTo: pending.returnTo };
   }
 
   /**
@@ -381,6 +458,9 @@ export class RelyingParty {
    * state, never from callback parameters. Nothing from a token that fails is returned.
    */
   async validateIdToken(idToken: string, x: IdTokenValidationOptions): Promise<JWTPayload> {
+    // Low-level callers must not bypass policy by going straight to signature validation.
+    if (this.issuerPolicy) await this.assertAcceptedIssuer(x.issuer, x.expectedHandle);
+    if (this.issuerPolicy) this.checkPolicyMetadata(x.metadata ?? await this.metadata(x.issuer, x.expectedHandle), x.expectedHandle);
     const bad = (why: string, cause?: unknown) => new RelyingPartyError('invalid_id_token', `ID Token rejected: ${why}`, undefined, { cause });
     if (!validAuthenticationRequest(x)) throw bad('malformed authentication age policy');
     let header;
@@ -391,7 +471,7 @@ export class RelyingParty {
     }
     if (typeof header.alg !== 'string' || !this.algs.includes(header.alg)) throw bad('algorithm not accepted');
     if (typeof header.kid !== 'string') throw bad('no kid');
-    const jwks = await this.jwks(x.issuer, header.kid);
+    const jwks = await this.jwks(x.issuer, header.kid, x.expectedHandle);
     let payload: JWTPayload;
     try {
       // Step 2: signature, with `alg` pinned and matched to the key (and to the JWK's `alg` when present).
@@ -421,6 +501,7 @@ export class RelyingParty {
       }
     }
     const homeIss = payload.home_iss;
+    if (this.issuerPolicy && homeIss !== undefined) throw new RelyingPartyError('issuer_not_accepted', 'this issuer policy accepts direct issuers only');
     if (homeIss !== undefined) {
       const cfg = this.issuers.get(x.issuer);
       if (typeof homeIss !== 'string' || !cfg?.relay) throw new RelyingPartyError('handle_binding_failed', 'home_iss from an Issuer that is not configured as a Relay');
@@ -430,7 +511,7 @@ export class RelyingParty {
       if (this.issuers.has(homeIss)) throw new RelyingPartyError('configuration_error', 'this Home Issuer is accepted directly and through the Relay; per-owner caps would be counted twice (Section 9 item 10)');
       if (!returnedHandle && !expectedHandle) throw new RelyingPartyError('handle_binding_failed', 'a Relay token requires a returned or pre-bound handle');
     }
-    const bindingHandle = returnedHandle ?? (homeIss !== undefined ? expectedHandle : undefined);
+    const bindingHandle = returnedHandle ?? (homeIss !== undefined || this.issuerPolicy ? expectedHandle : undefined);
     if (bindingHandle) {
       const expected = typeof homeIss === 'string' ? homeIss : x.issuer;
       const discovered = await this.resolve(bindingHandle.handle);
@@ -438,6 +519,7 @@ export class RelyingParty {
       if (expected !== x.issuer) await this.metadata(expected); // Section 2.2: the designated Issuer's metadata names itself
     }
     // Discovery and key retrieval can consume the remaining lifetime. Recheck time at the point of acceptance.
+    if (this.issuerPolicy) await this.assertAcceptedIssuer(x.issuer, returnedHandle?.handle ?? x.expectedHandle);
     const now = Date.now() / 1000;
     if (payload.exp <= now) throw bad('expired');
     if (payload.iat! > now + T_SKEW) throw bad('iat is in the future');
@@ -456,7 +538,8 @@ export class RelyingParty {
    * verifying as soon as the Issuer's own caching terms say so (Section 7.7). Separately, an unknown `kid` causes
    * one refetch of a still-fresh set, at most once a minute (R-13).
    */
-  private async jwks(issuer: string, kid: string): Promise<JSONWebKeySet> {
+  private async jwks(issuer: string, kid: string, handle?: string): Promise<JSONWebKeySet> {
+    if (this.issuerPolicy) await this.assertAcceptedIssuer(issuer, handle);
     const now = Date.now();
     const cached = this.jwksCache.get(issuer);
     const fresh = cached !== undefined && now < cached.until;
@@ -466,7 +549,8 @@ export class RelyingParty {
       if (this.jwksMissAt.size >= 200) this.jwksMissAt.delete(this.jwksMissAt.keys().next().value!);
       this.jwksMissAt.set(issuer, now);
     }
-    const m = await this.metadata(issuer);
+    const m = await this.metadata(issuer, handle);
+    if (this.issuerPolicy) await this.assertAcceptedIssuer(issuer, handle);
     let jwks: JSONWebKeySet;
     let ttl: number;
     try {
@@ -494,9 +578,11 @@ export class RelyingParty {
    */
   async recheck(s: LiveCheck | SignIn): Promise<Record<string, unknown>> {
     const sub = 'sub' in s ? s.sub : s.agent.sub;
+    const handle = 'sub' in s ? s.handle : (s.agent.handle ?? s.requestedHandle);
     if (Math.floor(Date.now() / 1000) >= s.accessTokenExpiresAt) throw new RelyingPartyError('reauthentication_required', 'the Access Token expired; require a new sign-in');
-    if (!this.issuers.has(s.issuer) && this.o.federation !== 'any') throw new RelyingPartyError('issuer_not_accepted', 'this application does not accept that Issuer');
-    const m = await this.metadata(s.issuer);
+    await this.assertAcceptedIssuer(s.issuer, handle);
+    const m = await this.metadata(s.issuer, handle);
+    await this.assertAcceptedIssuer(s.issuer, handle);
     let status: number;
     let body: unknown;
     try {
@@ -509,6 +595,8 @@ export class RelyingParty {
     if (status === 401) throw new RelyingPartyError('revoked', 'the Issuer no longer vouches for this sign-in');
     if (status !== 200 || !isObject(body)) throw new RelyingPartyError('userinfo_failed', `UserInfo answered ${status}`);
     if (body.sub !== sub) throw new RelyingPartyError('userinfo_failed', 'UserInfo sub does not match the ID Token');
+    await this.assertAcceptedIssuer(s.issuer, handle);
+    if (Math.floor(Date.now() / 1000) >= s.accessTokenExpiresAt) throw new RelyingPartyError('reauthentication_required', 'the Access Token expired during its live check');
     return body;
   }
   /** The Agent, and the Owner data when an owner scope was granted, from validated ID Token Claims. */
@@ -517,7 +605,7 @@ export class RelyingParty {
   }
   /** The part of a sign-in that `recheck` needs; discard it when `accessTokenExpiresAt` has passed. */
   liveCheckOf(s: SignIn): LiveCheck {
-    return { issuer: s.issuer, accessToken: s.accessToken, accessTokenExpiresAt: s.accessTokenExpiresAt, sub: s.agent.sub };
+    return { issuer: s.issuer, accessToken: s.accessToken, accessTokenExpiresAt: s.accessTokenExpiresAt, sub: s.agent.sub, handle: s.agent.handle ?? s.requestedHandle };
   }
 
   /** Section 4.2: the Client ID Metadata Document an Open Client serves at its `client_id` URL (R-10). */
