@@ -11,18 +11,18 @@ It is an implementation, not a conformance certification. No provider is preferr
 
 ## Install and configure
 
-Use Node.js 22.23.4 or a supported later release. Install the published beta
-`0.2.0-beta.2` explicitly, without selecting the `latest` tag:
+Use Node.js 22.23.4 or a supported later release. Check the [release status](https://github.com/agentlogin/reference/blob/main/docs/npm-release.md) before installing this package version,
+`0.2.0-beta.3`, explicitly, without selecting the `latest` tag:
 
 ```sh
-npm install --save-exact @agentlogin/mcp@0.2.0-beta.2
+npm install --save-exact @agentlogin/mcp@0.2.0-beta.3
 ```
 
 For development or release rehearsal, install the matching locally packed
 `agentlogin` and `@agentlogin/mcp` tarballs together. A build does not publish them:
 
 ```sh
-npm install /absolute/artifacts/agentlogin-0.2.0-beta.2.tgz /absolute/artifacts/agentlogin-mcp-0.2.0-beta.2.tgz
+npm install /absolute/artifacts/agentlogin-0.2.0-beta.3.tgz /absolute/artifacts/agentlogin-mcp-0.2.0-beta.3.tgz
 ```
 
 Copy [the example configuration](examples/config.json), replace the reserved example

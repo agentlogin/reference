@@ -1,6 +1,6 @@
 {
   "name": "@agentlogin/store-postgres",
-  "version": "0.2.0-beta.2",
+  "version": "0.2.0-beta.3",
   "description": "Normalized PostgreSQL storage for the Agent Login reference issuer",
   "license": "Apache-2.0",
   "type": "module",
@@ -24,7 +24,7 @@
     "directory": "packages/store-postgres"
   },
   "dependencies": {
-    "@agentlogin/issuer": "0.2.0-beta.2",
+    "@agentlogin/issuer": "0.2.0-beta.3",
     "pg": "^8.16.3"
   },
   "devDependencies": {

@@ -4,7 +4,7 @@ Reference code for the [Agent Login](https://github.com/agentlogin/spec) specifi
 server), a relying-party library with a "Sign in with your agent" button, an agent command-line client and
 SDKs, and a conformance test harness. Apache-2.0.
 
-Status: draft 0.1 is the published baseline; this branch also implements selected draft 0.2 changes. See the
+Status: the specification publishes working draft 0.2; this implementation targets the pinned draft revision below. See the
 [pinned compatibility status](docs/draft-0.2-status.md) for implemented paths, remaining requirements and evidence
 gaps. The reference issuer passes the partial harness on JSON and wait-page flows; this is not full conformance.
 The implementation milestones are:
@@ -17,7 +17,7 @@ The implementation milestones are:
 An optional [trusted-provider programme](trusted-providers/README.md) is being
 prepared separately from the discovery catalogs. Websites would explicitly choose
 its reviewed, automatically updated issuer policy. It is still a draft with no
-approved providers; the source helper is not in the published beta packages.
+approved providers. The helper is part of the beta.3 release candidate; publishing the SDK does not activate the programme.
 
 | Package | Purpose |
 | --- | --- |
@@ -57,8 +57,8 @@ implementation that follows the specification section by section is the more use
 
 Package names: npm `agentlogin` (published beta), PyPI `agent-login` (the name `agentlogin` is held by an unrelated 2019 project), crates.io `agentlogin` (free, not reserved).
 
-The current npm beta is `0.2.0-beta.2`. Use the exact versions in the package
-guides; `latest` is not the beta distribution channel. The coordinated release process,
+The verified npm beta is `0.2.0-beta.2`; this source tree prepares `0.2.0-beta.3`.
+Check the release guide before installing source-guide versions from npm; `latest` is not the beta distribution channel. The coordinated release process,
 exact package graph, artifact checks,
 trusted publishing setup and first-publication procedure are in the
 [npm release guide](docs/npm-release.md). A prepared bundle is not a published release.

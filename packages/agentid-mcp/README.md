@@ -15,8 +15,8 @@ separately in the browser which completed the handoff.
 
 ## Setup
 
-Use Node.js 22.23.4 or a supported later release. Install the published experimental
-beta `@agentlogin/agentid-mcp@0.2.0-beta.2` explicitly. In a source checkout:
+Use Node.js 22.23.4 or a supported later release. Check the [release status](https://github.com/agentlogin/reference/blob/main/docs/npm-release.md) before installing this experimental
+beta `@agentlogin/agentid-mcp@0.2.0-beta.3`. In a source checkout:
 
 ```sh
 npm ci

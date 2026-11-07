@@ -1,6 +1,6 @@
 {
   "name": "@agentlogin/conformance",
-  "version": "0.2.0-beta.2",
+  "version": "0.2.0-beta.3",
   "description": "Black-box conformance harness for Agent Login issuers",
   "license": "Apache-2.0",
   "type": "module",
