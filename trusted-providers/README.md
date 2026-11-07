@@ -13,10 +13,11 @@ subscribes a website to this programme. The reference implementation has no
 implicit default registry, consistent with the specification's
 [governance](https://github.com/agentlogin/spec/blob/main/GOVERNANCE.md).
 
-The programme is not operational until named maintainers, the approved policy,
-its authenticated publication and recovery arrangements, and the first completed
-provider decision are published. Automated reviews can improve this draft; they
-do not fill those human roles or establish independent endorsement.
+The programme is not operational until its accountable operator, adopted policy,
+authenticated publication and recovery arrangements, and first completed provider
+decision are published. Reviews and admission decisions may be automated under
+the operator's published delegation. Automated or affiliated review does not
+establish independent endorsement.
 
 ## What websites are choosing
 
@@ -65,11 +66,12 @@ delegation. Account identity remains `(iss, sub)`.
 
 ## Admission evidence
 
-An application contains the following evidence. Reports identify the author,
-affiliation, observation date, software version, exact specification commit,
-reproduction method, exclusions and expiry. Evidence is public or has a public
-summary explaining any confidential portion; secrets and Owner personal data do
-not belong in the application.
+An application contains the following evidence. Reports identify the responsible
+organisation or maintainer, affiliations, observation date, review method and tool
+versions, tested source revision, exact specification commit, reproduction steps,
+results, exclusions and expiry. Evidence is public or has a public summary
+explaining any confidential portion; secrets and Owner personal data do not belong
+in the application.
 
 | Area | Required evidence |
 | --- | --- |
@@ -83,8 +85,10 @@ not belong in the application.
 Admission requires no unresolved defect that can permit identity substitution,
 unauthorised Owner approval, disclosure or account access. A passing harness alone
 does not establish admission or full conformance. Reviewers assess untested
-requirements and document the basis for their conclusions. A self-report can
-support review but cannot supply its independent approval.
+requirements and document the basis for their conclusions. Automated or affiliated
+review, including a provider reviewing its own application, may support a decision
+under the same published criteria. Disclose that relationship and do not describe
+it as independent approval.
 
 Admission is scoped, time-limited and renewable. The decision's expiry cannot be
 later than any evidence on which it relies. Material changes to ownership,
@@ -95,32 +99,40 @@ silently transfers existing approval.
 
 ## Decisions and accountability
 
-Before launch, publish a maintainer roster with each person's name, affiliation,
-role and authenticated decision channel. Publish the programme version and its
-review criteria. Provider admissions and reinstatements need two named human
-approvers, including at least one independent of the applicant. Provider employees,
-contractors, owners and people with a material financial interest disclose that
-interest and do not approve that provider. The same rule applies to a maintainer's
-own provider. If the required reviewers are unavailable, admission waits; an
-unreviewed provider is not a bootstrap exception.
+Before launch, publish the accountable programme operator and responsible
+maintainers, their affiliations, roles and authenticated decision channels. An
+organisation can hold these responsibilities; named individual people are not
+required. Publish the programme version, review criteria and any delegation to
+automated reviewers or decision systems, including their authority and limits.
+
+Admission and reinstatement require a completed evidence-based decision under
+those criteria. No human approval, reviewer count or external quorum is required.
+The programme operator remains accountable for delegated decisions. Disclose
+employment, ownership, financial interests and other affiliations with an
+applicant. Affiliated review is permitted under the same criteria, including for
+the operator's own provider; it is not independent endorsement.
 
 Every admission, rejection, renewal, suspension, withdrawal and reinstatement has
 a dated public [decision record](decision-template.md). It links the application,
-evidence, conflicts, exact scope, reasons, approvers, validity period and resulting
-policy revision. Authenticated publication identifies the publisher; it does not replace the
-underlying review. Public records must distinguish human reviewers from automated
-review tools and distinguish vendor evidence from independent evidence.
+evidence, conflicts, exact scope, reasons, responsible decision authority, review
+method, validity period and resulting policy revision. Automated decisions record
+the system and tool versions, tested source revision and test results.
+Authenticated publication identifies the publisher; it does not replace the
+underlying review. Distinguish automated from manual assessment and vendor evidence
+from independently produced evidence.
 
-Programme rule changes are published with their rationale and reviewed by two
-unconflicted maintainers before adoption. Expanding beyond direct Core issuers or
-changing the subscription's trust root creates a new policy choice for websites.
-These programme decisions do not amend the Core specification or bypass its
-separate governance. Admission cannot be purchased or exchanged for partnerships.
+Programme rule changes are published with their rationale and an authenticated
+adoption decision by the accountable operator or its published delegate. Expanding
+beyond direct Core issuers or changing the subscription's trust root creates a new
+policy choice for websites. These programme decisions do not amend the Core
+specification or bypass its separate governance. Admission cannot be purchased or
+exchanged for partnerships.
 
-An applicant can request correction or appeal with new evidence. Two people who
-did not make the disputed decision assess the appeal and publish their reasoning;
-if they are not available, the appeal remains pending. An appeal does not restore
-acceptance while its subject is suspended or expired.
+An applicant can request correction or appeal with new evidence. The programme
+operator or its delegate reassesses the disputed findings and publishes the
+method, affiliations and reasoning, including whether the original reviewer or
+system was reused. An appeal does not restore acceptance while its subject is
+suspended or expired.
 
 ## Status, renewal and incident response
 
@@ -137,10 +149,11 @@ because an incident is being investigated or a feed is unavailable. Reinstatemen
 requires evidence of remediation and a new decision; it is never inferred from a
 provider returning to a healthy HTTP response.
 
-A named maintainer can suspend a provider immediately on a credible threat to
-identity or Owner authority. Record the acting person, time, affected issuer and
-reason; another unconflicted maintainer reviews the decision promptly. Publish
-sensitive technical details only when that will not worsen the incident. Contact
+The operator or its authorised delegate, including an automated system, can
+suspend a provider immediately on a credible threat to identity or Owner authority.
+Record the acting authority, method, time, affected issuer and reason; reassess the
+evidence promptly and publish the outcome. Publish sensitive technical details only
+when that will not worsen the incident. Contact
 the provider's security contact, publish a redacted incident notice, and preserve
 the decision history. Suspension does not require the provider's permission.
 
@@ -247,8 +260,8 @@ without unnecessarily logging tokens, handles or Owner data. Its local issuer
 blocks take precedence.
 
 The programme remains a draft: no production admission, operational publishing
-schedule or accountable reviewer roster is asserted here. Repository test fixtures
-are not approvals. Activation requires reviewed records, independently exercised
-publication and recovery controls, and tests for malformed and expired releases,
-partial updates, concurrent refresh, rollback, cold starts, restarts, and a
-suspended issuer's in-flight callback.
+schedule or accountable operator roster is asserted here. Repository test fixtures
+are not approvals. Activation requires completed decision records, separately
+exercised publication and recovery controls, and tests for malformed and expired
+releases, partial updates, concurrent refresh, rollback, cold starts, restarts, and
+a suspended issuer's in-flight callback.

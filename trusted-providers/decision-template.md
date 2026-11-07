@@ -2,7 +2,8 @@
 
 **Template only. An incomplete copy is not an approval.** Do not publish private
 credentials, personal Owner details or live exploit material. Use exact identifiers;
-do not substitute marketing names for issuers or named people for their employer.
+do not substitute marketing names for issuers or conceal responsible organisations
+behind tool names.
 
 - Decision ID and public application/issue:
 - Action: admit / reject / renew / suspend / withdraw / reinstate / correct.
@@ -20,28 +21,32 @@ do not substitute marketing names for issuers or named people for their employer
 ## Evidence and findings
 
 For each admission area in the [programme](README.md#admission-evidence), link the
-report and record its named author, affiliation, observation and expiry dates,
-method, results and exclusions. Distinguish observations from operator assertions.
+report and record its responsible organisation or maintainer, affiliations,
+observation and expiry dates, review method, tool versions, tested source revision,
+results and exclusions. Distinguish observations from operator assertions.
 Identify the independently maintained counterpart in the interoperability run.
-Document manual assessment where a harness does not exercise a requirement.
+Document the assessment and supporting evidence where a harness does not exercise
+a requirement, including any unresolved uncertainty.
 
 List unresolved findings, severity, their effect on the decision and required
 remediation. Explain how the evidence supports this exact issuer, domains,
 configuration and specification revision. For renewal or reinstatement, identify
 what changed and which previous conclusions were reassessed.
 
-## People and decision
+## Authority and decision
 
-For each human reviewer and approver, record name, affiliation, role, decision,
-date, authenticated approval reference, and disclosed relationships or interests.
-Identify recusals and show that the required independent approval is present.
-Name automated tools and their tested versions separately; their output is evidence,
-not a human vote or a claim of independent organisational review.
+Identify the accountable programme operator and decision authority, including any
+published delegation to a maintainer or automated system. Record the decision,
+date, authenticated decision reference and disclosed relationships or interests.
+State whether assessment was manual, automated or combined. For automated review,
+identify the system, tool versions, source revisions and reproducible results.
+Affiliated self-review is permitted under the same published criteria; disclose it
+and do not claim independent endorsement. No human approval or quorum is required.
 
 State the decision and its reasons. A rejection, suspension or withdrawal includes
 the acceptance change, affected scope and public remediation or appeal route.
-An emergency suspension records the acting maintainer and the second person's
-subsequent review; confidential details have a redacted public explanation.
+An emergency suspension records the acting authority and subsequent reassessment;
+confidential details have a redacted public explanation.
 
 ## Follow-up
 

@@ -17,6 +17,9 @@ test('draft publication preserves exact bytes, original dates and explicit non-o
   assert.deepEqual(publication.body, original);
   assert.match(publication.html, /Draft programme\. No approved providers\./);
   assert.match(publication.html, /programme is not operational/);
+  assert.match(publication.html, /Reviews and decisions may be automated under published delegation/);
+  assert.match(publication.html, /no human approval or reviewer quorum is required/);
+  assert.match(publication.html, /Automated or affiliated review does not establish independent endorsement/);
   assert.ok(publication.html.includes(draft().issuedAt));
   assert.ok(publication.html.includes(draft().expiresAt));
   assert.match(publication.html, /Rebuilding this page never renews it/);
