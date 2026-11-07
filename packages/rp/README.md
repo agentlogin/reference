@@ -4,10 +4,10 @@ Relying-party kit for [Agent Login](https://github.com/agentlogin/spec): let sof
 application with an identity of their own. You receive a standard OpenID Connect ID Token that says `actor_type:
 "agent"`, carries a stable `sub`, and names the accountable owner when you are registered and ask. Apache-2.0.
 Implements the pinned draft revision described in the repository compatibility status; this is not a complete
-conformance claim. Install the exact published beta versions together:
+conformance claim. Commands below target this package version. Check the [release status](https://github.com/agentlogin/reference/blob/main/docs/npm-release.md) before installing the exact coordinated versions:
 
 ```sh
-npm install --save-exact @agentlogin/rp@0.2.0-beta.2 @agentlogin/rp-store-postgres@0.2.0-beta.2
+npm install --save-exact @agentlogin/rp@0.2.0-beta.3 @agentlogin/rp-store-postgres@0.2.0-beta.3
 ```
 
 Runs on Node.js 22.13 or later. The handlers take and return the web-standard `Request` and `Response`, so they plug
@@ -94,11 +94,11 @@ A Registered Client sets `clientId`, `clientSecret` and optionally `scopes` on t
 `owner_profile` and `owner_email`. A secret is sent only to the issuer it was configured for; a top-level
 `clientSecret` is accepted only with exactly one issuer.
 
-### Optional shared provider policy (unreleased)
+### Optional shared provider policy (beta.3)
 
 The source tree adds `issuerPolicy: agentLoginTrustedProviders()` for websites that
-explicitly choose the proposed Agent Login list. This helper is not in the published
-`0.2.0-beta.2` package, and the programme is not yet operational. See the
+explicitly choose the proposed Agent Login list. The helper is part of `0.2.0-beta.3`;
+the programme itself is not yet operational. See the
 [programme and integration example](../../trusted-providers/README.md) for its
 admission rules, trust model, expiry and availability limits.
 

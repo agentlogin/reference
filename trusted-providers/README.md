@@ -150,10 +150,11 @@ revoked: the website owns those sessions. Its incident procedure must identify
 sessions by issuer, apply local restrictions or invalidate them where appropriate,
 and preserve Core's UserInfo rechecks before actions with lasting effects.
 
-## SDK integration (unreleased)
+## SDK integration (beta.3)
 
-The helper in this source tree is not included in the published `0.2.0-beta.2`
-packages. Its explicit opt-in is:
+The helper is part of `0.2.0-beta.3`. Check the [release status](../docs/npm-release.md)
+before installing it from npm. SDK publication does not activate this programme.
+Its explicit opt-in is:
 
 ```ts
 import { RelyingParty, agentLoginTrustedProviders } from '@agentlogin/rp';
@@ -177,8 +178,8 @@ discovered issuer and its handle domain must be approved. The bound requested
 handle is preserved for live checks even when the granted scopes omit `email`.
 Domain discovery and token validation still apply.
 
-The checked-in [draft feed](v1.json) accepts no providers. It is not a live
-publication, so this configuration cannot yet be used as a
+The [draft feed](v1.json) accepts no providers. It is not an active approval
+policy, so this configuration cannot yet be used as a
 working public sign-in service. Keep an existing explicitly configured issuer
 policy until the programme is operational; do not configure an automatic fallback
 that bypasses this policy on errors.

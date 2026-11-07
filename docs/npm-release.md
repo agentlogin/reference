@@ -16,6 +16,24 @@ Do not advertise installation from npm until the exact version and artifact
 integrity have been read back from the registry. Preparing a bundle or passing a
 local consumer test is not publication.
 
+## Beta.3 preparation
+
+This source tree prepares the coordinated `0.2.0-beta.3` release. It adds the RP's
+explicit `issuerPolicy: agentLoginTrustedProviders()` option and the separate
+[draft programme](../trusted-providers/README.md). The helper checks issuer and
+handle-domain admissions throughout sign-in and live checks. Publication is not
+yet verified here; the current verified release above remains beta.2.
+
+The programme is inactive and its empty draft feed admits nobody. Publishing
+these packages or the programme page does not approve SentFrom.ai or another
+provider. Keep an explicit issuer configuration until the programme is operational,
+or deliberately configure an independently administered policy. The separate
+`sentfromai-mcp` companion remains at `0.5.0-beta.2`.
+
+The beta.3 preparation changes no third-party dependency resolutions. Its release
+record must identify whether publication used verified CI OIDC provenance or
+maintainer authentication; beta.2's historical manual-publication evidence is unchanged.
+
 ## Release contents
 
 Publish the following coordinated version in this order. Internal package
