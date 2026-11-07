@@ -44,38 +44,43 @@ operational.
 
 Activation requires a separately reviewed publisher and these public records:
 
-1. The adopted programme version; a named maintainer roster with affiliations,
-   roles and authenticated decision channels; and the responsible incident contact.
+1. The adopted programme version; its accountable operator and responsible
+   maintainers, affiliations, roles and authenticated decision channels; any
+   delegated decision authority; and the responsible incident contact.
 2. The first completed admission decision, its application and evidence, exact
    issuer and handle domains, specification commit and validity period. Verify the
-   two required human approvals, their authenticated references and disclosed
-   conflicts against the [programme rules](README.md#decisions-and-accountability).
-   Automated results and candidate catalog entries are not approvals.
+   decision authority, authenticated record, review method, tool versions, tested
+   source revision, results and disclosed affiliations against the
+   [programme rules](README.md#decisions-and-accountability). Decisions may be
+   automated; a passing test suite or candidate catalog entry alone is not admission.
 3. The publishing access and branch/deployment controls, accountable publisher,
    refresh schedule and expiry alerts. Explain that the fixed HTTPS origin,
    repository publishing access, CI and host are the version 1 trust root. This
    format provides no independent signature or durable client rollback protection.
-4. An independently exercised publication, emergency suspension and recovery
+4. A separately exercised publication, emergency suspension and recovery
    procedure. Include incomplete deployments, unavailable or stale publication,
    expiry, concurrent refreshes, cold starts and in-flight callbacks. Restoring an
    older artifact must not re-admit a suspended issuer. Record the observed limits
    rather than claiming worldwide suspension within the SDK's cache interval.
 
 The activation review must change the draft-only publication guard deliberately;
-editing `v1.json` alone cannot activate this build. Machine checks can validate
-record structure and consistency. They cannot establish a person's identity,
-independence or genuine approval.
+editing `v1.json` alone cannot activate this build. Automated review and decisions
+are permitted under the published delegation. Record checks establish structure
+and consistency; admission also needs the substantive evidence and accountable
+authority required by the programme. No human approval or reviewer quorum is
+required. Neither automation nor affiliated self-review establishes independent
+endorsement.
 
 For the first active release, choose a revision greater than every previously
 published revision, use fresh issue and expiry times no more than 24 hours apart,
 and include only issuers with valid completed decisions. Every entry must exactly
 match its approved issuer, domains, review URL, specification commit and review
 expiry. Never extend approval past its earliest required evidence expiry. Validate
-the release with the production SDK and independently verify the published bytes.
+the release with the production SDK and separately verify the published bytes.
 Later renewals also need a new revision; never retimestamp the same revision.
 
-Initial activation requires the first genuine admission. Later releases may have
-no accepted providers, for example when all are suspended. Removing an issuer
+Initial activation requires the first completed admission decision. Later releases
+may have no accepted providers, for example when all are suspended. Removing an issuer
 does not erase its decision history or remotely invalidate application sessions.
 The [programme's publication limitations](README.md#publication-and-consumption)
 continue to apply.
