@@ -1,38 +1,37 @@
 # npm beta release
 
-The current supported package release is `0.2.0-beta.2`, under the `beta` dist-tag.
-This release updates the issuer HTTP adapter to patched
-`@hono/node-server` 2.1.3. It does not change the protocol or previously published
-archives. Install the exact version; existing `latest` defaults are unchanged.
-The [release manifest](https://github.com/agentlogin/reference/releases/download/v0.2.0-beta.2/release.json)
-records the source revision and archive hashes. Publication uses maintainer-authenticated
-uploads of the verified archives; this release has no CI provenance.
-It implements the working Agent Login draft described in
-[draft status](draft-0.2-status.md); the package version does not publish or ratify
-the specification. `@agentlogin/agentid-mcp` is an experimental, separate AgentMail
-AgentID integration. Its inclusion does not establish AgentID/Core interoperability.
+The current supported package release is `0.2.0-beta.3`, under the `beta` dist-tag.
+It adds the RP's explicit `issuerPolicy: agentLoginTrustedProviders()` option.
+The helper checks the approved issuer and handle domain throughout sign-in and
+live checks. It does not change Core or automatically subscribe applications.
+Install the exact version; existing `latest` defaults are unchanged.
 
-Do not advertise installation from npm until the exact version and artifact
-integrity have been read back from the registry. Preparing a bundle or passing a
-local consumer test is not publication.
+The [release manifest](https://github.com/agentlogin/reference/releases/download/v0.2.0-beta.3/release.json)
+records source `b4ea4c78c2674685fea362f3dbe8b809f77cabcf` and all eight archive
+hashes. The [original release workflow](https://github.com/agentlogin/reference/actions/runs/42321226646)
+prepared the archives once, passed 970 tests with PostgreSQL required and no
+skips, and published those exact bytes through npm trusted publishing with
+npm-generated GitHub provenance. Processing delays were reconciled by reading
+back immutable registry bytes before continuing; accepted versions were not
+rebuilt or replaced. The earlier beta.2 release used maintainer authentication
+and has no CI provenance; its historical evidence is unchanged.
 
-## Beta.3 preparation
+The [programme's published status](https://agentlogin.github.io/reference/trusted-providers/)
+and unexpired policy determine current provider admission. Publishing packages
+or documentation alone approves nobody. Website operators can retain an explicit
+issuer configuration or deliberately opt into the programme; errors never cause
+an automatic fallback to unapproved issuers. The separate `sentfromai-mcp`
+companion remains at `0.5.0-beta.2`. Beta.3 changes no third-party dependency
+resolutions from beta.2, which already uses patched `@hono/node-server` 2.1.3.
 
-This source tree prepares the coordinated `0.2.0-beta.3` release. It adds the RP's
-explicit `issuerPolicy: agentLoginTrustedProviders()` option and the separate
-[draft programme](../trusted-providers/README.md). The helper checks issuer and
-handle-domain admissions throughout sign-in and live checks. Publication is not
-yet verified here; the current verified release above remains beta.2.
+These packages implement the working draft described in
+[draft status](draft-0.2-status.md); a package version does not publish or ratify
+the specification. `@agentlogin/agentid-mcp` remains an experimental, separate
+AgentMail AgentID integration, not Core interoperability or programme membership.
 
-The programme is inactive and its empty draft feed admits nobody. Publishing
-these packages or the programme page does not approve SentFrom.ai or another
-provider. Keep an explicit issuer configuration until the programme is operational,
-or deliberately configure an independently administered policy. The separate
-`sentfromai-mcp` companion remains at `0.5.0-beta.2`.
-
-The beta.3 preparation changes no third-party dependency resolutions. Its release
-record must identify whether publication used verified CI OIDC provenance or
-maintainer authentication; beta.2's historical manual-publication evidence is unchanged.
+Do not advertise any future release until its exact version and artifact integrity
+have been read back from npm and its clean registry consumer checks have passed.
+A prepared bundle or local-only installation is not publication.
 
 ## Release contents
 

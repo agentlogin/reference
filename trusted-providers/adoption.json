@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "status": "adopted",
+  "programme": "agentlogin-trusted-providers",
+  "profile": "agent-login-core-1.0-draft-0.2-direct-es256",
+  "operator": "Brightboard AI Ltd, trading as SentFromAI",
+  "adoptedAt": "2026-11-08T23:14:17.768Z",
+  "adoptionUrl": "https://github.com/agentlogin/reference/blob/ef036c47f9132502b6b85fc31c6cf1a1773e0de0/trusted-providers/OPERATOR.md",
+  "authority": "sentfromai-programme-maintainers",
+  "publication": {
+    "repository": "agentlogin/reference",
+    "sourceBranch": "main",
+    "branch": "gh-pages",
+    "url": "https://agentlogin.github.io/reference/trusted-providers/v1.json",
+    "bootstrapCommit": "666cafe61888057cd49885ff2bc0eb775b1107b2",
+    "bootstrapFeedSha256": "6dbb2cbd1deb43bfa8ec3acf70ec5e86bc8077bf26865ba164e4bf58497477a2",
+    "lifetimeHours": 12
+  },
+  "delegates": []
+}

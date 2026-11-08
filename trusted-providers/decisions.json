@@ -1,0 +1,67 @@
+{
+  "version": 1,
+  "decisions": [
+    {
+      "id": "sentfromai-20261108-admit",
+      "action": "admit",
+      "issuer": "https://identity.sentfrom.ai",
+      "decidedAt": "2026-11-08T23:14:17.768Z",
+      "reviewUrl": "https://github.com/agentlogin/reference/blob/928e47236987f51e241ff9957d4433289b3408da/trusted-providers/decisions/sentfromai-20261108.md",
+      "authority": "sentfromai-programme-maintainers",
+      "method": "Codex-assisted affiliated review, separately executed peer review and pinned tests; historical human pilot evidence assessed separately",
+      "reason": "All six admission areas assessed for the named direct-issuer pilot; source-assessment and operational limits are public. Restored uncertain authority and admission must remain closed.",
+      "supersedes": null,
+      "handleDomains": [
+        "mail.sentfrom.ai"
+      ],
+      "specRevision": "536c5d15738f45a3c2115884a0a43cdd28b06dd3",
+      "expiresAt": "2026-11-15T00:00:00.000Z",
+      "affiliations": "The operator also operates SentFromAI, the reference implementation and Agent Tasks. This is affiliated self-review, not independent organisational endorsement.",
+      "sourceRevision": "074175e59ae269be3135c4d865d7bca13dd34e73",
+      "evidence": [
+        {
+          "area": "operator",
+          "url": "https://github.com/agentlogin/reference/blob/ef036c47f9132502b6b85fc31c6cf1a1773e0de0/trusted-providers/applications/sentfromai/README.md",
+          "observedAt": "2026-11-08T22:59:00.000Z",
+          "expiresAt": "2026-11-23T00:00:00.000Z",
+          "result": "pass"
+        },
+        {
+          "area": "protocol",
+          "url": "https://github.com/agentlogin/reference/blob/ef036c47f9132502b6b85fc31c6cf1a1773e0de0/trusted-providers/applications/sentfromai/issuer-checklist.md",
+          "observedAt": "2026-11-08T22:59:00.000Z",
+          "expiresAt": "2026-11-23T00:00:00.000Z",
+          "result": "pass"
+        },
+        {
+          "area": "owner_authority",
+          "url": "https://github.com/agentlogin/reference/blob/ef036c47f9132502b6b85fc31c6cf1a1773e0de0/trusted-providers/applications/sentfromai/README.md",
+          "observedAt": "2026-11-08T22:59:00.000Z",
+          "expiresAt": "2026-11-23T00:00:00.000Z",
+          "result": "pass"
+        },
+        {
+          "area": "lifecycle",
+          "url": "https://github.com/agentlogin/reference/blob/ef036c47f9132502b6b85fc31c6cf1a1773e0de0/trusted-providers/applications/sentfromai/issuer-checklist.md",
+          "observedAt": "2026-11-08T22:59:00.000Z",
+          "expiresAt": "2026-11-23T00:00:00.000Z",
+          "result": "pass"
+        },
+        {
+          "area": "operations",
+          "url": "https://github.com/agentlogin/reference/blob/ef036c47f9132502b6b85fc31c6cf1a1773e0de0/trusted-providers/applications/sentfromai/recovery-report.md",
+          "observedAt": "2026-11-08T22:59:00.000Z",
+          "expiresAt": "2026-11-23T00:00:00.000Z",
+          "result": "pass"
+        },
+        {
+          "area": "privacy",
+          "url": "https://github.com/agentlogin/reference/blob/ef036c47f9132502b6b85fc31c6cf1a1773e0de0/trusted-providers/applications/sentfromai/identity-data.md",
+          "observedAt": "2026-11-08T22:59:00.000Z",
+          "expiresAt": "2026-11-23T00:00:00.000Z",
+          "result": "pass"
+        }
+      ]
+    }
+  ]
+}
