@@ -2,9 +2,19 @@
   "version": 1,
   "programme": "agentlogin-trusted-providers",
   "profile": "agent-login-core-1.0-draft-0.2-direct-es256",
-  "status": "draft",
-  "revision": 1,
-  "issuedAt": "2026-11-06T00:00:00.000Z",
-  "expiresAt": "2026-11-07T00:00:00.000Z",
-  "providers": []
+  "status": "active",
+  "revision": 2,
+  "issuedAt": "2026-11-08T23:28:58.811Z",
+  "expiresAt": "2026-11-09T11:28:58.811Z",
+  "providers": [
+    {
+      "issuer": "https://identity.sentfrom.ai",
+      "handleDomains": [
+        "mail.sentfrom.ai"
+      ],
+      "specRevision": "536c5d15738f45a3c2115884a0a43cdd28b06dd3",
+      "reviewUrl": "https://github.com/agentlogin/reference/blob/928e47236987f51e241ff9957d4433289b3408da/trusted-providers/decisions/sentfromai-20261108.md",
+      "reviewExpiresAt": "2026-11-15T00:00:00.000Z"
+    }
+  ]
 }
