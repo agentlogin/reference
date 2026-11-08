@@ -1,0 +1,66 @@
+TAP version 13
+# (node:1201) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+# (Use `node --trace-warnings ...` to show where the warning was created)
+# Subtest: memory: a used-code replay with wrong PKCE preserves its token; a proven replay revokes it
+ok 1 - memory: a used-code replay with wrong PKCE preserves its token; a proven replay revokes it
+  ---
+  duration_ms: 155.751791
+  type: 'test'
+  ...
+# Subtest: memory: a used-code replay with wrong client preserves its token; a proven replay revokes it
+ok 2 - memory: a used-code replay with wrong client preserves its token; a proven replay revokes it
+  ---
+  duration_ms: 38.773459
+  type: 'test'
+  ...
+# Subtest: memory: a used-code replay with wrong redirect preserves its token; a proven replay revokes it
+ok 3 - memory: a used-code replay with wrong redirect preserves its token; a proven replay revokes it
+  ---
+  duration_ms: 26.488791
+  type: 'test'
+  ...
+# Subtest: sqlite: a used-code replay with wrong PKCE preserves its token; a proven replay revokes it
+ok 4 - sqlite: a used-code replay with wrong PKCE preserves its token; a proven replay revokes it
+  ---
+  duration_ms: 111.488542
+  type: 'test'
+  ...
+# Subtest: sqlite: a used-code replay with wrong client preserves its token; a proven replay revokes it
+ok 5 - sqlite: a used-code replay with wrong client preserves its token; a proven replay revokes it
+  ---
+  duration_ms: 83.707333
+  type: 'test'
+  ...
+# Subtest: sqlite: a used-code replay with wrong redirect preserves its token; a proven replay revokes it
+ok 6 - sqlite: a used-code replay with wrong redirect preserves its token; a proven replay revokes it
+  ---
+  duration_ms: 90.602583
+  type: 'test'
+  ...
+# Subtest: postgres: a used-code replay with wrong PKCE preserves its token; a proven replay revokes it
+ok 7 - postgres: a used-code replay with wrong PKCE preserves its token; a proven replay revokes it
+  ---
+  duration_ms: 946.470042
+  type: 'test'
+  ...
+# Subtest: postgres: a used-code replay with wrong client preserves its token; a proven replay revokes it
+ok 8 - postgres: a used-code replay with wrong client preserves its token; a proven replay revokes it
+  ---
+  duration_ms: 515.72225
+  type: 'test'
+  ...
+# Subtest: postgres: a used-code replay with wrong redirect preserves its token; a proven replay revokes it
+ok 9 - postgres: a used-code replay with wrong redirect preserves its token; a proven replay revokes it
+  ---
+  duration_ms: 416.325875
+  type: 'test'
+  ...
+1..9
+# tests 9
+# suites 0
+# pass 9
+# fail 0
+# cancelled 0
+# skipped 0
+# todo 0
+# duration_ms 4587.715791

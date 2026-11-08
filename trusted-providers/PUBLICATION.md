@@ -1,6 +1,6 @@
 # Publishing the programme draft
 
-**Status: draft publication only. No providers are approved.** Publishing the
+**This guide publishes only the historical draft.** Publishing the
 programme's documents does not activate its acceptance policy.
 
 ## Current publication
@@ -39,6 +39,14 @@ HTTP response alone does not establish admission, freshness or correct content.
 This draft can remain published after its historical expiry. It cannot enable
 sign-in. Do not add a renewal schedule that makes an unapproved programme appear
 operational.
+
+## Active publication
+
+The separate [active publisher](ACTIVE-PUBLICATION.md) implements staged,
+source-bound releases, renewal, suspension and recovery anchors. It remains
+inactive until both adoption and completed decision records exist. The
+[operator record](OPERATOR.md) identifies accountability and delegated authority.
+Do not deploy this draft-only builder over an active release.
 
 ## Before initial activation
 

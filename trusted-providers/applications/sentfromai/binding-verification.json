@@ -1,0 +1,574 @@
+{
+  "assessmentDate": "2026-11-08",
+  "issuer": "https://identity.sentfrom.ai",
+  "deployedImageDigest": "sha256:565902de80eca62f7708d43dd5a5165e0baafbd8797c73e09700482ac0f83aea",
+  "identitySource": "074175e59ae269be3135c4d865d7bca13dd34e73",
+  "referenceSource": "62c54330cca22a1ff0a61c4278431ca23457926d",
+  "rehearsalMailSource": "9924dd288560db86fa4ad97c543fa1abbf58b689",
+  "observationDate": "2026-11-08T22:18:26.794451+00:00",
+  "artifactManifestSha256": "fd8ccf3149dbfbf74b4ac029f9fc10ccfd44194dcdf9f06929bc107f43848794",
+  "artifactFilesVerified": 48,
+  "sourceManifestFilesVerified": 283,
+  "rehearsalInputsVerified": 10,
+  "recoveryResultSha256": "067c758093271adf36332c578cb0d7d935f05f7e15b29e354bc62ecaae46e374",
+  "recoveryObservedAt": "2026-11-06T22:14:36.135Z",
+  "independentAgentCheckpoints": 21,
+  "typescriptVersion": "5.9.3",
+  "sourceChecks": [
+    {
+      "package": "identity",
+      "path": "src/app.ts",
+      "sha256": "da4b5b7da868152587fff19d06b16774751889c01f23b1c0490fb4eac4f4ef46",
+      "matchesDeployedSource": true
+    },
+    {
+      "package": "identity",
+      "path": "src/bridge.ts",
+      "sha256": "9ee76bf8d4cf7bd845a74e5bf80519beb152ae85a79ca2220cf7ba461c02ec4b",
+      "matchesDeployedSource": true
+    },
+    {
+      "package": "identity",
+      "path": "src/config.ts",
+      "sha256": "5b8d1b0c1f8d7c4e4b42bc85bdbdb3c1aeebbe99e4dbd58fff8322ac507e5de7",
+      "matchesDeployedSource": true
+    },
+    {
+      "package": "identity",
+      "path": "src/database.ts",
+      "sha256": "4f9326dac746fca4fde59f0eee60fccdb7a851896e10acac2a4b332285105427",
+      "matchesDeployedSource": true
+    },
+    {
+      "package": "identity",
+      "path": "src/durable-schema.ts",
+      "sha256": "eaf7947e2b878577a2ca7f9c2ef6e858b47ef2ff9ce3861308d61adc6d619eb8",
+      "matchesDeployedSource": true
+    },
+    {
+      "package": "identity",
+      "path": "src/email-verification.ts",
+      "sha256": "4bbf991b570a7172b969c10c70b10d613de9fc39de004326113761ed8d925228",
+      "matchesDeployedSource": true
+    },
+    {
+      "package": "identity",
+      "path": "src/errors.ts",
+      "sha256": "a303ec1415cf1c32f23aa51fede1a70fe6e44e5012af1f45fd0b0660166b4cce",
+      "matchesDeployedSource": true
+    },
+    {
+      "package": "identity",
+      "path": "src/migrate.ts",
+      "sha256": "c407040a4bc7277d1fa0943967342aec9e4c59b7d43e5bb2459a33b55763a76d",
+      "matchesDeployedSource": true
+    },
+    {
+      "package": "identity",
+      "path": "src/owner-admin.ts",
+      "sha256": "bb1a8461417a50b592fa6493d5873e5d64557e72b4d848b61e6077aa6e9b28a4",
+      "matchesDeployedSource": true
+    },
+    {
+      "package": "identity",
+      "path": "src/owner-form-browser.ts",
+      "sha256": "cb3f5f56d7b29856b3e0b99921e5861e446be57af30acde406ec8a6778d74a6f",
+      "matchesDeployedSource": true
+    },
+    {
+      "package": "identity",
+      "path": "src/passkey-browser.ts",
+      "sha256": "80699aaf0d8b636309e81e63cd8df90133580b08f61dc5836114c45fb41e9872",
+      "matchesDeployedSource": true
+    },
+    {
+      "package": "identity",
+      "path": "src/passkeys.ts",
+      "sha256": "3f80de0cc7ed95387c9d03d7c074fb852c3b3bc9a8ea67ed8b4f647a261225db",
+      "matchesDeployedSource": true
+    },
+    {
+      "package": "identity",
+      "path": "src/readiness.ts",
+      "sha256": "a9f52ca0ffbcd88dab777a135db873ad1a5892b0156a016cb7f40467690ce06a",
+      "matchesDeployedSource": true
+    },
+    {
+      "package": "identity",
+      "path": "src/schema.ts",
+      "sha256": "b68e00d9f587c22ce78b7e88e6da87f4652668d4b3df5901185da1aa11007e52",
+      "matchesDeployedSource": true
+    },
+    {
+      "package": "identity",
+      "path": "src/security.ts",
+      "sha256": "3c60f1f11034a5f11d56e4a491feee4c776fc5b665337f6da5c436362bdf9800",
+      "matchesDeployedSource": true
+    },
+    {
+      "package": "identity",
+      "path": "src/server.ts",
+      "sha256": "43f1f17a2995d7d4e04bf499947724866d619d800d308825205960514609084b",
+      "matchesDeployedSource": true
+    },
+    {
+      "package": "identity",
+      "path": "src/shutdown.ts",
+      "sha256": "c1c9468e890bc4c0154f888d5a6ce7d5bd3c9d0b79bfa81314f456e4aa031531",
+      "matchesDeployedSource": true
+    },
+    {
+      "package": "identity",
+      "path": "src/signing-source.ts",
+      "sha256": "4b48db7ee65957c3115d8fcd1cd115b8b59b2d0a9d18110130a009b67677b784",
+      "matchesDeployedSource": true
+    },
+    {
+      "package": "identity",
+      "path": "src/store.ts",
+      "sha256": "70339288125611154d8a544d1c1cca370056b880362a601dbc1640957fa00e2e",
+      "matchesDeployedSource": true
+    },
+    {
+      "package": "issuer",
+      "path": "src/agents.ts",
+      "sha256": "51e49dedbc2991f1a00973e3e14c11db6b024b07e58ccd8669cea0f013ae4dd9",
+      "matchesDeployedSource": true
+    },
+    {
+      "package": "issuer",
+      "path": "src/app.ts",
+      "sha256": "52f63dbf152009012e48ac6b4933b0da1c555956a194e1d5f8c340c9a3e3eb4e",
+      "matchesDeployedSource": true
+    },
+    {
+      "package": "issuer",
+      "path": "src/clients.ts",
+      "sha256": "a9e75b1b309172f65d6d5e8a16b9f933438f9681b2febd4141c2f8112c175316",
+      "matchesDeployedSource": true
+    },
+    {
+      "package": "issuer",
+      "path": "src/constants.ts",
+      "sha256": "79241c1c3b6d79579dd59dadc168e7ad6944b9cf75185eb6792e839124f55904",
+      "matchesDeployedSource": true
+    },
+    {
+      "package": "issuer",
+      "path": "src/context.ts",
+      "sha256": "e363460c012c2b052087c4398e3b88271c340de4ab07eae68a3d45142a661c33",
+      "matchesDeployedSource": true
+    },
+    {
+      "package": "issuer",
+      "path": "src/errors.ts",
+      "sha256": "5ddd49678061085e635795c1c608534c5697232dfe6f15f90fdb56afc3ee587c",
+      "matchesDeployedSource": true
+    },
+    {
+      "package": "issuer",
+      "path": "src/index.ts",
+      "sha256": "9bc8085a23920a820dc91e4cdd8d9946e7df577595ebc5763800a6fad9a4580d",
+      "matchesDeployedSource": true
+    },
+    {
+      "package": "issuer",
+      "path": "src/owner-address.ts",
+      "sha256": "534872b07825d9cc39d892b43b665c16d35fbfb237e580213aa0c833b4e6a8c9",
+      "matchesDeployedSource": true
+    },
+    {
+      "package": "issuer",
+      "path": "src/safefetch.ts",
+      "sha256": "e4c157bc19090961069a016429573a48a83a7d6b520c50b3f509123cb2062dc8",
+      "matchesDeployedSource": true
+    },
+    {
+      "package": "issuer",
+      "path": "src/server.ts",
+      "sha256": "cf5dcb0f47cb1ca55d22b90f36ee0cc56657efb8eb9730f657ec318923d70430",
+      "matchesDeployedSource": true
+    },
+    {
+      "package": "issuer",
+      "path": "src/signing-configuration.ts",
+      "sha256": "29e4c18c629c18257c2c57dd82799e45b6ebe58f0417efae438de49406bab919",
+      "matchesDeployedSource": true
+    },
+    {
+      "package": "issuer",
+      "path": "src/signing-state.ts",
+      "sha256": "8978dbd4fc8b87ff43322df39d8243117e6eb4e81fe052342f0ebe06ed6314b5",
+      "matchesDeployedSource": true
+    },
+    {
+      "package": "issuer",
+      "path": "src/sqlite-store.ts",
+      "sha256": "86c491116ec69bc4dcc3fca5e677728dc875d2a989762ba34522045d4ad3d2a5",
+      "matchesDeployedSource": true
+    },
+    {
+      "package": "issuer",
+      "path": "src/state.ts",
+      "sha256": "3dbb15cae89ccabdb57f655ad19716e98308bf39a00beb1c818fe8d599cf6882",
+      "matchesDeployedSource": true
+    },
+    {
+      "package": "issuer",
+      "path": "src/store.ts",
+      "sha256": "db4bda1c46fb6b32dcd4e26e883dfc2e0611e84fb27d9b5ed7b7fa0e65778a0a",
+      "matchesDeployedSource": true
+    },
+    {
+      "package": "issuer",
+      "path": "src/tokens.ts",
+      "sha256": "9a053749967709dd932798140f6dc1214863a39eb93bcbd9243e457880f3de0c",
+      "matchesDeployedSource": true
+    },
+    {
+      "package": "issuer",
+      "path": "src/transactions.ts",
+      "sha256": "f3ce738bbc76b80f21b65de5781919bacb4c10e80c6f5e0457bca1276432636c",
+      "matchesDeployedSource": true
+    },
+    {
+      "package": "issuer",
+      "path": "src/util.ts",
+      "sha256": "bad3b6c15b57666d1a89f2dce0b25133619d7ca2f9a4183df7683db5ed28cf63",
+      "matchesDeployedSource": true
+    },
+    {
+      "package": "store-postgres",
+      "path": "src/index.ts",
+      "sha256": "98575b5a6b8ebbfe38e5ce937a858874aed82d03f10258c94a7ebc44dc54d50a",
+      "matchesDeployedSource": true
+    },
+    {
+      "package": "store-postgres",
+      "path": "src/migrate.ts",
+      "sha256": "3f2e28dddabed4a4b340da659bd5abec0ff3b9d5184d273bd67b045a0bf3f423",
+      "matchesDeployedSource": true
+    },
+    {
+      "package": "store-postgres",
+      "path": "src/postgres-store.ts",
+      "sha256": "9f4a6052fa5b84861b4c39f0fbaa7eabb0a236ba0e3196961091bbfa67d0819c",
+      "matchesDeployedSource": true
+    },
+    {
+      "package": "store-postgres",
+      "path": "src/runtime.ts",
+      "sha256": "6cb971cfb5685ad7d105e1b715e33eb6460189aa040922fbc85876cfb7633c99",
+      "matchesDeployedSource": true
+    },
+    {
+      "package": "store-postgres",
+      "path": "src/schema.ts",
+      "sha256": "723e4512546878ae1132ee2ec8aaa79d3e30dbf6c049ddd3e458132f6c4733bf",
+      "matchesDeployedSource": true
+    }
+  ],
+  "emissionChecks": [
+    {
+      "package": "identity",
+      "path": "dist/app.js",
+      "sourceEmissionSha256": "fa1c0182100fea52d158ed7ff5743e6f1957b6814cbd0c462d33636a74bf68a0",
+      "artifactSha256": "fa1c0182100fea52d158ed7ff5743e6f1957b6814cbd0c462d33636a74bf68a0",
+      "byteIdentical": true
+    },
+    {
+      "package": "identity",
+      "path": "dist/bridge.js",
+      "sourceEmissionSha256": "4a231452a0f4f9e66fe0c67c652c2185b43e71615fa3ee92a1930dbbb71659fc",
+      "artifactSha256": "4a231452a0f4f9e66fe0c67c652c2185b43e71615fa3ee92a1930dbbb71659fc",
+      "byteIdentical": true
+    },
+    {
+      "package": "identity",
+      "path": "dist/config.js",
+      "sourceEmissionSha256": "e92a13f1c069bbc4b49117674bf07033429a54e5feec4d77d8451b425751c889",
+      "artifactSha256": "e92a13f1c069bbc4b49117674bf07033429a54e5feec4d77d8451b425751c889",
+      "byteIdentical": true
+    },
+    {
+      "package": "identity",
+      "path": "dist/database.js",
+      "sourceEmissionSha256": "dc830c2a5c25dd890418d0dadba3419051e8e86636f66b8775df0fc2c4760825",
+      "artifactSha256": "dc830c2a5c25dd890418d0dadba3419051e8e86636f66b8775df0fc2c4760825",
+      "byteIdentical": true
+    },
+    {
+      "package": "identity",
+      "path": "dist/durable-schema.js",
+      "sourceEmissionSha256": "0a1e304badd402cba6c0609d2afad7c633c85f1d95a86a7e0ca222f008c22668",
+      "artifactSha256": "0a1e304badd402cba6c0609d2afad7c633c85f1d95a86a7e0ca222f008c22668",
+      "byteIdentical": true
+    },
+    {
+      "package": "identity",
+      "path": "dist/email-verification.js",
+      "sourceEmissionSha256": "adb3249fae0dcd4445be63dd72cfc2babe179fa2e0baa000d82d90f6677e392e",
+      "artifactSha256": "adb3249fae0dcd4445be63dd72cfc2babe179fa2e0baa000d82d90f6677e392e",
+      "byteIdentical": true
+    },
+    {
+      "package": "identity",
+      "path": "dist/errors.js",
+      "sourceEmissionSha256": "63d1e01c99102b3af5b530cbc1c40a175391b13ad82916dd61ba957ecfc7d058",
+      "artifactSha256": "63d1e01c99102b3af5b530cbc1c40a175391b13ad82916dd61ba957ecfc7d058",
+      "byteIdentical": true
+    },
+    {
+      "package": "identity",
+      "path": "dist/migrate.js",
+      "sourceEmissionSha256": "6bbb7e89611d2916afd37f4ef94bcb579c5ed92e502f9ef7b459ba487cc41b0c",
+      "artifactSha256": "6bbb7e89611d2916afd37f4ef94bcb579c5ed92e502f9ef7b459ba487cc41b0c",
+      "byteIdentical": true
+    },
+    {
+      "package": "identity",
+      "path": "dist/owner-admin.js",
+      "sourceEmissionSha256": "a25da01c038f8b85c4603965477f2cfe2657f0f03fc922de378bd14f58ced629",
+      "artifactSha256": "a25da01c038f8b85c4603965477f2cfe2657f0f03fc922de378bd14f58ced629",
+      "byteIdentical": true
+    },
+    {
+      "package": "identity",
+      "path": "dist/owner-form-browser.js",
+      "sourceEmissionSha256": "6aecbc4e01f5d3df460a9641e2b8c8ec1fc24450398e033b3085f6fd136e99e0",
+      "artifactSha256": "6aecbc4e01f5d3df460a9641e2b8c8ec1fc24450398e033b3085f6fd136e99e0",
+      "byteIdentical": true
+    },
+    {
+      "package": "identity",
+      "path": "dist/passkey-browser.js",
+      "sourceEmissionSha256": "80699aaf0d8b636309e81e63cd8df90133580b08f61dc5836114c45fb41e9872",
+      "artifactSha256": "80699aaf0d8b636309e81e63cd8df90133580b08f61dc5836114c45fb41e9872",
+      "byteIdentical": true
+    },
+    {
+      "package": "identity",
+      "path": "dist/passkeys.js",
+      "sourceEmissionSha256": "5c7d42c16fd53a77703adf385efa2e3333b2ee57a8c21e3ede6c989f961b27c9",
+      "artifactSha256": "5c7d42c16fd53a77703adf385efa2e3333b2ee57a8c21e3ede6c989f961b27c9",
+      "byteIdentical": true
+    },
+    {
+      "package": "identity",
+      "path": "dist/readiness.js",
+      "sourceEmissionSha256": "bc1dc3549809078cda953262d89f1b9f67f473f0a217faef1ade11edf4dcfa03",
+      "artifactSha256": "bc1dc3549809078cda953262d89f1b9f67f473f0a217faef1ade11edf4dcfa03",
+      "byteIdentical": true
+    },
+    {
+      "package": "identity",
+      "path": "dist/schema.js",
+      "sourceEmissionSha256": "a171d2ab2d6ce161da7df3a83622c194ee38277107864d97b65d32c01dbe9eb7",
+      "artifactSha256": "a171d2ab2d6ce161da7df3a83622c194ee38277107864d97b65d32c01dbe9eb7",
+      "byteIdentical": true
+    },
+    {
+      "package": "identity",
+      "path": "dist/security.js",
+      "sourceEmissionSha256": "6910c7b7137af890157ea00923a228b14e019a0255730c28da45a7229a429065",
+      "artifactSha256": "6910c7b7137af890157ea00923a228b14e019a0255730c28da45a7229a429065",
+      "byteIdentical": true
+    },
+    {
+      "package": "identity",
+      "path": "dist/server.js",
+      "sourceEmissionSha256": "3c2bbdc6d3edd8c77413bb72c9615bc7e0ddeb6a015902d9a14390500cea445b",
+      "artifactSha256": "3c2bbdc6d3edd8c77413bb72c9615bc7e0ddeb6a015902d9a14390500cea445b",
+      "byteIdentical": true
+    },
+    {
+      "package": "identity",
+      "path": "dist/shutdown.js",
+      "sourceEmissionSha256": "c4cc372715f17344a89ec8ab952f86e1fbd7c14ec89b36c4a4e3eff59e5f021f",
+      "artifactSha256": "c4cc372715f17344a89ec8ab952f86e1fbd7c14ec89b36c4a4e3eff59e5f021f",
+      "byteIdentical": true
+    },
+    {
+      "package": "identity",
+      "path": "dist/signing-source.js",
+      "sourceEmissionSha256": "3e61ae6575291a7b9343483de13821c3957e49de20a36bc08bed0cb224177d1c",
+      "artifactSha256": "3e61ae6575291a7b9343483de13821c3957e49de20a36bc08bed0cb224177d1c",
+      "byteIdentical": true
+    },
+    {
+      "package": "identity",
+      "path": "dist/store.js",
+      "sourceEmissionSha256": "384624bce669877b92f6161834efcf1065f8c082a8658bb87afb070eb34da81d",
+      "artifactSha256": "384624bce669877b92f6161834efcf1065f8c082a8658bb87afb070eb34da81d",
+      "byteIdentical": true
+    },
+    {
+      "package": "issuer",
+      "path": "dist/agents.js",
+      "sourceEmissionSha256": "067809e42afdcacb8e04baacc0f5995ee9455d7eb081b793367027e9789a44d2",
+      "artifactSha256": "067809e42afdcacb8e04baacc0f5995ee9455d7eb081b793367027e9789a44d2",
+      "byteIdentical": true
+    },
+    {
+      "package": "issuer",
+      "path": "dist/app.js",
+      "sourceEmissionSha256": "67ab4f2f3b869a986e3be666306f6a040f26e280fac768dd69fee7c9c111e080",
+      "artifactSha256": "67ab4f2f3b869a986e3be666306f6a040f26e280fac768dd69fee7c9c111e080",
+      "byteIdentical": true
+    },
+    {
+      "package": "issuer",
+      "path": "dist/clients.js",
+      "sourceEmissionSha256": "fb35a1b4a2478f25a0c0abdf04354e0e643f8378c73255ba0fc122e7a77da89e",
+      "artifactSha256": "fb35a1b4a2478f25a0c0abdf04354e0e643f8378c73255ba0fc122e7a77da89e",
+      "byteIdentical": true
+    },
+    {
+      "package": "issuer",
+      "path": "dist/constants.js",
+      "sourceEmissionSha256": "c1dfe5b5c6ea24e75a07044491ff0102ec7316a87f0a2edbae3bcd89eaded905",
+      "artifactSha256": "c1dfe5b5c6ea24e75a07044491ff0102ec7316a87f0a2edbae3bcd89eaded905",
+      "byteIdentical": true
+    },
+    {
+      "package": "issuer",
+      "path": "dist/context.js",
+      "sourceEmissionSha256": "d7768e31f9f96aac997a3ae84ade0022b46ccccc298301dc9d62877f9a4fd01d",
+      "artifactSha256": "d7768e31f9f96aac997a3ae84ade0022b46ccccc298301dc9d62877f9a4fd01d",
+      "byteIdentical": true
+    },
+    {
+      "package": "issuer",
+      "path": "dist/errors.js",
+      "sourceEmissionSha256": "aeabcc0663ab591954ef34354923d607d1bc1deb06a5739a5c33a7a969205713",
+      "artifactSha256": "aeabcc0663ab591954ef34354923d607d1bc1deb06a5739a5c33a7a969205713",
+      "byteIdentical": true
+    },
+    {
+      "package": "issuer",
+      "path": "dist/index.js",
+      "sourceEmissionSha256": "de065039fa1e6044890cd250ce9116cec6d087c2d790cb9ce065b7c2b897c3f3",
+      "artifactSha256": "de065039fa1e6044890cd250ce9116cec6d087c2d790cb9ce065b7c2b897c3f3",
+      "byteIdentical": true
+    },
+    {
+      "package": "issuer",
+      "path": "dist/owner-address.js",
+      "sourceEmissionSha256": "27ad876daddbf44005b1b7cec3fe0e5e100b242181093c8cd67fab3d70b9c9da",
+      "artifactSha256": "27ad876daddbf44005b1b7cec3fe0e5e100b242181093c8cd67fab3d70b9c9da",
+      "byteIdentical": true
+    },
+    {
+      "package": "issuer",
+      "path": "dist/safefetch.js",
+      "sourceEmissionSha256": "1144bcb1ae0c291365e782b1ff1eb1795c2b7adf6c0500c47b8b5443c4b0f97c",
+      "artifactSha256": "1144bcb1ae0c291365e782b1ff1eb1795c2b7adf6c0500c47b8b5443c4b0f97c",
+      "byteIdentical": true
+    },
+    {
+      "package": "issuer",
+      "path": "dist/server.js",
+      "sourceEmissionSha256": "8360da28f5c7ba11755d7d1311a5a25e877a36cc2de10e535a925206b6d3a02c",
+      "artifactSha256": "8360da28f5c7ba11755d7d1311a5a25e877a36cc2de10e535a925206b6d3a02c",
+      "byteIdentical": true
+    },
+    {
+      "package": "issuer",
+      "path": "dist/signing-configuration.js",
+      "sourceEmissionSha256": "a78765eb61dbbc06948c407cba3f6e3c4cf3a3fbd68ff69c25d4dff350e4deeb",
+      "artifactSha256": "a78765eb61dbbc06948c407cba3f6e3c4cf3a3fbd68ff69c25d4dff350e4deeb",
+      "byteIdentical": true
+    },
+    {
+      "package": "issuer",
+      "path": "dist/signing-state.js",
+      "sourceEmissionSha256": "988c2ec8dcefc62f2b107a0452c86dd4d30549dae69d65d2df0116c0b0435018",
+      "artifactSha256": "988c2ec8dcefc62f2b107a0452c86dd4d30549dae69d65d2df0116c0b0435018",
+      "byteIdentical": true
+    },
+    {
+      "package": "issuer",
+      "path": "dist/sqlite-store.js",
+      "sourceEmissionSha256": "ee9a5df86d29ce650821c356407c831469d822dbf4a8ea586438c6618d888db2",
+      "artifactSha256": "ee9a5df86d29ce650821c356407c831469d822dbf4a8ea586438c6618d888db2",
+      "byteIdentical": true
+    },
+    {
+      "package": "issuer",
+      "path": "dist/state.js",
+      "sourceEmissionSha256": "7ecef2fa7d879d2288f170fca5327166a76dd303548e97df1c4e3468fe5729a5",
+      "artifactSha256": "7ecef2fa7d879d2288f170fca5327166a76dd303548e97df1c4e3468fe5729a5",
+      "byteIdentical": true
+    },
+    {
+      "package": "issuer",
+      "path": "dist/store.js",
+      "sourceEmissionSha256": "1dccd2fe8dd7cd3e8f4faeeefe5bce62e55291bfaef02cff34840877b67e6398",
+      "artifactSha256": "1dccd2fe8dd7cd3e8f4faeeefe5bce62e55291bfaef02cff34840877b67e6398",
+      "byteIdentical": true
+    },
+    {
+      "package": "issuer",
+      "path": "dist/tokens.js",
+      "sourceEmissionSha256": "31640d4412ea0a50eec556789de6cd26ffbc4501d13c1b42979077a4206c6a51",
+      "artifactSha256": "31640d4412ea0a50eec556789de6cd26ffbc4501d13c1b42979077a4206c6a51",
+      "byteIdentical": true
+    },
+    {
+      "package": "issuer",
+      "path": "dist/transactions.js",
+      "sourceEmissionSha256": "1567ec9a0f42bb8de24ba4caf62605b40d7c93e5556779f94abb5974e42092e4",
+      "artifactSha256": "1567ec9a0f42bb8de24ba4caf62605b40d7c93e5556779f94abb5974e42092e4",
+      "byteIdentical": true
+    },
+    {
+      "package": "issuer",
+      "path": "dist/util.js",
+      "sourceEmissionSha256": "6c6258f264e1019582341e5d7f8d915a9ffa6b51f5fd40535887554d4465d7e4",
+      "artifactSha256": "6c6258f264e1019582341e5d7f8d915a9ffa6b51f5fd40535887554d4465d7e4",
+      "byteIdentical": true
+    },
+    {
+      "package": "store-postgres",
+      "path": "dist/index.js",
+      "sourceEmissionSha256": "16954937eb09068c519314e3488b0a20cb7dae5ffb04d553d7652e4a83a4cb68",
+      "artifactSha256": "16954937eb09068c519314e3488b0a20cb7dae5ffb04d553d7652e4a83a4cb68",
+      "byteIdentical": true
+    },
+    {
+      "package": "store-postgres",
+      "path": "dist/migrate.js",
+      "sourceEmissionSha256": "eda86e2a40eaeee14c891ac7b3c61f913171c7da9ee69be3ae8cfa4db68a1350",
+      "artifactSha256": "eda86e2a40eaeee14c891ac7b3c61f913171c7da9ee69be3ae8cfa4db68a1350",
+      "byteIdentical": true
+    },
+    {
+      "package": "store-postgres",
+      "path": "dist/postgres-store.js",
+      "sourceEmissionSha256": "0b885689d4c9c85188ef179f02e484ae091b5910a34da1668a6ea2a2911d715f",
+      "artifactSha256": "0b885689d4c9c85188ef179f02e484ae091b5910a34da1668a6ea2a2911d715f",
+      "byteIdentical": true
+    },
+    {
+      "package": "store-postgres",
+      "path": "dist/runtime.js",
+      "sourceEmissionSha256": "3a41c598c60efa6267f9511daa7ca6e4d8ca454ec4dee2cc26593e025c07a6bc",
+      "artifactSha256": "3a41c598c60efa6267f9511daa7ca6e4d8ca454ec4dee2cc26593e025c07a6bc",
+      "byteIdentical": true
+    },
+    {
+      "package": "store-postgres",
+      "path": "dist/schema.js",
+      "sourceEmissionSha256": "1577787ddf8be5e62798be1d5c45a1731bccb10ed50090a9f5591cbb2297c2e4",
+      "artifactSha256": "1577787ddf8be5e62798be1d5c45a1731bccb10ed50090a9f5591cbb2297c2e4",
+      "byteIdentical": true
+    }
+  ],
+  "nonRuntimeIdentityDelta": [
+    "packages/identity/scripts/provision-roles.md",
+    "packages/identity/scripts/provision-roles.mjs"
+  ],
+  "newTestsExecuted": false,
+  "emissionOnlyNoRuntimeExecuted": true,
+  "productionAccess": false
+}
