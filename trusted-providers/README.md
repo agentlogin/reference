@@ -1,6 +1,7 @@
 # Agent Login trusted providers
 
-**Draft programme. No provider is approved by this document.**
+**Programme rules. This document does not itself approve a provider.**
+Check the [published programme status](https://agentlogin.github.io/reference/trusted-providers/) and its current unexpired policy.
 
 A website can choose the named Agent Login provider policy once and receive its
 reviewed additions, suspensions and removals through policy updates. Individual
@@ -13,9 +14,9 @@ subscribes a website to this programme. The reference implementation has no
 implicit default registry, consistent with the specification's
 [governance](https://github.com/agentlogin/spec/blob/main/GOVERNANCE.md).
 
-The programme is not operational until its accountable operator, adopted policy,
+An operational programme requires its accountable operator, adopted policy,
 authenticated publication and recovery arrangements, and first completed provider
-decision are published. Reviews and admission decisions may be automated under
+decision to be published. Reviews and admission decisions may be automated under
 the operator's published delegation. Automated or affiliated review does not
 establish independent endorsement.
 
@@ -38,7 +39,8 @@ button.
 
 The existing [participant catalog](../catalogs/README.md) is a discovery directory,
 not this approval policy. Its `candidate` and `reviewed` labels do not grant
-membership. SentFrom.ai and AgentID by AgentMail remain catalog candidates. Hark,
+membership. Check the programme feed for current admission rather than inferring it
+from a catalog label. AgentID by AgentMail is outside this Core profile. Hark,
 Muse and other prospective providers receive no status merely by being named in
 a discussion. SentFrom.ai receives the same review as any other applicant.
 
@@ -191,11 +193,11 @@ discovered issuer and its handle domain must be approved. The bound requested
 handle is preserved for live checks even when the granted scopes omit `email`.
 Domain discovery and token validation still apply.
 
-The [draft feed](v1.json) accepts no providers. It is not an active approval
-policy, so this configuration cannot yet be used as a
-working public sign-in service. Keep an existing explicitly configured issuer
-policy until the programme is operational; do not configure an automatic fallback
-that bypasses this policy on errors.
+The checked-in [historical draft](v1.json) accepts no providers. The SDK reads the
+fixed published feed below, whose current status and expiry determine acceptance.
+Until an active release is available, keep an existing explicitly configured
+issuer policy; do not configure an automatic fallback that bypasses this policy
+on errors.
 
 ## Publication and consumption
 
@@ -259,9 +261,9 @@ The website should monitor refresh/expiry failures and record applied revisions
 without unnecessarily logging tokens, handles or Owner data. Its local issuer
 blocks take precedence.
 
-The programme remains a draft: no production admission, operational publishing
-schedule or accountable operator roster is asserted here. Repository test fixtures
-are not approvals. Activation requires completed decision records, separately
-exercised publication and recovery controls, and tests for malformed and expired
-releases, partial updates, concurrent refresh, rollback, cold starts, restarts, and
-a suspended issuer's in-flight callback.
+The [operator record](OPERATOR.md), [publication procedure](ACTIVE-PUBLICATION.md)
+and completed decision history identify the operational scope of an active
+release. Repository test fixtures are not approvals. Activation requires completed
+decisions and separately exercised publication and recovery controls. Tests cover
+malformed and expired releases, partial updates, concurrent refresh, rollback,
+cold starts, restarts and a suspended issuer's in-flight callback.
