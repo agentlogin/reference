@@ -8,7 +8,7 @@ Use Node.js 22.23.4 or a supported later release. Commands below target this pac
 `latest` is not the beta distribution channel.
 
 ```bash
-npm install -g agentlogin@0.2.0-beta.3
+npm install -g agentlogin@0.2.0-beta.4
 
 # once: enroll a key for your handle with your Owner Credential (or a Delegated Credential)
 export AGENTLOGIN_CREDENTIAL=...   # or --credential-file; keep credentials out of command lines

@@ -11,23 +11,23 @@ It is an implementation, not a conformance certification. No provider is preferr
 
 ## Install and configure
 
-The `fingerprint` enrollment output documented below is pending the next package
-release; published beta.2 and beta.3 helpers do not include it. Existing coordinated
-beta.2 SentFrom companion installations remain supported. Do not change their
-exact peer versions until the matching companion release is available.
+The `fingerprint` enrollment output documented below is prepared for beta.4;
+published beta.2 and beta.3 helpers do not include it. Existing coordinated beta.2
+SentFrom companion installations remain supported. Upgrade to the matching
+`sentfromai-mcp@0.5.0-beta.3` only after both releases are verified as public.
 
 Use Node.js 22.23.4 or a supported later release. Check the [release status](https://github.com/agentlogin/reference/blob/main/docs/npm-release.md) before installing this package version,
-`0.2.0-beta.3`, explicitly, without selecting the `latest` tag:
+`0.2.0-beta.4`, explicitly, without selecting the `latest` tag:
 
 ```sh
-npm install --save-exact @agentlogin/mcp@0.2.0-beta.3
+npm install --save-exact @agentlogin/mcp@0.2.0-beta.4
 ```
 
 For development or release rehearsal, install the matching locally packed
 `agentlogin` and `@agentlogin/mcp` tarballs together. A build does not publish them:
 
 ```sh
-npm install /absolute/artifacts/agentlogin-0.2.0-beta.3.tgz /absolute/artifacts/agentlogin-mcp-0.2.0-beta.3.tgz
+npm install /absolute/artifacts/agentlogin-0.2.0-beta.4.tgz /absolute/artifacts/agentlogin-mcp-0.2.0-beta.4.tgz
 ```
 
 Copy [the example configuration](examples/config.json), replace the reserved example
