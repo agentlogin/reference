@@ -62,6 +62,34 @@ Record an actual previous-image rehearsal before describing production rollback 
 
 ## Monitoring and operational owners
 
+The [SentFrom monitor plan](monitor-plan.json) lists the exact public endpoints and
+the existing five-minute free-plan baseline. It is a prepared configuration, not
+proof of monitors or delivery. Reconcile existing monitors by URL before adding
+them, read back their alert contacts and settings, and test a dedicated synthetic
+DOWN/UP monitor without interrupting production. Keep the one-minute target below
+distinct from this slower interim configuration.
+
+For the deployed Workspace, setting
+`PROVIDER_POLICY_MONITOR_HANDLE=monitor@mail.sentfrom.ai` enables the optional
+`GET /health/provider-policy` endpoint. It uses the actual trusted-policy consumer
+against the fixed programme feed and exact configured Issuer/domain, and returns
+503 two hours before the feed or that provider's review expires. The handle is
+only a domain probe: no mailbox is created, discovered or signed in. A stalled
+publisher cannot keep this check healthy by leaving an expired JSON file online.
+Responses contain only `ready` or `unavailable`, set `Cache-Control: no-store`,
+and make no database writes. Upstream reads are bounded and coalesced; a successful
+cache never crosses its warning deadline. This does not change login acceptance
+or the platform's `/readyz` deployment gate.
+
+An external monitor must check this endpoint and deliver the alert. Hosting the
+probe in Workspace means a Workspace outage also alarms; it is not independent
+of that application. Its consumer retains process-local rollback protection and
+the documented publication/CDN freshness limits. Consumer caching plus the probe's
+cache can delay a non-expiry change by up to 90 seconds before external polling
+and CDN delays; the recorded absolute expiry-warning deadline still bounds the
+healthy cache. GitHub's existing expiry job is
+additional evidence, not a substitute for the external monitor or delivery test.
+
 Run the public probe from an independent host, through the same public HTTPS routes as users:
 
 ```sh
