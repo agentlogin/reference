@@ -7,12 +7,12 @@ export function privateDirectory(dir: string) {
   const st = lstatSync(dir);
   if (!st.isDirectory() || st.isSymbolicLink() || (typeof process.getuid === 'function' && (st.uid !== process.getuid() || (st.mode & 0o077) !== 0))) throw new Error('State directory must be owned by you with mode 0700');
 }
-export function readState(file: string): unknown {
+export function readState(file: string, maxBytes = 64 * 1024): unknown {
   if (!existsSync(file)) return undefined;
   const fd = openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW);
   try {
     const st = fstatSync(fd);
-    if (!st.isFile() || st.size > 64 * 1024 || (typeof process.getuid === 'function' && (st.uid !== process.getuid() || (st.mode & 0o077) !== 0))) throw new Error('Invalid private state file');
+    if (!st.isFile() || st.size > maxBytes || (typeof process.getuid === 'function' && (st.uid !== process.getuid() || (st.mode & 0o077) !== 0))) throw new Error('Invalid private state file');
     return JSON.parse(readFileSync(fd, 'utf8'));
   } finally { closeSync(fd); }
 }

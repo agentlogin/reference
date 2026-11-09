@@ -12,6 +12,11 @@ For requested enrollment, call `agentlogin_enroll`. Show an `awaiting_owner`
 approval link only to the operator in the existing trusted conversation. Let the
 human authenticate and approve through their independent control channel. Never
 read their mailbox to obtain approval, recover their account, or enroll their factor.
+Show the full returned `fingerprint` alongside the configured agent handle so the
+human can compare it with the agent key on the approval page. It is the public
+SHA-256 JWK thumbprint (`kid`), not the human passkey fingerprint. If the initial
+result is still `starting`, wait for status to include it; never read private key
+files to fill in missing tool output.
 Poll enrollment status no faster than every five seconds while `polling` is true.
 When `polling` is false, stop polling. If `resumable` is true, explicitly call
 `agentlogin_enroll` when ready to check the same saved request again. Stop on

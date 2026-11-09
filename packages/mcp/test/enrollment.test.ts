@@ -10,7 +10,7 @@ import { createIssuer } from '../../issuer/src/index.js';
 import { EnrollmentRuntime } from '../src/enrollment.js';
 import { parseConfig } from '../src/config.js';
 import { FileKeystore } from 'agentlogin';
-import { calculateJwkThumbprint, importJWK, jwtVerify } from 'jose';
+import { calculateJwkThumbprint, exportJWK, generateKeyPair, importJWK, jwtVerify } from 'jose';
 import { writeState } from '../src/private-state.js';
 
 async function freePort() { const server = http.createServer(); await new Promise<void>((r) => server.listen(0, '127.0.0.1', r)); const port = (server.address() as AddressInfo).port; await new Promise<void>((r) => server.close(() => r())); return port; }
@@ -64,8 +64,10 @@ test('broker enrollment proves the local key at the actual issuer and reconciles
     const stored = new FileKeystore(join(dir, 'keys.json'));
     assert.equal((await stored.list())[0]?.status, 'pending');
     const keyBefore = (await stored.list())[0]!.kid;
+    assert.equal(uncertain.fingerprint, keyBefore);
     const second = new EnrollmentRuntime(config, {}); second.start('scout');
-    assert.equal((await wait(second)).status, 'active');
+    const completed = await wait(second);
+    assert.equal(completed.status, 'active'); assert.equal(completed.fingerprint, keyBefore);
     assert.equal((await stored.list())[0]?.kid, keyBefore);
     assert.equal((await stored.list())[0]?.status, 'active');
     assert.equal(creations, 1); assert.equal(proofs, 1);
@@ -139,7 +141,8 @@ test('local polling pauses, restart reports the saved request without network, a
   try {
     const first = f.runtime(true); first.start('scout');
     const paused = await wait(first);
-    assert.deepEqual(paused, { identity: 'scout', status: 'awaiting_owner', polling: false, resumable: true, approvalUrl: f.state.approvalUrl, expiresAt: f.expiresAt });
+    const fingerprint = await calculateJwkThumbprint(f.state.publicJwk, 'sha256');
+    assert.deepEqual(paused, { identity: 'scout', status: 'awaiting_owner', polling: false, resumable: true, fingerprint, approvalUrl: f.state.approvalUrl, expiresAt: f.expiresAt });
     assert.equal(f.state.polls, 2, 'the helper stops after its ten-second local budget instead of polling for seven days');
     const store = new FileKeystore(join(f.dir, 'keys.json'));
     const original = (await store.list())[0]!;
@@ -147,14 +150,18 @@ test('local polling pauses, restart reports the saved request without network, a
     const restarted = f.runtime();
     assert.deepEqual(restarted.status('scout'), paused);
     assert.equal(f.state.polls, 2, 'status after restart is local and read-only');
-    f.state.status = 'approved'; restarted.start('scout');
+    f.state.status = 'approved'; assert.equal(restarted.start('scout').fingerprint, fingerprint);
     const result = await wait(restarted);
     assert.equal(result.status, 'active'); assert.equal(result.resumable, false);
+    assert.equal(result.fingerprint, fingerprint);
     assert.equal(f.state.creations, 1); assert.equal(f.state.proofs.length, 1);
     assert.equal((await store.list())[0]!.kid, original.kid);
     assert.equal((await store.list())[0]!.status, 'active');
     assert.equal(f.runtime().status('scout').status, 'active', 'completion survives another restart');
-    assert.doesNotMatch(JSON.stringify([paused, result]), /PRIVATE_|privateJwk|proof_url|challenge/);
+    assert.equal(f.runtime().status('scout').fingerprint, fingerprint);
+    const publicOutput = JSON.stringify([paused, result]);
+    assert.doesNotMatch(publicOutput, /PRIVATE_|privateJwk|publicJwk|proof_url|challenge/);
+    assert.ok(!publicOutput.includes(original.privateJwk.d!));
   } finally { await f.close(); }
 });
 
@@ -170,6 +177,7 @@ test('seven-day expiry stays final across resumes and never replaces the pending
     assert.equal(resumed.start('scout').status, 'expired');
     assert.equal(resumed.status('scout').resumable, false);
     assert.equal(resumed.status('scout').approvalUrl, undefined);
+    assert.equal(resumed.status('scout').fingerprint, original.kid);
     assert.equal(f.state.creations, 1); assert.equal(f.state.polls, 2);
     assert.deepEqual(await store.list(), [original]);
   } finally { await f.close(); }
@@ -181,6 +189,7 @@ test('denial persists and does not silently retry enrollment', async () => {
     f.state.status = 'denied'; const first = f.runtime(true); first.start('scout');
     assert.equal((await wait(first)).status, 'denied');
     assert.equal(f.runtime().start('scout').status, 'denied');
+    assert.equal(f.runtime().status('scout').fingerprint, await calculateJwkThumbprint(f.state.publicJwk));
     assert.equal(f.state.creations, 1); assert.equal(f.state.polls, 1);
   } finally { await f.close(); }
 });
@@ -257,7 +266,69 @@ test('approval for another key or proof endpoint is rejected without signing', a
       const result = await wait(runtime);
       assert.equal(result.status, 'failed');
       assert.equal(result.error, wrongKey ? 'enrollment_mismatch' : 'enrollment_response_invalid');
+      assert.equal(result.fingerprint, await calculateJwkThumbprint(f.state.publicJwk));
       assert.deepEqual(f.state.proofs, []);
     } finally { await f.close(); }
   }
+});
+
+test('status never displays an unbound saved identifier as a public fingerprint', async () => {
+  const f = await brokerFixture();
+  try {
+    const first = f.runtime(true); first.start('scout'); await wait(first);
+    const saved = f.saved();
+    const keyFile = join(f.dir, 'keys.json');
+    const original = JSON.parse(readFileSync(keyFile, 'utf8'));
+    const before = f.state.polls;
+    for (const replacement of [
+      [],
+      [{ ...original[0], handle: 'other@example.com' }],
+      [{ ...original[0], issuer: 'https://other.example' }],
+      [{ ...original[0], publicJwk: { ...original[0].publicJwk, x: 'A'.repeat(43) } }],
+      [{ ...original[0], publicJwk: { ...original[0].publicJwk, d: 'PRIVATE_VALUE' } }],
+      [original[0], original[0]],
+    ]) {
+      writeState(keyFile, replacement);
+      assert.throws(() => f.runtime().status('scout'), /saved (?:enrollment|public|key)/i);
+      assert.throws(() => f.runtime().start('scout'));
+    }
+    writeState(keyFile, original);
+    writeState(saved.file, { ...saved.value, kid: 'PRIVATE_VALUE_DO_NOT_ECHO' });
+    assert.throws(() => f.runtime().status('scout'), error => error instanceof Error && !error.message.includes('PRIVATE_VALUE'));
+    assert.equal(f.state.polls, before, 'invalid local records cannot trigger a broker poll');
+    assert.equal(f.state.creations, 1);
+  } finally { await f.close(); }
+});
+
+test('an already active local key reports its fingerprint without creating another enrollment', async () => {
+  const f = await brokerFixture();
+  try {
+    const first = f.runtime(true); first.start('scout'); await wait(first);
+    const store = new FileKeystore(join(f.dir, 'keys.json'));
+    const key = (await store.list())[0]!;
+    await store.put({ ...key, status: 'active', expiresAt: f.expiresAt });
+    rmSync(join(f.dir, 'enrollments'), { recursive: true });
+    const resumed = f.runtime(); resumed.start('scout');
+    const result = await wait(resumed);
+    assert.equal(result.status, 'active'); assert.equal(result.fingerprint, key.kid);
+    assert.equal(f.state.creations, 1);
+    assert.equal(f.state.polls, 2);
+  } finally { await f.close(); }
+});
+
+test('fingerprint status tolerates a normal key history larger than an individual task record', async () => {
+  const f = await brokerFixture();
+  try {
+    const runtime = f.runtime(true); runtime.start('scout'); const original = await wait(runtime);
+    const path = join(f.dir, 'keys.json'), keys = JSON.parse(readFileSync(path, 'utf8'));
+    for (let n = 0; n < 200; n++) {
+      const pair = await generateKeyPair('ES256', { extractable: true });
+      const publicJwk = await exportJWK(pair.publicKey), privateJwk = await exportJWK(pair.privateKey);
+      keys.push({ ...keys[0], publicJwk, privateJwk, kid: await calculateJwkThumbprint(publicJwk), status: 'revoked' });
+    }
+    writeState(path, keys);
+    assert.ok(readFileSync(path).byteLength > 64 * 1024);
+    assert.equal(f.runtime().status('scout').fingerprint, original.fingerprint);
+    assert.equal(f.state.polls, 2);
+  } finally { await f.close(); }
 });

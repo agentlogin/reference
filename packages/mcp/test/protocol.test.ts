@@ -4,6 +4,10 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
+import { createHash } from 'node:crypto';
+import { calculateJwkThumbprint, exportJWK, generateKeyPair } from 'jose';
+import { FileKeystore } from 'agentlogin';
+import { writeState } from '../src/private-state.js';
 import { Client } from '@modelcontextprotocol/client';
 import { StdioClientTransport } from '@modelcontextprotocol/client/stdio';
 
@@ -11,7 +15,20 @@ for (const mode of ['legacy', { pin: '2026-07-28' }] as const) {
   test(`real stdio MCP client lists, calls and validates tools (${typeof mode === 'string' ? mode : mode.pin})`, async () => {
     const dir = mkdtempSync(join(tmpdir(), 'agentlogin-mcp-wire-'));
     const config = join(dir, 'config.json');
-    writeFileSync(config, JSON.stringify({ version: 1, stateDirectory: join(dir, 'private'), identities: { scout: { handle: 'scout@example.com' } }, applications: {} }), { mode: 0o600 });
+    const stateDirectory = join(dir, 'private');
+    const issuer = 'https://issuer.example';
+    const endpoint = `${issuer}/identity/enrollment-requests`;
+    writeFileSync(config, JSON.stringify({ version: 1, stateDirectory, identities: { scout: { handle: 'scout@example.com', issuer, enrollmentEndpoint: endpoint } }, applications: {} }), { mode: 0o600 });
+    const pair = await generateKeyPair('ES256', { extractable: true });
+    const publicJwk = await exportJWK(pair.publicKey), privateJwk = await exportJWK(pair.privateKey);
+    const fingerprint = await calculateJwkThumbprint(publicJwk, 'sha256');
+    await new FileKeystore(join(stateDirectory, 'keys.json')).put({ kid: fingerprint, handle: 'scout@example.com', issuer, publicJwk, privateJwk, status: 'pending', createdAt: Math.floor(Date.now() / 1000) });
+    const requestId = 'request_public_fingerprint';
+    const pollingToken = 'PRIVATE_POLL_TOKEN_DO_NOT_OUTPUT';
+    writeState(join(stateDirectory, 'enrollments', `${createHash('sha256').update('scout').digest('hex')}.json`), {
+      requestId, token: pollingToken, approvalUrl: `${endpoint}/${requestId}/approve`, expiresAt: Math.floor(Date.now() / 1000) + 600,
+      kid: fingerprint, handle: 'scout@example.com', issuer, endpoint,
+    });
     const transport = new StdioClientTransport({ command: process.execPath, args: [fileURLToPath(new URL('../bin/agentlogin-mcp.js', import.meta.url)), '--config', config], stderr: 'pipe' });
     let stderr = ''; transport.stderr?.on('data', (v) => { stderr += v.toString(); });
     const client = new Client({ name: 'agentlogin-mcp-test', version: '1.0.0' }, { versionNegotiation: { mode } });
@@ -25,6 +42,12 @@ for (const mode of ['legacy', { pin: '2026-07-28' }] as const) {
       assert.equal(result.isError, undefined);
       assert.match(JSON.stringify(result), /scout@example.com/);
       assert.doesNotMatch(JSON.stringify(result), /keys.json|privateJwk|polling_token/);
+      const enrollment = await client.callTool({ name: 'agentlogin_enrollment_status', arguments: { identity: 'scout' } });
+      assert.equal(enrollment.isError, undefined);
+      assert.equal((enrollment.structuredContent as { fingerprint?: string }).fingerprint, fingerprint);
+      assert.doesNotMatch(JSON.stringify(enrollment), /privateJwk|publicJwk|keys.json|token/);
+      assert.ok(!JSON.stringify(enrollment).includes(pollingToken));
+      assert.ok(!JSON.stringify(enrollment).includes(privateJwk.d!));
       const invalid = await client.callTool({ name: 'agentlogin_sign_in', arguments: { identity: 'scout', application: 'notes', credential: 'DO_NOT_ACCEPT' } });
       assert.equal(invalid.isError, true);
       const missing = await client.callTool({ name: 'agentlogin_sign_in', arguments: { identity: 'scout', application: 'notes' } });

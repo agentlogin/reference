@@ -13,7 +13,18 @@ const recordSchema = z.object({
   outcome: z.enum(['active', 'denied', 'expired']).optional(),
 }).strict();
 type EnrollmentRecord = z.infer<typeof recordSchema>;
-type Progress = { identity: string; status: 'not_started' | 'starting' | 'awaiting_owner' | 'proving' | 'active' | 'denied' | 'expired' | 'failed'; polling: boolean; resumable: boolean; approvalUrl?: string; expiresAt?: number; error?: string };
+type Progress = { identity: string; status: 'not_started' | 'starting' | 'awaiting_owner' | 'proving' | 'active' | 'denied' | 'expired' | 'failed'; polling: boolean; resumable: boolean; fingerprint?: string; approvalUrl?: string; expiresAt?: number; error?: string };
+
+/** Core 7.1 / RFC 7638: expose only the public SHA-256 thumbprint, never key material. */
+function publicFingerprint(key: StoredKey): string {
+  const jwk = key.publicJwk;
+  if (!jwk || jwk.kty !== 'EC' || jwk.crv !== 'P-256' || Object.keys(jwk).some((field) => !['kty', 'crv', 'x', 'y'].includes(field)) ||
+      ![jwk.x, jwk.y].every((coordinate) => typeof coordinate === 'string' && /^[A-Za-z0-9_-]{43}$/.test(coordinate) && Buffer.from(coordinate, 'base64url').toString('base64url') === coordinate))
+    throw new ToolError('enrollment_mismatch', 'The saved public key is invalid. Resolve the saved enrollment before continuing.');
+  const fingerprint = createHash('sha256').update(JSON.stringify({ crv: jwk.crv, kty: jwk.kty, x: jwk.x, y: jwk.y })).digest('base64url');
+  if (fingerprint !== key.kid) throw new ToolError('enrollment_mismatch', 'The saved key identifier does not match its public key.');
+  return fingerprint;
+}
 export interface EnrollmentRuntimeOptions {
   /** Clock and scheduler injection for deterministic deadline tests. */
   now?: () => number;
@@ -59,6 +70,17 @@ export class EnrollmentRuntime {
       throw new ToolError('enrollment_response_invalid', 'The provider returned an unexpected approval address.');
     return approval.href;
   }
+  private savedFingerprint(record: EnrollmentRecord): string {
+    // The keystore contains many identities and old keys, unlike an individual
+    // task record. Keep its read bounded without imposing the task's 64-KiB cap.
+    const keys = readState(join(this.config.stateDirectory, 'keys.json'), 8 * 1024 * 1024);
+    if (!Array.isArray(keys)) throw new ToolError('enrollment_mismatch', 'The saved enrollment key is unavailable.');
+    const matching = keys.filter((key): key is StoredKey => key !== null && typeof key === 'object' && key.kid === record.kid);
+    const key = matching.length === 1 ? matching[0] : undefined;
+    if (!key || key.handle !== record.handle || key.issuer !== record.issuer || key.status === 'revoked')
+      throw new ToolError('enrollment_mismatch', 'The saved enrollment key is unavailable. Do not create a replacement automatically.');
+    return publicFingerprint(key);
+  }
   status(identityId: string): Progress {
     const identity = this.identity(identityId);
     const current = this.running.get(identityId);
@@ -66,7 +88,7 @@ export class EnrollmentRuntime {
     const record = this.saved(identityId, identity);
     if (!record) return current ? { ...current } : { identity: identityId, status: 'not_started', polling: false, resumable: false };
     const status = record.outcome ?? (this.now() >= record.expiresAt * 1000 ? 'expired' : current?.status === 'failed' ? 'failed' : 'awaiting_owner');
-    return { identity: identityId, status, polling: false, resumable: status === 'awaiting_owner' || status === 'failed',
+    return { identity: identityId, status, polling: false, resumable: status === 'awaiting_owner' || status === 'failed', fingerprint: this.savedFingerprint(record),
       ...(status === 'awaiting_owner' ? { approvalUrl: record.approvalUrl } : {}), expiresAt: record.expiresAt,
       ...(status === 'failed' && current?.error ? { error: current.error } : {}) };
   }
@@ -108,8 +130,10 @@ export class EnrollmentRuntime {
       if (!key || key.handle !== identity.handle || key.issuer !== issuer || key.status === 'revoked') throw new ToolError('enrollment_mismatch', 'Saved enrollment key is unavailable. Do not create a replacement automatically.');
     } else {
       const keys = (await store.list(identity.handle)).filter((k) => k.issuer === issuer);
-      if (keys.some((k) => k.status === 'active' && (!k.expiresAt || k.expiresAt > this.now() / 1000))) { progress.status = 'active'; return; }
+      const active = keys.find((k) => k.status === 'active' && (!k.expiresAt || k.expiresAt > this.now() / 1000));
+      if (active) { progress.fingerprint = publicFingerprint(active); progress.status = 'active'; return; }
       key = keys.find((k) => k.status === 'pending') ?? await client.generateKey('Agent Login local helper');
+      progress.fingerprint = publicFingerprint(key);
       const token = identity.enrollmentCredentialEnv ? this.env[identity.enrollmentCredentialEnv] : undefined;
       if (!token) throw new ToolError('enrollment_credential_missing', 'Configure the provider API credential through the host secret configuration.');
       const response = await this.json(endpoint.href, { method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json', accept: 'application/json' }, body: JSON.stringify({ handle: identity.handle, public_jwk: key.publicJwk, name: key.name }) }, deadline);
@@ -119,6 +143,7 @@ export class EnrollmentRuntime {
       const approvalUrl = this.approvalUrl(parsed.approval_url, endpoint, parsed.request_id);
       record = { requestId: parsed.request_id, token: parsed.polling_token, approvalUrl, expiresAt: parsed.expires_at, kid: key.kid, handle: identity.handle, issuer, endpoint: endpoint.href };
     }
+    progress.fingerprint = publicFingerprint(key);
     writeState(filename, record);
     progress.approvalUrl = record.approvalUrl; progress.expiresAt = record.expiresAt; progress.status = 'awaiting_owner';
     const finish = (outcome: 'active' | 'denied' | 'expired') => {
