@@ -62,6 +62,68 @@
           "result": "pass"
         }
       ]
+    },
+    {
+      "id": "sentfromai-20261109-renew",
+      "action": "renew",
+      "issuer": "https://identity.sentfrom.ai",
+      "decidedAt": "2026-11-09T23:55:04.528Z",
+      "reviewUrl": "https://github.com/agentlogin/reference/blob/79e4e202d6af7c6f286573e258ce5c568e4cf6aa/trusted-providers/decisions/sentfromai-20261109-renew.md",
+      "authority": "sentfromai-programme-maintainers",
+      "method": "Codex-assisted scoped reassessment with separate agent review, fresh human/device acceptance and deployment readback; historical evidence dates retained",
+      "reason": "Renew unchanged invited-Owner issuer scope after fresh account and live application acceptance, current source/domain/lifecycle reassessment, and explicit client-availability and unfinished launch-operation limits.",
+      "supersedes": "sentfromai-20261108-admit",
+      "handleDomains": [
+        "mail.sentfrom.ai"
+      ],
+      "specRevision": "536c5d15738f45a3c2115884a0a43cdd28b06dd3",
+      "expiresAt": "2026-11-17T00:00:00.000Z",
+      "affiliations": "The operator also operates SentFromAI, the reference implementation and Agent Tasks. This is affiliated self-review, not independent organisational endorsement.",
+      "sourceRevision": "074175e59ae269be3135c4d865d7bca13dd34e73",
+      "evidence": [
+        {
+          "area": "operator",
+          "url": "https://github.com/agentlogin/reference/blob/ef036c47f9132502b6b85fc31c6cf1a1773e0de0/trusted-providers/applications/sentfromai/README.md",
+          "observedAt": "2026-11-08T22:59:00.000Z",
+          "expiresAt": "2026-11-23T00:00:00.000Z",
+          "result": "pass"
+        },
+        {
+          "area": "protocol",
+          "url": "https://github.com/agentlogin/reference/blob/ef036c47f9132502b6b85fc31c6cf1a1773e0de0/trusted-providers/applications/sentfromai/issuer-checklist.md",
+          "observedAt": "2026-11-08T22:59:00.000Z",
+          "expiresAt": "2026-11-23T00:00:00.000Z",
+          "result": "pass"
+        },
+        {
+          "area": "owner_authority",
+          "url": "https://github.com/agentlogin/reference/blob/ef036c47f9132502b6b85fc31c6cf1a1773e0de0/trusted-providers/applications/sentfromai/README.md",
+          "observedAt": "2026-11-08T22:59:00.000Z",
+          "expiresAt": "2026-11-23T00:00:00.000Z",
+          "result": "pass"
+        },
+        {
+          "area": "lifecycle",
+          "url": "https://github.com/agentlogin/reference/blob/ef036c47f9132502b6b85fc31c6cf1a1773e0de0/trusted-providers/applications/sentfromai/issuer-checklist.md",
+          "observedAt": "2026-11-08T22:59:00.000Z",
+          "expiresAt": "2026-11-23T00:00:00.000Z",
+          "result": "pass"
+        },
+        {
+          "area": "operations",
+          "url": "https://github.com/agentlogin/reference/blob/ef036c47f9132502b6b85fc31c6cf1a1773e0de0/trusted-providers/applications/sentfromai/recovery-report.md",
+          "observedAt": "2026-11-08T22:59:00.000Z",
+          "expiresAt": "2026-11-23T00:00:00.000Z",
+          "result": "pass"
+        },
+        {
+          "area": "privacy",
+          "url": "https://github.com/agentlogin/reference/blob/ef036c47f9132502b6b85fc31c6cf1a1773e0de0/trusted-providers/applications/sentfromai/identity-data.md",
+          "observedAt": "2026-11-08T22:59:00.000Z",
+          "expiresAt": "2026-11-23T00:00:00.000Z",
+          "result": "pass"
+        }
+      ]
     }
   ]
 }
