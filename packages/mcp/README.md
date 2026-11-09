@@ -11,6 +11,11 @@ It is an implementation, not a conformance certification. No provider is preferr
 
 ## Install and configure
 
+The `fingerprint` enrollment output documented below is pending the next package
+release; published beta.2 and beta.3 helpers do not include it. Existing coordinated
+beta.2 SentFrom companion installations remain supported. Do not change their
+exact peer versions until the matching companion release is available.
+
 Use Node.js 22.23.4 or a supported later release. Check the [release status](https://github.com/agentlogin/reference/blob/main/docs/npm-release.md) before installing this package version,
 `0.2.0-beta.3`, explicitly, without selecting the `latest` tag:
 
@@ -96,6 +101,10 @@ alter this configuration or cause a listed issuer/application to be trusted.
 1. `agentlogin_inventory` lists identities, applications and operations.
 2. If the identity needs a key, `agentlogin_enroll` begins or resumes enrollment.
    `agentlogin_enrollment_status` reports the public Owner approval link and outcome.
+   Once a key is available, both tools include `fingerprint`: its full base64url
+   SHA-256 JWK thumbprint (the Core `kid`). Compare it with the agent key shown on
+   the approval page. It is different from the human passkey fingerprint. The same
+   value survives pauses, resumes and completion; private key material is never returned.
 3. `agentlogin_sign_in` returns an operation identifier promptly.
 4. Poll `agentlogin_status` no faster than its suggested interval. An
    `awaiting_consent` result contains the scopes, disclosure, client identifier,
