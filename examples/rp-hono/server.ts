@@ -7,6 +7,7 @@ import { createExample } from './app.js';
 import { MemorySessionStore, type SessionStore } from './session-store.js';
 import { PostgresSessionStore } from './postgres-session-store.js';
 import { listenPort, readinessCheck } from './server-config.js';
+import { providerPolicyHealth } from './policy-health.js';
 
 const baseUrl = new URL(process.env.BASE_URL ?? 'http://localhost:4000');
 const issuer = process.env.ISSUER ?? 'http://localhost:3000'; // exactly as the Issuer publishes it
@@ -67,6 +68,9 @@ try {
     base, issuer, stateSecret, callbackStore, sessionStore,
     handleDomains: (process.env.HANDLE_DOMAINS ?? (dev ? 'example.com' : '')).split(',').map((d) => d.trim()).filter(Boolean),
     ready: async () => !stopping && await ready() && !stopping,
+    providerPolicyHealth: process.env.PROVIDER_POLICY_MONITOR_HANDLE
+      ? providerPolicyHealth({ issuer, handle: process.env.PROVIDER_POLICY_MONITOR_HANDLE })
+      : undefined,
   });
 } catch (error) {
   await closeStorage();

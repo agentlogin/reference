@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "status": "prepared_not_applied",
+  "alertAddress": "support@sentfrom.ai",
+  "intervalSeconds": 300,
+  "intervalScope": "Existing free-plan baseline; does not meet the proposed one-minute target.",
+  "monitors": [
+    { "name": "SentFrom identity readiness", "url": "https://identity.sentfrom.ai/readyz", "expectedStatus": 200, "keyword": "\"status\":\"ready\"" },
+    { "name": "SentFrom mail workers and database", "url": "https://api.sentfrom.ai/health/workers", "expectedStatus": 200, "keyword": "\"ok\":true" },
+    { "name": "SentFrom console claim page", "url": "https://console.sentfrom.ai/claim", "expectedStatus": 200, "keyword": "Give your agent an email" },
+    { "name": "Agent Workspace readiness", "url": "https://workspace.sentfrom.ai/readyz", "expectedStatus": 200, "keyword": "\"status\":\"ready\"" },
+    { "name": "Agent Tasks readiness", "url": "https://agent-tasks-production-efbd.up.railway.app/readyz", "expectedStatus": 200, "keyword": "\"status\":\"ready\"" },
+    { "name": "SentFrom trusted-provider validity", "url": "https://workspace.sentfrom.ai/health/provider-policy", "expectedStatus": 200, "keyword": "\"status\":\"ready\"", "prerequisite": "Deploy the optional endpoint and set PROVIDER_POLICY_MONITOR_HANDLE=monitor@mail.sentfrom.ai; it checks admission only and creates no mailbox or sign-in." }
+  ],
+  "applicationRules": [
+    "Inspect existing monitors and alert contacts before creating anything; reconcile by exact URL, not name alone.",
+    "Reuse the existing identity monitor, preserving unrelated monitors, contacts and account settings.",
+    "Assign only the verified support contact to these monitors; do not infer contact activation or delivery from a successful API response.",
+    "Do not purchase a plan or silently claim one-minute checks.",
+    "Record monitor IDs, exact saved URLs, intervals, expected status/keyword and alert routing after readback."
+  ],
+  "deliveryDrill": {
+    "scope": "A clearly labelled, dedicated synthetic monitor; never stop production or weaken an actual health check.",
+    "failure": "Use an observed fixed nonexistent path on the owned public application, verify its 404 response, and let the dedicated monitor detect the failure normally.",
+    "recovery": "Update only that synthetic monitor to the observed healthy readiness URL, then require a normal UP event.",
+    "evidence": "Provider incident/activity records plus receipt of the labelled DOWN and UP alerts at support@sentfrom.ai. A Test Notification alone does not prove detection.",
+    "cleanup": "Pause the dedicated synthetic monitor after the drill; never remove production monitors."
+  },
+  "pending": [
+    "Authenticated monitoring-account readback and configuration.",
+    "Automatic DOWN/UP alert delivery confirmation.",
+    "Named response hours and backup/escalation contact.",
+    "Backup-job failure and age alerts after the real backup job is deployed."
+  ]
+}

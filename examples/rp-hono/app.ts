@@ -19,6 +19,8 @@ export interface ExampleOptions {
   now?: () => number;
   /** Runtime readiness, including storage connectivity. Must not disclose connection details. */
   ready?: () => Promise<boolean>;
+  /** Optional independent-monitor target; it never gates the platform's readiness or changes login policy. */
+  providerPolicyHealth?: () => Promise<boolean>;
 }
 
 export const SESSION_TTL = 3600; // seconds
@@ -86,6 +88,14 @@ export function createExample(o: ExampleOptions) {
     try {
       if (o.ready && !await o.ready()) return c.json({ status: 'unavailable' }, 503);
       return c.json({ status: 'ready' });
+    } catch { return c.json({ status: 'unavailable' }, 503); }
+  });
+  if (o.providerPolicyHealth) app.get('/health/provider-policy', async (c) => {
+    c.header('cache-control', 'no-store');
+    try {
+      return await o.providerPolicyHealth!()
+        ? c.json({ status: 'ready' })
+        : c.json({ status: 'unavailable' }, 503);
     } catch { return c.json({ status: 'unavailable' }, 503); }
   });
   app.get('/client-metadata.json', (c) => auth.metadata(c.req.raw));
