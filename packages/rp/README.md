@@ -7,7 +7,7 @@ Implements the pinned draft revision described in the repository compatibility s
 conformance claim. Commands below target this package version. Check the [release status](https://github.com/agentlogin/reference/blob/main/docs/npm-release.md) before installing the exact coordinated versions:
 
 ```sh
-npm install --save-exact @agentlogin/rp@0.2.0-beta.3 @agentlogin/rp-store-postgres@0.2.0-beta.3
+npm install --save-exact @agentlogin/rp@0.2.0-beta.4 @agentlogin/rp-store-postgres@0.2.0-beta.4
 ```
 
 Runs on Node.js 22.13 or later. The handlers take and return the web-standard `Request` and `Response`, so they plug

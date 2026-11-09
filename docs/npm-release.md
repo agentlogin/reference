@@ -6,6 +6,15 @@ The helper checks the approved issuer and handle domain throughout sign-in and
 live checks. It does not change Core or automatically subscribe applications.
 Install the exact version; existing `latest` defaults are unchanged.
 
+This source tree prepares `0.2.0-beta.4`. Its MCP enrollment and status results
+include the public agent-key fingerprint, including after a saved request resumes.
+It also includes the private Workspace example's optional provider-policy health
+check. All eight package versions and internal dependencies remain coordinated;
+external dependency resolutions are unchanged from beta.3. The matching SentFrom
+companion candidate is `sentfromai-mcp@0.5.0-beta.3`, with an exact beta.4 MCP peer.
+These candidates are not published until registry integrity and clean-consumer
+checks confirm them. Existing beta.2 companion installations remain supported.
+
 The [release manifest](https://github.com/agentlogin/reference/releases/download/v0.2.0-beta.3/release.json)
 records source `b4ea4c78c2674685fea362f3dbe8b809f77cabcf` and all eight archive
 hashes. The [original release workflow](https://github.com/agentlogin/reference/actions/runs/42321226646)

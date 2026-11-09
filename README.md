@@ -57,7 +57,7 @@ implementation that follows the specification section by section is the more use
 
 Package names: npm `agentlogin` (published beta), PyPI `agent-login` (the name `agentlogin` is held by an unrelated 2019 project), crates.io `agentlogin` (free, not reserved).
 
-The verified npm beta is `0.2.0-beta.2`; this source tree prepares `0.2.0-beta.3`.
+The verified npm beta is `0.2.0-beta.3`; this source tree prepares `0.2.0-beta.4`.
 Check the release guide before installing source-guide versions from npm; `latest` is not the beta distribution channel. The coordinated release process,
 exact package graph, artifact checks,
 trusted publishing setup and first-publication procedure are in the
