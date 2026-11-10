@@ -191,6 +191,22 @@ different artifact under the same name/version stops the whole release. A failed
 or uncertain publish is not retried blindly. Once all bytes are visible, finish
 public-registry consumer validation before declaring the release usable.
 
+After a successful upload, the publisher reads the exact version and direct
+distribution tags with ten seconds between attempts, for at most five minutes.
+It accepts only
+the tested integrity, the intended `beta` tag and the unchanged `latest` tag
+(including an absent `latest`). A 404 or the exact previous beta tag may still
+be awaiting visibility. Conflicting bytes, unexpected tag changes, malformed
+responses and network errors stop the run. This loop never uploads or repacks.
+The 50-minute publishing job allows 40 minutes of readback across eight packages
+plus setup and upload time; it remains an overall cap, not a completion guarantee.
+
+npm distinguishes [validation from publication](https://api-docs.npmjs.com/#tag/Packages)
+and [never permits reuse of a published name/version](https://docs.npmjs.com/cli/v12/commands/npm-publish/).
+The five-minute limit is our waiting budget, not an npm propagation promise.
+An expired wait means the accepted upload is unresolved, not absent. Preserve
+the original artifact and establish its registry outcome before retrying the job.
+
 Never reuse an npm version for a corrected artifact. Publish the next beta with
 new evidence and keep the earlier version available for reproducibility. A code
 rollback is a new package version; production service rollback is a separate operation.

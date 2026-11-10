@@ -210,18 +210,20 @@ export function verifyBundle(out) {
   return manifest;
 }
 
-async function registryVersion(p) {
-  const response = await fetch(`${registry}${encodeURIComponent(p.name)}/${p.version}`, { redirect: 'error', signal: AbortSignal.timeout(15_000) });
-  if (response.status === 404) return null;
+export async function registryVersion(p, fetcher = fetch, signal = AbortSignal.timeout(15_000)) {
+  const response = await fetcher(`${registry}${encodeURIComponent(p.name)}/${p.version}`, { redirect: 'error', headers: {'cache-control': 'no-cache'}, signal });
+  if (response.status === 404) { await response.body?.cancel(); return null; }
   assert.equal(response.status, 200, `Cannot check registry state for ${p.name}`);
-  return response.json();
+  const metadata = await response.json();
+  assert.ok(metadata && typeof metadata === 'object' && !Array.isArray(metadata), `Cannot check registry state for ${p.name}`);
+  return metadata;
 }
 
-export async function readRegistryTags(p, fetcher = fetch) {
+export async function readRegistryTags(p, fetcher = fetch, signal = AbortSignal.timeout(15_000)) {
   // The package-wide index can lag an accepted first publication. Use the
   // direct dist-tag endpoint separately from immutable version metadata.
-  const response = await fetcher(`${registry}-/package/${encodeURIComponent(p.name)}/dist-tags`, { redirect: 'error', signal: AbortSignal.timeout(15_000) });
-  if (response.status === 404) return null;
+  const response = await fetcher(`${registry}-/package/${encodeURIComponent(p.name)}/dist-tags`, { redirect: 'error', headers: {'cache-control': 'no-cache'}, signal });
+  if (response.status === 404) { await response.body?.cancel(); return null; }
   assert.equal(response.status, 200, `Cannot read dist-tags for ${p.name}`);
   const tags = await response.json();
   assertRegistryTagMap(p, tags);
@@ -263,6 +265,47 @@ export async function preflightPublishedVersion(p, lookup = registryVersion, loo
   return { exists, latest: tags?.latest };
 }
 
+// npm can accept an upload before its public metadata and tags become visible.
+// This waits only after a successful upload; errors never trigger another upload.
+export async function publishAndVerify(p, previousTags, upload, {
+  lookup = (pkg, signal) => registryVersion(pkg, fetch, signal),
+  lookupTags = (pkg, signal) => readRegistryTags(pkg, fetch, signal),
+  now = () => performance.now(), sleep = ms => new Promise(resolve => setTimeout(resolve, ms)),
+  timeoutMs = 300_000, pollIntervalMs = 10_000,
+} = {}) {
+  assert.ok(Number.isSafeInteger(timeoutMs) && timeoutMs > 0 && timeoutMs <= 300_000);
+  assert.ok(Number.isSafeInteger(pollIntervalMs) && pollIntervalMs > 0);
+  if (previousTags !== null) assertRegistryTagMap(p, previousTags);
+  const previousBeta = previousTags?.beta, previousLatest = previousTags?.latest;
+  await upload();
+  const deadline = now() + timeoutMs;
+  const checkDeadline = () => assert.ok(now() < deadline, `${p.name} accepted upload remains unresolved; preserve the artifact and reconcile before any further publish`);
+  const readSignal = () => {
+    checkDeadline();
+    return AbortSignal.timeout(Math.max(1, Math.ceil(Math.min(15_000, deadline - now()))));
+  };
+  let betaObserved = false;
+  for (;;) {
+    const existing = await lookup(p, readSignal());
+    if (existing !== null) assert.equal(existing?.dist?.integrity, p.integrity, `${p.name} already exists with different bytes`);
+    // Inspect tags even while the version is 404; never conceal a conflicting tag.
+    const tags = await lookupTags(p, readSignal());
+    if (tags !== null) {
+      assertRegistryTagMap(p, tags);
+      assert.equal(tags.latest, previousLatest, `${p.name} existing latest dist-tag changed`);
+      assert.ok(tags.beta === p.version || (!betaObserved && tags.beta === previousBeta), `${p.name} beta dist-tag changed`);
+      betaObserved ||= tags.beta === p.version;
+      if (existing !== null && tags.beta === p.version) {
+        checkDeadline();
+        validateRegistryTags(p, tags);
+        return true;
+      }
+    }
+    checkDeadline();
+    await sleep(Math.min(pollIntervalMs, deadline - now()));
+  }
+}
+
 export function validateDispatchCommit(releaseCommit, githubSha) {
   assert.match(releaseCommit, /^[0-9a-f]{40}$/);
   // npm provenance names GITHUB_SHA, independently of the checkout's HEAD.
@@ -283,15 +326,31 @@ async function publish(out) {
   git('merge-base', '--is-ancestor', manifest.sourceCommit, 'origin/main');
   // Preflight every immutable version before making any mutation. An identical
   // prior artifact is safe to resume; a different artifact is never overwritten.
-  const previousLatest = new Map();
-  for (const p of manifest.packages) previousLatest.set(p.name, (await preflightPublishedVersion(p)).latest);
-  const checkTags = (p) => verifyRegistryTags(p, previousLatest.get(p.name));
+  const previousTags = new Map();
+  const snapshotTags = async (p) => {
+    const tags = await readRegistryTags(p);
+    previousTags.set(p.name, tags);
+    return tags;
+  };
+  for (const p of manifest.packages) await preflightPublishedVersion(p, registryVersion, snapshotTags);
+  const checkTags = async (p) => {
+    const tags = await readRegistryTags(p);
+    validateRegistryTags(p, tags);
+    assert.equal(tags.latest, previousTags.get(p.name)?.latest, `${p.name} existing latest dist-tag changed`);
+  };
   for (const p of manifest.packages) {
-    if (await reconcilePublishedVersion(p, registryVersion, checkTags)) { console.log(`Verified existing ${p.name}@${p.version}`); continue; }
-    // An uncertain publish is reconciled by immutable name/version+integrity on rerun.
-    // Never build or execute package lifecycle scripts in the OIDC-enabled job.
-    run('npm', ['publish', join(out, p.filename), '--access', 'public', '--tag', 'beta', '--provenance', '--ignore-scripts', '--registry', registry], root, { stdio: 'inherit' });
-    assert.ok(await reconcilePublishedVersion(p, registryVersion, checkTags), `${p.name} publication must be read back before proceeding`);
+    // Repeat preflight, including partial visibility, before an irreversible upload.
+    const current = await preflightPublishedVersion(p, registryVersion, async () => {
+      const tags = await readRegistryTags(p);
+      if (tags !== null) {
+        assert.equal(tags.latest, previousTags.get(p.name)?.latest, `${p.name} existing latest dist-tag changed`);
+        assert.ok(tags.beta === p.version || tags.beta === previousTags.get(p.name)?.beta, `${p.name} beta dist-tag changed`);
+      }
+      return tags;
+    });
+    if (current.exists) { console.log(`Verified existing ${p.name}@${p.version}`); continue; }
+    // Never build, repack or replay an upload while reconciling its public visibility.
+    await publishAndVerify(p, previousTags.get(p.name), () => run('npm', ['publish', join(out, p.filename), '--access', 'public', '--tag', 'beta', '--provenance', '--ignore-scripts', '--registry', registry], root, { stdio: 'inherit' }));
   }
   for (const p of manifest.packages) assert.ok(await reconcilePublishedVersion(p, registryVersion, checkTags), `${p.name} is absent at final release verification`);
   console.log(`Verified all ${manifest.packages.length} published beta artifacts and distribution tags`);
