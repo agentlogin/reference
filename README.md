@@ -14,10 +14,12 @@ The implementation milestones are:
 3. Agent CLI, TypeScript SDK and local MCP/plugin: private enrollment, disclosure review, application sessions and bounded named operations. Python SDK work is separate.
 4. Optional provider/application catalogs with review evidence, validation and a static directory. Relay implementation and independent interoperability remain separate milestones.
 
-An optional [trusted-provider programme](trusted-providers/README.md) is being
-prepared separately from the discovery catalogs. Websites would explicitly choose
-its reviewed, automatically updated issuer policy. It is still a draft with no
-approved providers. The helper is part of the beta.3 release candidate; publishing the SDK does not activate the programme.
+The optional [trusted-provider programme](trusted-providers/README.md) provides an
+explicitly chosen, automatically updated issuer policy, separate from discovery
+catalogs. Its [published status and unexpired policy](https://agentlogin.github.io/reference/trusted-providers/)
+determine current admission. SentFrom.ai is admitted only for its reviewed
+invited-Owner pilot scope. Publishing an SDK does not admit a provider or grant
+an Agent permissions on a website.
 
 | Package | Purpose |
 | --- | --- |
@@ -57,11 +59,14 @@ implementation that follows the specification section by section is the more use
 
 Package names: npm `agentlogin` (published beta), PyPI `agent-login` (the name `agentlogin` is held by an unrelated 2019 project), crates.io `agentlogin` (free, not reserved).
 
-The verified npm beta is `0.2.0-beta.3`; this source tree prepares `0.2.0-beta.4`.
-Check the release guide before installing source-guide versions from npm; `latest` is not the beta distribution channel. The coordinated release process,
-exact package graph, artifact checks,
-trusted publishing setup and first-publication procedure are in the
-[npm release guide](docs/npm-release.md). A prepared bundle is not a published release.
+All eight reference packages at [`0.2.0-beta.4`](https://github.com/agentlogin/reference/releases/tag/v0.2.0-beta.4)
+are published on npm and verified against their retained release archives.
+Install the exact version; existing `latest` defaults remain unchanged. The
+matching `sentfromai-mcp@0.5.0-beta.3` companion is a tested, unpublished candidate
+awaiting npm authorization. The published beta.2 reference/companion pairing
+remains available. See the [npm release guide](docs/npm-release.md) for evidence,
+installation limits and the remaining operational work; package publication does
+not establish general service launch readiness.
 
 For the issuer, see the [PostgreSQL issuer guide](packages/store-postgres/README.md): set `DATABASE_URL`, run
 `npm run issuer:migrate`, and supply a persistent `SIGNING_JWK` when starting the issuer. For the application, see the

@@ -1,45 +1,59 @@
 # npm beta release
 
-The current supported package release is `0.2.0-beta.3`, under the `beta` dist-tag.
-It adds the RP's explicit `issuerPolicy: agentLoginTrustedProviders()` option.
-The helper checks the approved issuer and handle domain throughout sign-in and
-live checks. It does not change Core or automatically subscribe applications.
-Install the exact version; existing `latest` defaults are unchanged.
+As of 10 November 2026, all eight reference packages at `0.2.0-beta.4` are
+published on npm and verified against their original release archives. Install
+the exact version; existing `latest` defaults remain unchanged.
 
-This source tree prepares `0.2.0-beta.4`. Its MCP enrollment and status results
-include the public agent-key fingerprint, including after a saved request resumes.
-It also includes the private Workspace example's optional provider-policy health
-check. All eight package versions and internal dependencies remain coordinated;
-external dependency resolutions are unchanged from beta.3. The matching SentFrom
-companion candidate is `sentfromai-mcp@0.5.0-beta.3`, with an exact beta.4 MCP peer.
-These candidates are not published until registry integrity and clean-consumer
-checks confirm them. Existing beta.2 companion installations remain supported.
+Beta.4 adds the public Agent Key fingerprint to MCP enrollment and status results,
+including resumed requests and existing active keys. The private Workspace example
+adds an optional provider-validity health check. Internal versions are coordinated;
+external dependency resolutions are unchanged from beta.3. The RP's explicit
+`issuerPolicy: agentLoginTrustedProviders()` option remains opt-in.
 
-The [release manifest](https://github.com/agentlogin/reference/releases/download/v0.2.0-beta.3/release.json)
-records source `b4ea4c78c2674685fea362f3dbe8b809f77cabcf` and all eight archive
-hashes. The [original release workflow](https://github.com/agentlogin/reference/actions/runs/42321226646)
-prepared the archives once, passed 970 tests with PostgreSQL required and no
-skips, and published those exact bytes through npm trusted publishing with
-npm-generated GitHub provenance. Processing delays were reconciled by reading
-back immutable registry bytes before continuing; accepted versions were not
-rebuilt or replaced. The earlier beta.2 release used maintainer authentication
-and has no CI provenance; its historical evidence is unchanged.
+The [GitHub release](https://github.com/agentlogin/reference/releases/tag/v0.2.0-beta.4)
+and [manifest](https://github.com/agentlogin/reference/releases/download/v0.2.0-beta.4/release.json)
+retain source `275dcfe9b60fe55fe4ce5aa094c0871cd804616e` and all eight archive
+hashes. The manifest SHA-256 is
+`322ea84996070be5aa0d3ed43015ee60ee59663aaa7dd654ff11b04e08d4d5c2`.
+The [original workflow](https://github.com/agentlogin/reference/actions/runs/42724726884)
+passed 1,017 tests with PostgreSQL required and zero skips, plus a production
+dependency audit with zero vulnerabilities. Publication completed on attempt 9
+using the original prepared bytes and npm-generated GitHub provenance. Registry
+metadata, tags and downloaded archives were checked against that manifest;
+accepted versions were not rebuilt or replaced.
+
+The matching `sentfromai-mcp@0.5.0-beta.3` companion, with an exact beta.4 MCP peer,
+remains **unpublished**. Its [canonical workflow](https://github.com/sentfromai/sentfromai-mcp/actions/runs/42729085128)
+passed preparation at `1b5a525f407c62910277a676ccecd199394ebbf7`, then publication
+stopped with npm `ENEEDAUTH`. Its tested archive is preserved for the authorized
+retry. The previously verified pairing of reference `0.2.0-beta.2` and
+`sentfromai-mcp@0.5.0-beta.2` remains available.
+
+A 10 November live acceptance used the published beta.4 reference packages with
+that original, unpublished companion CI archive. It matched the existing active
+public key fingerprint, signed in, read the existing synthetic Workspace note,
+and logged out; the next helper request returned `not_authenticated`. It created
+no new enrollment or note. Acceptance with all nine packages installed from the
+public registry remains pending companion publication. This check did not test
+new-Owner onboarding, old-cookie replay rejection or independent replica routing.
 
 The [programme's published status](https://agentlogin.github.io/reference/trusted-providers/)
 and unexpired policy determine current provider admission. Publishing packages
-or documentation alone approves nobody. Website operators can retain an explicit
-issuer configuration or deliberately opt into the programme; errors never cause
-an automatic fallback to unapproved issuers. The separate `sentfromai-mcp`
-companion remains at `0.5.0-beta.2`. Beta.3 changes no third-party dependency
-resolutions from beta.2, which already uses patched `@hono/node-server` 2.1.3.
+or documentation alone approves nobody. Websites can keep an explicit issuer
+configuration or deliberately opt into the programme; errors never fall back to
+unapproved issuers. AWS recovery access and rehearsal, UptimeRobot configuration
+and an automatic alert drill, protected operator credential custody/provisioning,
+and staffed coverage remain unfinished launch work.
 
 These packages implement the working draft described in
-[draft status](draft-0.2-status.md); a package version does not publish or ratify
-the specification. `@agentlogin/agentid-mcp` remains an experimental, separate
-AgentMail AgentID integration, not Core interoperability or programme membership.
+[draft status](draft-0.2-status.md); package publication does not ratify the
+specification. `@agentlogin/agentid-mcp` remains an experimental, separate AgentMail
+AgentID integration, not Core interoperability or programme membership. Historical [beta.3 release evidence](https://github.com/agentlogin/reference/releases/tag/v0.2.0-beta.3)
+and beta.2 evidence retain their original scope; beta.2 used maintainer
+authentication and has no CI provenance.
 
-Do not advertise any future release until its exact version and artifact integrity
-have been read back from npm and its clean registry consumer checks have passed.
+Do not advertise a future release until its exact version and integrity have
+been read back from npm and its clean registry consumer checks have passed.
 A prepared bundle or local-only installation is not publication.
 
 ## Release contents
