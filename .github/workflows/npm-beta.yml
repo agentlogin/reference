@@ -88,7 +88,7 @@ jobs:
     needs: prepare
     if: inputs.publish
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 50
     environment: npm-beta
     permissions:
       contents: read
