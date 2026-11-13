@@ -3,9 +3,9 @@
   "programme": "agentlogin-trusted-providers",
   "profile": "agent-login-core-1.0-draft-0.2-direct-es256",
   "status": "active",
-  "revision": 15,
-  "issuedAt": "2026-11-13T01:05:59.830Z",
-  "expiresAt": "2026-11-13T13:05:59.830Z",
+  "revision": 16,
+  "issuedAt": "2026-11-13T12:14:55.862Z",
+  "expiresAt": "2026-11-14T00:14:55.862Z",
   "providers": [
     {
       "issuer": "https://identity.sentfrom.ai",
