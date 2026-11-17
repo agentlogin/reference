@@ -3,18 +3,8 @@
   "programme": "agentlogin-trusted-providers",
   "profile": "agent-login-core-1.0-draft-0.2-direct-es256",
   "status": "active",
-  "revision": 26,
-  "issuedAt": "2026-11-16T18:34:04.680Z",
-  "expiresAt": "2026-11-17T06:34:04.680Z",
-  "providers": [
-    {
-      "issuer": "https://identity.sentfrom.ai",
-      "handleDomains": [
-        "mail.sentfrom.ai"
-      ],
-      "specRevision": "536c5d15738f45a3c2115884a0a43cdd28b06dd3",
-      "reviewUrl": "https://github.com/agentlogin/reference/blob/79e4e202d6af7c6f286573e258ce5c568e4cf6aa/trusted-providers/decisions/sentfromai-20261109-renew.md",
-      "reviewExpiresAt": "2026-11-17T00:00:00.000Z"
-    }
-  ]
+  "revision": 27,
+  "issuedAt": "2026-11-17T02:56:37.759Z",
+  "expiresAt": "2026-11-17T14:56:37.759Z",
+  "providers": []
 }
