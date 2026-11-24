@@ -3,8 +3,8 @@
   "programme": "agentlogin-trusted-providers",
   "profile": "agent-login-core-1.0-draft-0.2-direct-es256",
   "status": "active",
-  "revision": 43,
-  "issuedAt": "2026-11-23T14:41:11.316Z",
-  "expiresAt": "2026-11-24T02:41:11.316Z",
+  "revision": 44,
+  "issuedAt": "2026-11-24T02:54:54.367Z",
+  "expiresAt": "2026-11-24T14:54:54.367Z",
   "providers": []
 }
