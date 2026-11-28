@@ -1,8 +1,8 @@
 {
   "version": 1,
-  "revision": 52,
+  "revision": 53,
   "sourceCommit": "9bb9dbbbdbe83167bd8df9914ae8359a2c603b39",
-  "previousPublicationCommit": "e130cbbc18c0d3b9fe7957637879f44a7885c2af",
+  "previousPublicationCommit": "08381e0ada33aace802813da6822cbfb4d703e46",
   "adoptionDigest": "e7ec1df1deab1b98cf2e511bd077f8411c730be1608bd489c150593b8ccd0535",
   "decisions": [
     {
@@ -14,7 +14,7 @@
       "sha256": "aef19593271b2150c621cb0eada7366444fad101c2d0421b3282360389f710df"
     }
   ],
-  "feedSha256": "0f60d798532ff984e4bd7fd403099fc6890fdbccbdf71b96f9b307ad10db5178",
-  "issuedAt": "2026-11-28T00:04:09.694Z",
-  "expiresAt": "2026-11-28T12:04:09.694Z"
+  "feedSha256": "bce9d828d5c4ce3b3ae1bcdb56589e203e361de61624b2ae83f8e7a48e0eb1cd",
+  "issuedAt": "2026-11-28T07:51:27.776Z",
+  "expiresAt": "2026-11-28T19:51:27.776Z"
 }
